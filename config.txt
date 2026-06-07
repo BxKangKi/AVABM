@@ -1,0 +1,253 @@
+# AVABM unified configuration
+CONFIG_VERSION=17
+# EN: Python and batch files read this file instead of hard-coded environment variables.
+# KO: Python과 배치 파일이 환경 변수 set 대신 이 파일을 공통 설정으로 읽습니다.
+# Format: KEY=VALUE.  Use None for optional layer names.
+
+# ------------------------------------------------------------
+# Batch / Conda / Build
+# ------------------------------------------------------------
+CONDA_ENV=avabm
+CONDA_ACTIVATE_PATH=%USERPROFILE%\miniforge3\Scripts\activate.bat
+PYTHON_COMMAND=python
+CUDA_HOME=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6
+TORCH_NVCC_FLAGS=-allow-unsupported-compiler
+CUDA_EXTRA_NVCC_FLAGS=
+CUDA_EXTRA_CXX_FLAGS=
+MAX_JOBS=16
+
+# ------------------------------------------------------------
+# Data sources
+# ------------------------------------------------------------
+ROAD_GPKG=data/road_links.gpkg
+SPAWN_GPKG=data/spawn_points.gpkg
+SIGNAL_GPKG=data/signals.gpkg
+GPKG_LAYER=Dongbu
+SPAWN_GPKG_LAYER=Dongbu
+SIGNAL_GPKG_LAYER=None
+SPAWN_NODE_MATCH_MAX_DIST=150
+SIGNAL_NODE_MATCH_MAX_DIST=0
+
+# ------------------------------------------------------------
+# Road direction / one-way handling
+# ------------------------------------------------------------
+# ROAD_ONEWAY_MODE controls whether a source centerline is split into two directions.
+#   auto          : use ONEWAY/ONE_WAY fields and OSM other_tags like "oneway"=>"yes".
+#   force_oneway  : never split the centerline; all lanes follow geometry direction.
+#   force_two_way : always split the centerline into opposing directions.
+# KO: 중앙선을 양방향으로 분리할지 결정합니다. Dongbu 레이어는 auto 권장.
+ROAD_ONEWAY_MODE=force_oneway
+ROAD_DEFAULT_ONEWAY=0
+ROAD_PARSE_OSM_OTHER_TAGS=1
+# Dongbu custom rows use plain labels such as enterance/sideway/sidway.
+ROAD_ONEWAY_HINT_KEYWORDS=enterance,entrance,sideway,sidway,slip
+# 0 disables width-only fallback. Set e.g. 3.6 to treat unknown narrow roads as one-way.
+ROAD_NARROW_ONEWAY_MAX_WIDTH=3.6
+
+
+# ------------------------------------------------------------
+# Route/lane safety repair
+# ------------------------------------------------------------
+# EN: Validate generated route lane paths before CUDA receives them.
+# KO: CUDA로 넘기기 전에 route 차로 연결성을 검사해 잘못된 lane 때문에
+#     차량이 도로 중간에 멈추는 상황을 줄입니다.
+ROUTE_VALIDATE_LANE_CONNECTIVITY=1
+ROUTE_DROP_INVALID_LANE_PATHS=1
+
+# ------------------------------------------------------------
+# Simulation scale / runtime
+# ------------------------------------------------------------
+SCREEN_W=1600
+SCREEN_H=900
+MAX_AGENTS=150000
+NUM_ROUTES=2048
+DT=0.05
+AV_PENETRATION=0.0
+FPS_LIMIT=0
+RENDER_INTERVAL=1
+# 24h run helper: run this many physics ticks per rendered frame. 1 = real-time-style visual loop.
+PHYSICS_STEPS_PER_FRAME=10
+METRICS_INTERVAL=2.0
+METRICS_PATH=data/results/simulation_metrics.csv
+DEBUG_SYNC=0
+
+# ------------------------------------------------------------
+# Simulation duration / research section outputs
+# ------------------------------------------------------------
+# SIMULATION_DURATION_SECONDS < 0 means run until ESC/window close.
+# 86400 = 24 simulated hours. Raise/lower PHYSICS_STEPS_PER_FRAME above for speed/visual smoothness.
+# SECTION_LENGTH_M > 0 splits each directed road link by that length.
+# SECTION_LENGTH_M=-1 stores a single whole-network section.
+SCENARIO_ID=default
+SCENARIO_SEED=20260529
+SIMULATION_DURATION_SECONDS=6000
+SECTION_STATS_ENABLED=1
+SECTION_LENGTH_M=250
+SECTION_STATS_INTERVAL=300
+SECTION_OUTPUT_DIR=data
+SECTION_TIME_BINS_CSV_PATH=data/results/section_time_bins_{section_length_label}.csv
+SECTION_SCENARIO_CSV_PATH=data/results/scenario_summary_{section_length_label}.csv
+SECTION_ROAD_GPKG_PATH=data/results/road_sections_{section_length_label}.gpkg
+SECTION_RESULTS_GPKG_PATH=data/results/section_results_{section_length_label}.gpkg
+SECTION_BASE_LAYER=road_sections
+SECTION_RESULTS_LAYER=section_summary
+SECTION_TIME_LAYER=section_time_bins
+SECTION_WRITE_ROAD_GPKG=1
+SECTION_WRITE_TIME_BIN_GPKG=1
+SECTION_TIME_BIN_GPKG_MAX_ROWS=750000
+SECTION_WRITE_EMPTY_ROWS=1
+SECTION_BACKUP_OUTPUTS=1
+SECTION_FREEFLOW_SPEED_MPS=-1
+SECTION_CONGESTION_SPEED_RATIO=0.5
+SECTION_QUEUE_SPEED_KMH=10.0
+SECTION_STOP_SPEED_KMH=5.0
+SECTION_GO_SPEED_KMH=30.0
+SECTION_HARD_BRAKE_MPS2=-3.0
+SECTION_OCCUPANCY_EFFECTIVE_VEHICLE_LENGTH_M=7.5
+SECTION_VIS_WIDTH_BASE=1.0
+SECTION_VIS_WIDTH_ALPHA=5.0
+
+# ------------------------------------------------------------
+# Routing and cache
+# ------------------------------------------------------------
+ROUTE_SEED=20260529
+MIN_TRIP_DISTANCE=3000.0
+MAX_ROUTE_TRIES=120000
+ROUTE_CACHE_DIR=data/route_cache
+REFRESH_ROUTE_CACHE=0
+BACKUP_ROUTE_CACHE=1
+ROUTE_PARALLEL=1
+ROUTE_PARALLEL_BACKEND=process
+ROUTE_WORKERS=15
+# 1이면 multi-lane spawn expansion + lane safety repair가 끝난 최종 route를 별도 cache로 저장합니다.
+# 첫 실행 후에는 [Routes] multi-lane spawn expansion 단계를 건너뜁니다.
+ROUTE_READY_CACHE=1
+# 1이면 multi-lane spawn expansion을 route chunk 단위로 안정 병렬 처리합니다.
+ROUTE_SPAWN_EXPANSION_PARALLEL=1
+ROUTE_SPAWN_EXPANSION_BACKEND=thread
+# 0이면 ROUTE_WORKERS 값을 그대로 사용합니다.
+ROUTE_SPAWN_EXPANSION_WORKERS=0
+ROUTE_SPAWN_EXPANSION_MIN_ROUTES=1024
+TURN_LANE_ROUTE_PREP_BASE=30.0
+TURN_LANE_ROUTE_PREP_PER_LANE=24.0
+STRICT_ROUTE_TURN_LANE_FILTER=0
+# 1이면 넓은/다차로 본선 링크를 우선해 좁은 측도로나 램프 선택을 줄입니다.
+ROUTE_USE_WIDTH_BIASED_COST=1
+ROUTE_WIDE_LINK_REF_LANES=3.0
+ROUTE_WIDE_LINK_POWER=0.80
+ROUTE_NARROW_LINK_PENALTY=4.25
+ROUTE_NARROW_WIDTH_MAX=7.5
+ROUTE_WIDE_LINK_MIN_COST_FACTOR=0.75
+ROUTE_WIDE_LINK_MAX_COST_FACTOR=5.50
+# 1이면 직진 구간에서 기존 상대 차선을 유지하고, 좌/우 진출 전에는 해당 가장자리 차선을 선호합니다.
+ROUTE_KEEP_RELATIVE_LANE=1
+ROUTE_DESTINATION_LANE_INTENT=1
+ROUTE_STRAIGHT_LANE_RANDOMIZE=1
+ROUTE_RANDOM_LANE_SALT=91127
+
+# ------------------------------------------------------------
+# v13 lane safety / lane change behavior
+# ------------------------------------------------------------
+# CUDA v17 repairs route_pos/lane mismatches at runtime, exits vehicles only at
+# true route ends, and uses probabilistic straight-lane spreading, blocked-lane escape, lane-drop merge prep, destination lane spread,
+# zero-acceleration anti-stall recovery, active lane-change deadlock release, and right-edge bottleneck avoidance.
+# These knobs are compiled in avabm_cuda/main.cu for speed; rebuild the extension after updating.
+ROUTE_LANE_RUNTIME_REPAIR=1
+PROBABILISTIC_STRAIGHT_LANE_CHANGE=1
+CONGESTION_OPEN_LANE_ESCAPE=1
+# 나들목/램프는 다차로 본선의 중앙 차선이 아니라 가장 가까운 최외곽 차로로만 연결합니다.
+INTERCHANGE_EDGE_ONLY=1
+INTERCHANGE_RAMP_MAX_LANES=1
+INTERCHANGE_MAIN_MIN_LANES=2
+INTERCHANGE_ADJUST_RAMP_GEOMETRY=1
+
+# ------------------------------------------------------------
+# Spatial grid
+# ------------------------------------------------------------
+WORLD_CELL_SIZE=20.0
+WORLD_GRID_MAX_W=2048
+WORLD_GRID_MAX_H=2048
+
+# ------------------------------------------------------------
+# Rendering
+# ------------------------------------------------------------
+ZOOM_MIN=0.05
+ZOOM_MAX=120.0
+ZOOM_SPEED=1.14
+RENDER_WHEELS=0
+ASSET_DIR=assets
+CAR_TEXTURE_PATH=assets/car_topdown.png
+USE_TEXTURED_CARS=1
+DRAW_LANE_MARKINGS=1
+DRAW_LANE_CENTERLINES=1
+DRAW_LANE_EDGES=1
+LANE_MARKING_WIDTH=0.5
+LANE_DASH_LENGTH=7.0
+LANE_DASH_GAP=5.0
+LANE_MARKING_GROUP_BY_SOURCE=1
+SHOW_SIGNAL_HOVER=1
+SIGNAL_HOVER_RADIUS_PX=18.0
+SHOW_VEHICLE_HOVER=1
+VEHICLE_HOVER_RADIUS_PX=24.0
+
+# Rounded inner-corner asphalt, not a center circle.
+DRAW_INTERSECTION_APRONS=1
+INTERSECTION_APRON_RADIUS_MULT=2.05
+INTERSECTION_APRON_EXTRA=2.5
+INTERSECTION_APRON_MAX_RADIUS=14.0
+INTERSECTION_APRON_SEGMENTS=32
+INTERSECTION_APRON_CENTER_FILL_MULT=0.0
+INTERSECTION_APRON_MIN_GAP_DEG=28.0
+INTERSECTION_APRON_SEMICIRCLE_FLIP=1
+
+# ------------------------------------------------------------
+# Traffic behavior implemented in CUDA v17
+# ------------------------------------------------------------
+# EN: Deadlock release, complete-overlap random release, runtime route-lane
+#     mismatch repair, stale negative/zero-acceleration cleanup, probabilistic
+#     and emptiest-lane straight-flow spreading, right-edge bottleneck avoidance,
+#     active lane-change no-start release, blocked-lane escape, interchange
+#     edge-lane preparation, turn-signal lane-change etiquette and filtered
+#     connector local avoidance are compiled into avabm_cuda/main.cu.
+# KO: 데드락 해소, 완전 중첩 랜덤 통과, 실시간 route/lane 불일치 복구,
+#     음수/0가속도 stale hold 정리, 확률/빈 차선 우선 직진 차선 분산,
+#     우측 병목 차선 회피, 차선변경 no-start 데드락 해소, 막힌 차선 회피,
+#     나들목 최외곽 차로 사전 준비, 깜빡이 기반 차선변경 예절/거부,
+#     connector 국소 회피는 avabm_cuda/main.cu에 컴파일되어 있습니다.
+#     이 값을 바꾸려면 main.cu의 상수를 조정한 뒤 avabm_cuda/build.bat로 재빌드하세요.
+
+# ------------------------------------------------------------
+# Spawn demand
+# ------------------------------------------------------------
+BASE_VPS=0.2
+SPAWN_REF_WIDTH=10.5
+SPAWN_WIDTH_EXP_K=1.25
+SPAWN_LANE_POWER=1.15
+SPAWN_MAX_MULT=18.0
+MAX_TOTAL_VPS=2000.0
+# 1이면 다차로 스폰 지점의 수요를 각 차로 슬롯에 균등 분배합니다.
+SPAWN_MULTI_LANE_BALANCE=1
+SPAWN_PROFILE_SLOTS=24
+SPAWN_PROFILE_SLOT_SECONDS=3600.0
+SPAWN_PROFILE_FIELD_PREFIX=SPWN
+SPAWN_PROFILE_UNIT=vph
+
+# ------------------------------------------------------------
+# Lane-drop / destination spread behavior added in v14
+# ------------------------------------------------------------
+# 4->3, 3->4처럼 차로 수만 바뀌며 이어지는 다차로 본선은 좌/우회전이 아니라 직진 연속 구간으로 처리합니다.
+ROUTE_WIDE_LANE_CHANGE_AS_STRAIGHT=1
+ROUTE_WIDE_CONTINUATION_MAX_TURN_DEG=62.0
+# 차로 수 변화 구간에서 route lane target을 한 중앙 차선으로 몰지 않고 안정 랜덤으로 분산합니다.
+ROUTE_LANE_COUNT_CHANGE_BALANCE=1
+# 마지막 도착 링크가 다차로이면 한쪽 차선에 고착되지 않고 빈 차선/랜덤 차선으로 퍼지게 합니다.
+ROUTE_DESTINATION_LANE_SPREAD=1
+
+
+# ------------------------------------------------------------
+# Lane-drop / right-edge anti-stall behavior added in v17
+# ------------------------------------------------------------
+# 아래 기능은 avabm_cuda/main.cu에 상수로 컴파일되어 있습니다.
+# - 4->3 같은 차로 감소 no-start 경계에서 차선변경이 얼어붙으면 초반 취소/후반 완료로 정지 해소
+# - 앞이 비었는데 accel=0으로 중간 정지한 차량을 hard stop이 아닐 때 재출발
+# - 나들목이 가깝지 않은 직진 차량은 우측 끝 병목 차선을 피하고 안전한 안쪽/빈 차선으로 분산
