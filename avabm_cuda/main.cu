@@ -9,6 +9,17 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+// EN: CUDA 12.6 + recent Windows SDKs print thousands of C4996 warnings from
+//     NVIDIA/Windows headers (for example cusparse.h).  They are not AVABM
+//     compile errors, but they hide the real diagnostic at the end of the log.
+// KO: CUDA 12.6과 최신 Windows SDK 조합에서는 NVIDIA/Windows 헤더에서 C4996
+//     경고가 수천 줄 출력됩니다. AVABM 코드 오류가 아니지만 실제 오류를 가리므로
+//     외부 헤더 include 구간에서만 경고를 잠시 끕니다.
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable: 4996)
+#pragma warning(disable: 4819)
+#endif
 #include <windows.h>
 #include <GL/gl.h>
 #else
@@ -18,6 +29,12 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_gl_interop.h>
+
+#ifdef _WIN32
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+#endif
 
 #include <stdint.h>
 #include <math.h>
@@ -64,6 +81,23 @@
 
 #define MAX_SPEED_FALLBACK 13.9f
 
+#ifndef AVABM_MIN_CRUISE_SPEED_ENABLED
+#define AVABM_MIN_CRUISE_SPEED_ENABLED 1
+#endif
+#ifndef AVABM_MIN_CRUISE_SPEED_KMH
+#define AVABM_MIN_CRUISE_SPEED_KMH 40.0f
+#endif
+#ifndef AVABM_FAST_EQUIV_MATH
+#define AVABM_FAST_EQUIV_MATH 1
+#endif
+#ifndef AVABM_USE_ASYNC_MEMSET_CLEAR
+#define AVABM_USE_ASYNC_MEMSET_CLEAR 1
+#endif
+#ifndef AVABM_SPAWN_GRID_INSERT_FASTPATH
+#define AVABM_SPAWN_GRID_INSERT_FASTPATH 1
+#endif
+#define AVABM_KMH_TO_MPS 0.2777777778f
+
 #define MAX_ACCEL_AV     2.8f
 #define MAX_ACCEL_HUMAN  2.0f
 
@@ -83,6 +117,13 @@
 
 #define LANE_CHANGE_DURATION_AV    2.5f
 #define LANE_CHANGE_DURATION_HUMAN 4.8f
+// EN: Minimum duration used only when a short GIS segment would otherwise end
+//     before a safe lane change can finish.  It prevents right-entry vehicles
+//     from being rejected by the no-start zone on every short mainline piece.
+// KO: 짧은 GIS segment에서 기본 차선변경 시간이 너무 길어 매번 no-start 구간에
+//     걸리는 문제를 막기 위한 최소 시간입니다. 안전 gap 검사는 그대로 유지됩니다.
+#define LANE_CHANGE_MIN_DURATION_AV    0.65f
+#define LANE_CHANGE_MIN_DURATION_HUMAN 0.85f
 
 #define LC_COOLDOWN_AV    2.0f
 #define LC_COOLDOWN_HUMAN 6.5f
@@ -194,8 +235,17 @@
 #define TURN_LANE_PREP_BASE_DIST       180.0f
 #define TURN_LANE_PREP_PER_LANE_DIST     95.0f
 #define TURN_LANE_MIN_LC_DIST            70.0f
-#define LANE_CHANGE_NO_START_DIST_TO_NODE 92.0f
-#define LANE_CHANGE_FINISH_BEFORE_NODE    28.0f
+// EN: v25 lowers the generic no-start/finish buffers again.  GIS networks often
+//     split a visually continuous mainline into many short segments; a 20+ m
+//     no-start buffer on each piece makes safe lane changes impossible even when
+//     the physical road is clear.  The independent inside_intersection_box_ecs()
+//     guard still forbids starting a lane change in the actual node/connector box.
+// KO: v25에서는 공통 no-start/finish 여유거리를 한 번 더 낮춥니다. GIS 도로는
+//     눈으로는 하나의 본선인 구간도 짧은 segment 여러 개로 쪼개져 있어, 각 segment마다
+//     20m 이상의 no-start가 붙으면 안전 gap이 있어도 차선변경이 불가능해집니다. 실제
+//     노드/connector 박스 안에서는 inside_intersection_box_ecs()가 여전히 시작을 막습니다.
+#define LANE_CHANGE_NO_START_DIST_TO_NODE 14.0f
+#define LANE_CHANGE_FINISH_BEFORE_NODE     8.5f
 #define TURN_LANE_HARD_HOLD_DIST       14.0f
 #define TURN_LANE_STOP_BUFFER           8.0f
 #define TURN_LANE_WRONG_LANE_SPEED_AV   6.5f
@@ -263,8 +313,8 @@
 // KO: 실제로 경로가 겹치는 차량끼리만 우선순위를 비교하고, 우회전은 짧은 코너 경로를 사용합니다.
 #define PRIORITY_GATE_PATH_SCAN_RANGE      48.0f
 #define PRIORITY_GATE_EXIT_SPACE            8.5f
-#define PRIORITY_GATE_ACTIVE_CLEAR_FRACTION 0.34f
-#define PRIORITY_GATE_ACTIVE_EXIT_CLEAR_DIST 9.0f
+#define PRIORITY_GATE_ACTIVE_CLEAR_FRACTION 0.22f
+#define PRIORITY_GATE_ACTIVE_EXIT_CLEAR_DIST 12.0f
 #define PRIORITY_GATE_BEHAVIOR_BIAS_SCALE   5.0f
 #define HUMAN_AI_ASSERTIVE_BOOST_AV          0.85f
 #define HUMAN_AI_ASSERTIVE_BOOST_HUMAN       1.65f
@@ -328,7 +378,7 @@
 // KO: 지능형 정체/중첩/차선의도 보정 모델 v14입니다. 넓은 본선의 4->3 / 3->4
 //     차로수 변화 구간을 회전이 아닌 직진 연속 구간으로 보고, 차로 감소 사전
 //     합류와 도착 링크 다차로 분산을 추가해 데드락을 줄입니다.
-#define SMART_AI_VERSION                         17
+#define SMART_AI_VERSION                         21
 #define SPAWN_RACE_REQUEUE_ENABLED              1
 #define SPAWN_RACE_RECENT_WINDOW                0.30f
 #define SPAWN_RACE_REQUEUE_FULLSCAN_MAX       4096
@@ -374,15 +424,15 @@
 #define LANE_SPREAD_EMPTY_REAR_GAP                34.0f
 #define ROUTE_LANE_REPAIR_SPEED_CAP                4.0f
 #define CRUISE_RANDOM_LANE_DECISION_PERIOD        4.0f
-#define CRUISE_RANDOM_LANE_CHANGE_PROB            0.22f
+#define CRUISE_RANDOM_LANE_CHANGE_PROB            0.34f
 #define CRUISE_RANDOM_LANE_UTILITY_TOL            0.32f
 #define OPEN_LANE_LC_UTILITY_TOL                  0.22f
 #define ROUTE_MISMATCH_REPAIR_ENABLED                1
 #define ROUTE_POS_REPAIR_SCAN_MAX                  24
 #define UPCOMING_EXIT_LANE_PREP_ENABLED             1
-#define UPCOMING_EXIT_LOOKAHEAD_LANES               6
-#define UPCOMING_EXIT_PREP_EXTRA_DIST            70.0f
-#define UPCOMING_EXIT_PREP_MAX_DIST             540.0f
+#define UPCOMING_EXIT_LOOKAHEAD_LANES               3
+#define UPCOMING_EXIT_PREP_EXTRA_DIST            12.0f
+#define UPCOMING_EXIT_PREP_MAX_DIST             130.0f
 #define WRONG_LANE_STALL_FORCE_WAIT               1.60f
 #define STALE_BRAKE_CLEAR_FRONT_GAP             20.0f
 #define STALE_BRAKE_CLEAR_ACCEL_AV               0.72f
@@ -400,9 +450,9 @@
 #define LANE_SPREAD_FRONT_GAIN                  12.0f
 #define LANE_SPREAD_REAR_GAIN                    5.0f
 #define LANE_SPREAD_SEARCH_RADIUS              125.0f
-#define LANE_SPREAD_MIN_DIST_TO_NODE            72.0f
+#define LANE_SPREAD_MIN_DIST_TO_NODE            55.0f
 #define LANE_SPREAD_MIN_LINK_LENGTH             70.0f
-#define LANE_SPREAD_MIN_CURRENT_GAP             10.0f
+#define LANE_SPREAD_MIN_CURRENT_GAP              0.0f
 #define LANE_SPREAD_COOLDOWN_READY               0.20f
 #define OPEN_LANE_REAR_GAP_AV                   12.0f
 #define OPEN_LANE_REAR_GAP_HUMAN                20.0f
@@ -435,8 +485,8 @@
 #define OPEN_LANE_EMPTIEST_GROUP_SCAN_ENABLED       1
 #define OPEN_LANE_EMPTIEST_SCAN_PERIOD             3.0f
 #define OPEN_LANE_EMPTIEST_FRONT_GAIN              6.0f
-#define OPEN_LANE_EMPTIEST_SCORE_GAIN              7.5f
-#define OPEN_LANE_EMPTIEST_MIN_EXIT_DIST         210.0f
+#define OPEN_LANE_EMPTIEST_SCORE_GAIN              2.0f
+#define OPEN_LANE_EMPTIEST_MIN_EXIT_DIST          85.0f
 
 // EN: v17 anti-stall and congestion-aware lane choice.  The rightmost lane is
 //     treated as a potential bottleneck lane unless an exit is near; through
@@ -453,15 +503,92 @@
 #define RIGHT_EDGE_BOTTLENECK_AVOID_ENABLED          1
 #define RIGHT_EDGE_BOTTLENECK_MIN_GROUP              3
 #define RIGHT_EDGE_BOTTLENECK_IDX_LIMIT              1
-#define RIGHT_EDGE_BOTTLENECK_PENALTY             24.0f
-#define RIGHT_EDGE_INNER_BONUS                      5.5f
-#define RIGHT_EDGE_SAFE_FRONT_LOSS                  4.0f
-#define RIGHT_EDGE_SCAN_SCORE_GAIN                  2.0f
+#define RIGHT_EDGE_BOTTLENECK_PENALTY            260.0f
+#define RIGHT_EDGE_INNER_BONUS                     16.0f
+#define RIGHT_EDGE_SAFE_FRONT_LOSS                 24.0f
+#define RIGHT_EDGE_SCAN_SCORE_GAIN                -24.0f
 #define LANE_DROP_AMBIGUOUS_RIGHT_EDGE_FALLBACK      1
 #define LANE_DROP_ACTIVE_LC_ABORT_T                0.38f
 #define LANE_DROP_ACTIVE_LC_COMMIT_T               0.62f
 #define LANE_DROP_ACTIVE_LC_BARRIER_EXTRA           1.25f
 #define LANE_DROP_ACTIVE_LC_RELEASE_SPEED          1.60f
+
+// EN: v18 hard lane-drop merge gates and inner-lane preference.  Lane-count
+//     reductions are treated as taper merges, not ordinary intersections.
+//     Vehicles in through traffic do not prepare for right exits too early,
+//     and safe right-edge-to-inner lane changes bypass MOBIL utility checks.
+// KO: v18 차로 감소 하드 병목 게이트와 안쪽 차로 선호입니다. 차로 수 감소는
+//     일반 교차로가 아니라 테이퍼 병목으로 취급합니다. 직진 차량은 우측 진출
+//     준비를 너무 일찍 하지 않고, 안전한 우측->안쪽 차선변경은 MOBIL 효용
+//     조건보다 우선합니다.
+#define LANE_DROP_MERGE_GATE_ENABLED                1
+#define LANE_DROP_CONNECTOR_GROUP_CLEAR_ENABLED     1
+#define LANE_DROP_RECEIVING_BALANCE_ENABLED         1
+#define LANE_DROP_ACTIVE_LC_ABORT_ON_UNSAFE         1
+#define RIGHT_EDGE_FORCE_INNER_LC_ENABLED           1
+#define RIGHT_EDGE_FORCE_INNER_MIN_EXIT_DIST       35.0f
+#define RIGHT_EDGE_FORCE_INNER_MAX_CUR_IDX          1
+#define RIGHT_EDGE_FORCE_INNER_MIN_TARGET_GAIN    -28.0f
+
+// EN: v19 node/taper fix.  Lane-count reductions are physical tapers: only
+//     vehicles mapped into the same receiving lane reserve the same bottleneck
+//     slot.  Parallel survivor lanes may pass together, which prevents the old
+//     whole-bundle gate from locking 4->3 and ramp-adjacent nodes.
+// KO: v19 노드/테이퍼 수정입니다. 차로 감소는 물리적 테이퍼로 보며, 같은 수신
+//     차로로 합류하는 차량끼리만 같은 병목 슬롯을 예약합니다. 서로 다른 생존
+//     차로는 동시에 지나갈 수 있어 4->3 및 전출입로 인접 노드의 전체 묶음
+//     잠금 데드락을 줄입니다.
+#define LANE_DROP_TAPER_SAME_TARGET_ONLY             1
+#define CONNECTOR_GROUP_CLEAR_SAME_TARGET_ONLY       1
+#define NODE_CONTINUATION_RELEASE_ENABLED            1
+#define LANE_GAIN_RECEIVING_BALANCE_ENABLED          1
+#define LANE_GAIN_AMBIGUOUS_RIGHT_EDGE_FALLBACK      1
+#define THROUGH_LANE_BALANCE_TARGET_ENABLED          1
+#define THROUGH_LANE_BALANCE_TARGET_BONUS           58.0f
+#define THROUGH_LANE_BALANCE_DISTANCE_PENALTY        9.0f
+#define THROUGH_LANE_BALANCE_RIGHT_EDGE_PENALTY    210.0f
+#define OVERLAP_CONNECTOR_RELEASE_ENABLED            1
+#define OVERLAP_CONNECTOR_RELEASE_WAIT               0.70f
+#define OVERLAP_CONTACT_PRIORITY_NUDGE_ENABLED       1
+#define OVERLAP_CONTACT_WINNER_NUDGE                 0.72f
+#define OVERLAP_CONTACT_WINNER_MIN_SPEED             1.15f
+
+
+// EN: v21 missed-exit fallback and through-lane balancing.
+//     If a vehicle failed to reach the mandatory left/right exit lane before
+//     the no-start zone, it no longer waits forever or cuts across lanes.  It
+//     takes the best straight continuation and will despawn later when its
+//     route budget is exhausted.  Through vehicles on 3+ lane mainlines also
+//     perform deterministic safe inner-lane balancing instead of staying on the
+//     ramp/right edge.
+// KO: v21 진출 실패 fallback 및 직진 차로 분산입니다. 좌/우 진출 차로를
+//     no-start 구간 전에 맞추지 못한 차량은 더 이상 영구 대기하거나 무리하게
+//     가로지르지 않고, 가장 좋은 직진 연결로를 타고 지나갑니다. 3차로 이상
+//     본선의 직진 차량은 램프/우측 끝에 고착되지 않도록 안전할 때 결정론적
+//     안쪽 차로 분산을 수행합니다.
+#define MISSED_EXIT_STRAIGHT_FALLBACK_ENABLED      1
+#define MISSED_EXIT_STRAIGHT_MAX_DEG             58.0f
+#define MISSED_EXIT_STRAIGHT_RAMP_PENALTY        42.0f
+#define MISSED_EXIT_STRAIGHT_RIGHT_EDGE_PENALTY   8.5f
+#define MISSED_EXIT_OFFROUTE_TAIL_ENABLED          1
+
+// EN: v25 makes through-lane balancing reachable on very short GIS segments.
+//     A right-ramp entrant must first appear in the physical right receiving lane,
+//     but after that it should not be trapped there only because the imported
+//     mainline is cut into 15-30 m pieces.  We still require same-direction adjacent
+//     lanes, refreshed front/rear gaps, and the intersection-box guard.
+// KO: v25에서는 매우 짧은 GIS segment에서도 직진 차로 분산을 시도합니다. 우측 전입
+//     차량은 합류 순간에는 실제 우측 수신 차로에 들어오지만, 이후 본선이 15~30m
+//     조각으로 쪼개졌다는 이유만으로 우측 차로에 갇히면 안 됩니다. 동일 방향 인접
+//     차로, 최신 앞/뒤 gap, 교차로 박스 guard는 그대로 유지합니다.
+#define THROUGH_LANE_BALANCE_LC_ENABLED             1
+#define THROUGH_LANE_BALANCE_LC_MIN_LINK_LENGTH  12.0f
+#define THROUGH_LANE_BALANCE_LC_MIN_DIST_TO_NODE 12.0f
+#define THROUGH_LANE_BALANCE_FORCE_RIGHT_IDX        0
+#define FLOW_BALANCE_MANDATORY_FRONT_SCALE       0.72f
+#define FLOW_BALANCE_MANDATORY_REAR_SCALE        0.76f
+#define CONNECTOR_ENTRY_WAIT_RELEASE_ENABLED        1
+#define CONNECTOR_ENTRY_WAIT_RELEASE_MAX          45.0f
 
 // EN: Interchange edge-lane rule.  A one-lane ramp/lane-drop attached to a
 //     multi-lane mainline must use the nearest physical outside lane.  This
@@ -503,7 +630,7 @@
 #define INTERSECTION_BOX_MAX_DEPTH            19.50f
 #define INTERSECTION_BOX_ENTRY_MARGIN          0.65f
 #define INTERSECTION_BOX_PRIORITY_BONUS       96
-#define LANE_CHANGE_BOX_CLEAR_MULT            10.50f
+#define LANE_CHANGE_BOX_CLEAR_MULT             3.80f
 #define STRAIGHT_NO_TURN_SPEED_CAP_DEG        12.0f
 #define RIGHT_TURN_CURB_BIAS_FRAC              0.18f
 
@@ -541,7 +668,7 @@
 #define CONNECTOR_EXIT_SPACE_MIN          12.0f
 #define LC_ACTIVE_FREEZE_FRONT_MIN          7.0f
 #define LC_ACTIVE_FREEZE_REAR_MIN           9.0f
-#define LC_ACTIVE_FREEZE_T_MAX              0.62f
+#define LC_ACTIVE_FREEZE_T_MAX              0.72f
 
 #define RENDER_BODY_VERTS_PER_VEHICLE 6
 #define RENDER_FULL_VERTS_PER_VEHICLE 30
@@ -814,6 +941,38 @@ __device__ __forceinline__ float clampf_cuda(float v, float lo, float hi) {
 
 __device__ __forceinline__ int clampi_cuda(int v, int lo, int hi) {
     return max(lo, min(v, hi));
+}
+
+__device__ __forceinline__ float avabm_square_ecs(float x) {
+    return x * x;
+}
+
+__device__ __forceinline__ float avabm_fourth_power_ecs(float x) {
+#if AVABM_FAST_EQUIV_MATH
+    // KO 문법 이유: powf(x, 4.0f) 대신 곱셈 두 번으로 x^4를 계산합니다.
+    // KO 논리 이유: 지수는 항상 4로 고정되어 있으므로 일반 powf 함수를 호출할 필요가
+    //    없습니다. IDM 식은 그대로이고, 각 차량/각 tick의 device 함수 비용만 줄입니다.
+    float x2 = x * x;
+    return x2 * x2;
+#else
+    return powf(x, 4.0f);
+#endif
+}
+
+__device__ __forceinline__ float avabm_second_power_ecs(float x) {
+#if AVABM_FAST_EQUIV_MATH
+    return x * x;
+#else
+    return powf(x, 2.0f);
+#endif
+}
+
+__device__ __forceinline__ float avabm_min_cruise_speed_mps_ecs() {
+#if AVABM_MIN_CRUISE_SPEED_ENABLED
+    return fmaxf(0.0f, ((float)AVABM_MIN_CRUISE_SPEED_KMH) * AVABM_KMH_TO_MPS);
+#else
+    return 0.0f;
+#endif
 }
 
 __device__ __forceinline__ uint32_t xorshift32(uint32_t& state) {
@@ -1641,6 +1800,50 @@ __device__ __forceinline__ int repair_route_pos_for_current_lane_ecs(
 }
 
 
+
+__device__ __forceinline__ bool missed_exit_tail_sentinel_active_ecs(
+    int current_lane,
+    int route_id,
+    int route_pos,
+    const RoadNetwork road
+) {
+#if MISSED_EXIT_OFFROUTE_TAIL_ENABLED
+    // EN: The missed-exit fallback intentionally lets a vehicle leave its
+    // original route and continue straight to despawn.  Such a vehicle is marked
+    // by route_pos sitting on the final route slot while the actual lane is not
+    // compatible with that final route lane.  Generic route repair must not move
+    // that marker back to an earlier route position, or the vehicle will try to
+    // take the missed exit again and can deadlock at the next node.
+    // KO: 진출을 놓친 차량은 원래 route를 벗어나 직진 후 디스폰되도록 둡니다.
+    // 이 상태는 route_pos가 마지막 route slot에 있고 실제 lane이 그 route lane과
+    // 호환되지 않는 것으로 표시됩니다. 일반 route repair가 이 표시를 과거 위치로
+    // 되돌리면 차량이 놓친 진출을 다시 시도해 다음 노드에서 데드락을 만들 수
+    // 있으므로 repair 대상에서 제외합니다.
+    if (!valid_lane_ecs(current_lane, road)) return false;
+    if (route_id < 0 || route_id >= road.num_routes) return false;
+    int ro0 = road.route_offsets[route_id];
+    int ro1 = road.route_offsets[route_id + 1];
+    int route_len = ro1 - ro0;
+    if (route_len <= 0 || route_pos < 0 || route_pos >= route_len) return false;
+    if (route_pos < route_len - 1) return false;
+    int tail_lane = road.route_lanes[ro0 + route_pos];
+    return !route_lane_current_compatible_ecs(tail_lane, current_lane, road);
+#else
+    (void)current_lane; (void)route_id; (void)route_pos; (void)road;
+    return false;
+#endif
+}
+
+__device__ __forceinline__ int repair_route_pos_unless_missed_exit_tail_ecs(
+    int current_lane,
+    int route_id,
+    int route_pos,
+    const RoadNetwork road
+) {
+    if (missed_exit_tail_sentinel_active_ecs(current_lane, route_id, route_pos, road)) return -1;
+    return repair_route_pos_for_current_lane_ecs(current_lane, route_id, route_pos, road);
+}
+
 __device__ __forceinline__ int connected_equivalent_lane_from_group_ecs(
     int from_lane,
     int group_lane,
@@ -1723,6 +1926,22 @@ __device__ __forceinline__ bool wide_lane_count_change_continuation_ecs(
 #endif
 }
 
+
+__device__ __forceinline__ bool wide_group_continuation_candidate_ecs(
+    int from_lane,
+    int candidate_group_lane,
+    const RoadNetwork road
+) {
+    if (!valid_lane_ecs(from_lane, road) || !valid_lane_ecs(candidate_group_lane, road)) return false;
+    if (road.lane_end_node[from_lane] != road.lane_start_node[candidate_group_lane]) return false;
+    int from_count = lane_group_count_ecs(from_lane, road);
+    int to_count = lane_group_count_ecs(candidate_group_lane, road);
+    if (from_count < 2 || to_count < 2) return false;
+    if (from_count <= INTERCHANGE_RAMP_MAX_GROUP_LANES || to_count <= INTERCHANGE_RAMP_MAX_GROUP_LANES) return false;
+    float deg = fabsf(lane_signed_turn_deg(from_lane, candidate_group_lane, road));
+    return deg <= LANE_COUNT_CHANGE_MAX_TURN_DEG;
+}
+
 __device__ __forceinline__ int effective_turn_code_ecs(
     int from_lane,
     int to_lane,
@@ -1731,14 +1950,18 @@ __device__ __forceinline__ int effective_turn_code_ecs(
 ) {
     int geom_turn = turn_code_from_lanes_ecs(from_lane, to_lane, road);
 
-    // EN: A 4->3 or 3->4 wide mainline continuation may bend more than the
-    //     generic 25 degree turn threshold.  Do not force all vehicles to the
-    //     left/right edge lane for that case; it is a lane-count transition,
-    //     not an exit turn.
-    // KO: 4->3 또는 3->4 본선 연속 구간은 일반 25도 회전 기준보다 크게 휘어
-    //     보일 수 있습니다. 이 경우 모든 차량을 좌/우 가장자리 차로로 몰지 말고
-    //     차로수 변화 직진 구간으로 처리합니다.
-    if (wide_lane_count_change_continuation_ecs(from_lane, to_lane, road)) {
+    // EN: Wide mainline continuations can bend more than the generic 25-degree
+    //     turn threshold.  Always protect true lane-count transitions; for
+    //     same-count wide links, only flatten to straight when the Python route
+    //     cache already identified this transition as a straight continuation.
+    // KO: 넓은 본선 연속 구간은 일반 25도 회전 기준보다 크게 휘어 보일 수
+    //     있습니다. 차로수 변화는 항상 직진 연속으로 보호하고, 차로수가 같은
+    //     다차로 link는 Python route cache가 직진으로 판정한 경우에만
+    //     좌/우회전 요구를 해제합니다.
+    if (
+        wide_lane_count_change_continuation_ecs(from_lane, to_lane, road)
+        || (route_turn == TURN_STRAIGHT && wide_group_continuation_candidate_ecs(from_lane, to_lane, road))
+    ) {
         return TURN_STRAIGHT;
     }
 
@@ -1772,6 +1995,39 @@ __device__ __forceinline__ int lane_count_reduction_drop_side_ecs(
     if (dr > dl + eps2) return -1;  // right edge moves inward: rightmost lane(s) drop.
     if (dl > dr + eps2) return  1;  // left edge moves inward: leftmost lane(s) drop.
     return 0;
+}
+
+
+__device__ __forceinline__ int lane_count_gain_side_ecs(
+    int from_lane,
+    int to_lane,
+    const RoadNetwork road
+) {
+    if (!wide_lane_count_change_continuation_ecs(from_lane, to_lane, road)) return 0;
+    int from_count = lane_group_count_ecs(from_lane, road);
+    int to_count = lane_group_count_ecs(to_lane, road);
+    if (from_count >= to_count) return 0;
+
+    int from_right = rightmost_lane_in_group_ecs(from_lane, road);
+    int from_left = leftmost_lane_in_group_ecs(from_lane, road);
+    int to_right = rightmost_lane_in_group_ecs(to_lane, road);
+    int to_left = leftmost_lane_in_group_ecs(to_lane, road);
+    if (!valid_lane_ecs(from_right, road) || !valid_lane_ecs(from_left, road) ||
+        !valid_lane_ecs(to_right, road) || !valid_lane_ecs(to_left, road)) {
+        return 0;
+    }
+
+    float dr = lane_endpoint_dist2_ecs(from_right, road.lane_start_x[to_right], road.lane_start_y[to_right], true, road);
+    float dl = lane_endpoint_dist2_ecs(from_left,  road.lane_start_x[to_left],  road.lane_start_y[to_left],  true, road);
+    float eps2 = LANE_COUNT_CHANGE_EDGE_ALIGN_EPS * LANE_COUNT_CHANGE_EDGE_ALIGN_EPS;
+
+    if (dr > dl + eps2) return -1;  // right edge expands: new lane opens on the right.
+    if (dl > dr + eps2) return  1;  // left edge expands: new lane opens on the left.
+#if LANE_GAIN_AMBIGUOUS_RIGHT_EDGE_FALLBACK
+    return -1;
+#else
+    return 0;
+#endif
 }
 
 __device__ __forceinline__ int lane_count_reduction_step_target_ecs(
@@ -1812,6 +2068,152 @@ __device__ __forceinline__ int lane_count_reduction_step_target_ecs(
         return target;
     }
 #endif
+    return -1;
+}
+
+
+__device__ __forceinline__ bool lane_count_merge_transition_ecs(
+    int from_lane,
+    int to_lane,
+    const RoadNetwork road
+) {
+#if LANE_DROP_MERGE_GATE_ENABLED
+    if (!valid_lane_ecs(from_lane, road) || !valid_lane_ecs(to_lane, road)) return false;
+    if (!lane_connected(from_lane, to_lane, road)) return false;
+    int from_count = lane_group_count_ecs(from_lane, road);
+    int to_count = lane_group_count_ecs(to_lane, road);
+    return from_count >= 2
+        && to_count >= 2
+        && from_count > to_count
+        && wide_lane_count_change_continuation_ecs(from_lane, to_lane, road);
+#else
+    return false;
+#endif
+}
+
+__device__ __forceinline__ bool lane_count_merge_pair_conflict_ecs(
+    int a_from,
+    int a_to,
+    int b_from,
+    int b_to,
+    const RoadNetwork road
+) {
+#if LANE_DROP_MERGE_GATE_ENABLED
+    if (!valid_lane_ecs(a_from, road) || !valid_lane_ecs(a_to, road) ||
+        !valid_lane_ecs(b_from, road) || !valid_lane_ecs(b_to, road)) return false;
+    if (road.lane_end_node[a_from] != road.lane_end_node[b_from]) return false;
+    bool a_merge = lane_count_merge_transition_ecs(a_from, a_to, road);
+    bool b_merge = lane_count_merge_transition_ecs(b_from, b_to, road);
+    if (!a_merge && !b_merge) return false;
+    if (!lane_groups_same_ecs(a_from, b_from, road) && a_from != b_from) return false;
+    if (a_to == b_to) return true;
+#if LANE_DROP_TAPER_SAME_TARGET_ONLY
+    // EN/KO: A 4->3 taper should not reserve the entire 3-lane receiving
+    // bundle.  Only two vehicles that actually map to the same receiving lane
+    // conflict here; adjacent survivor lanes are handled by normal local
+    // avoidance and can pass the node in parallel.
+    return false;
+#else
+    return lane_groups_same_ecs(a_to, b_to, road);
+#endif
+#else
+    return false;
+#endif
+}
+
+__device__ __forceinline__ int balanced_receiving_index_for_lane_count_change_ecs(
+    int from_lane,
+    int group_lane,
+    const RoadNetwork road
+) {
+    int from_idx = -1;
+    int from_count = lane_group_count_and_index_ecs(from_lane, road, from_idx);
+    int target_idx_dummy = -1;
+    int to_count = lane_group_count_and_index_ecs(group_lane, road, target_idx_dummy);
+    if (from_count <= 0 || to_count <= 0 || from_idx < 0) return -1;
+    if (to_count == 1) return 0;
+    if (from_count == 1) return clampi_cuda(target_idx_dummy >= 0 ? target_idx_dummy : 0, 0, to_count - 1);
+
+#if LANE_DROP_RECEIVING_BALANCE_ENABLED
+    if (from_count > to_count && wide_lane_count_change_continuation_ecs(from_lane, group_lane, road)) {
+        int drop = min(from_count - to_count, from_count - 1);
+        int side = lane_count_reduction_drop_side_ecs(from_lane, group_lane, road);
+#if LANE_DROP_AMBIGUOUS_RIGHT_EDGE_FALLBACK
+        if (side == 0) side = -1;
+#endif
+        if (side < 0) {
+            // Right-edge taper: the disappearing right lane and its neighbor merge
+            // into the new rightmost lane, while inner lanes preserve index order.
+            return clampi_cuda(from_idx - drop, 0, to_count - 1);
+        }
+        if (side > 0) {
+            // Left-edge taper: keep right-side lanes stable; compress the left edge.
+            return clampi_cuda(from_idx, 0, to_count - 1);
+        }
+    }
+#endif
+
+#if LANE_GAIN_RECEIVING_BALANCE_ENABLED
+    if (from_count < to_count && wide_lane_count_change_continuation_ecs(from_lane, group_lane, road)) {
+        int add = min(to_count - from_count, to_count - 1);
+        int side = lane_count_gain_side_ecs(from_lane, group_lane, road);
+#if LANE_GAIN_AMBIGUOUS_RIGHT_EDGE_FALLBACK
+        if (side == 0) side = -1;
+#endif
+        if (side < 0) {
+            // Right-edge gain: the new right lane starts as a taper. Continuing
+            // vehicles shift to the survivor lanes and may move into the new lane
+            // later by normal safe lane change, not at the node connector.
+            return clampi_cuda(from_idx + add, 0, to_count - 1);
+        }
+        if (side > 0) {
+            // Left-edge gain: right-side continuing lanes keep their index.
+            return clampi_cuda(from_idx, 0, to_count - 1);
+        }
+    }
+#endif
+
+    float denom = fmaxf(1.0f, (float)(from_count - 1));
+    int mapped = (int)floorf(((float)from_idx * (float)(to_count - 1) / denom) + 0.5f);
+    return clampi_cuda(mapped, 0, to_count - 1);
+}
+
+__device__ __forceinline__ int connected_balanced_equivalent_lane_from_group_ecs(
+    int from_lane,
+    int group_lane,
+    const RoadNetwork road
+) {
+    if (!valid_lane_ecs(from_lane, road) || !valid_lane_ecs(group_lane, road)) return -1;
+
+    int target_count = lane_group_count_ecs(group_lane, road);
+    if (target_count <= 0) return -1;
+
+    int mapped_idx = balanced_receiving_index_for_lane_count_change_ecs(from_lane, group_lane, road);
+    if (mapped_idx < 0) {
+        int from_idx = -1;
+        int from_count = lane_group_count_and_index_ecs(from_lane, road, from_idx);
+        if (from_count > 1 && from_idx >= 0 && target_count > 1) {
+            mapped_idx = (int)floorf(((float)from_idx * (float)(target_count - 1) / fmaxf(1.0f, (float)(from_count - 1))) + 0.5f);
+        } else {
+            mapped_idx = 0;
+        }
+        mapped_idx = clampi_cuda(mapped_idx, 0, target_count - 1);
+    }
+
+    // Try the mapped lane first, then nearest neighbors.  This prevents the
+    // previous rightmost-first fallback from collapsing all straight vehicles
+    // into the right lane whenever the route cache named a different lane of
+    // the same receiving link.
+    for (int radius = 0; radius < CRUISE_RANDOM_LANE_MAX_GROUP; ++radius) {
+        int idxs[2] = { mapped_idx - radius, mapped_idx + radius };
+        for (int q = 0; q < 2; ++q) {
+            if (radius == 0 && q == 1) continue;
+            int idx = idxs[q];
+            if (idx < 0 || idx >= target_count) continue;
+            int cand = lane_at_right_to_left_index_ecs(group_lane, idx, road);
+            if (valid_lane_ecs(cand, road) && lane_connected(from_lane, cand, road)) return cand;
+        }
+    }
     return -1;
 }
 
@@ -1876,11 +2278,99 @@ __device__ __forceinline__ int random_cruise_lane_step_target_ecs(
         ^ ((uint32_t)(ecs.route_pos[id] + 17) * 277803737u)
         ^ ((uint32_t)(road.lane_start_node[lane] + 3) * 1442695041u)
         ^ ((uint32_t)(road.lane_end_node[lane] + 5) * 1597334677u);
-    int target_index = (int)(hash_u32_ecs(key) % (uint32_t)count);
+    uint32_t h = hash_u32_ecs(key);
+    int target_index = 0;
+#if THROUGH_LANE_BALANCE_TARGET_ENABLED
+    // EN: Through traffic should not all keep the rightmost lane.  When there
+    // are at least three lanes, use a stable per-vehicle target over the inner
+    // lanes; the right edge remains available for near exits, ramps and gaps.
+    // KO: 직진 차량이 모두 우측 끝 차로에 붙지 않도록 3차로 이상에서는 차량별
+    // 안정 목표를 안쪽 차선들에 균등 분산합니다. 우측 끝은 가까운 진출/램프와
+    // 실제 빈 공간이 있을 때만 사용됩니다.
+    if (count >= 3) {
+        target_index = 1 + (int)(h % (uint32_t)(count - 1));
+    } else {
+        target_index = (int)(h % (uint32_t)count);
+    }
+#else
+    target_index = (int)(h % (uint32_t)count);
+#endif
     if (target_index == cur_index) return -1;
 
     if (target_index > cur_index) return geometric_left_neighbor_ecs(lane, road);
     return geometric_right_neighbor_ecs(lane, road);
+}
+
+
+__device__ __forceinline__ int missed_exit_straight_fallback_lane_ecs(
+    int id,
+    int from_lane,
+    int requested_lane,
+    const RoadNetwork road
+) {
+#if MISSED_EXIT_STRAIGHT_FALLBACK_ENABLED
+    if (!valid_lane_ecs(from_lane, road)) return -1;
+    int from_idx = -1;
+    int from_count = lane_group_count_and_index_ecs(from_lane, road, from_idx);
+    int best = -1;
+    float best_score = 1.0e30f;
+
+    uint32_t h = hash_u32_ecs(
+        ((uint32_t)(id + 1) * 747796405u)
+        ^ ((uint32_t)(from_lane + 17) * 2891336453u)
+        ^ ((uint32_t)(road.lane_end_node[from_lane] + 31) * 277803737u)
+    );
+
+    for (int cand0 = 0; cand0 < road.num_lanes; ++cand0) {
+        if (!valid_lane_ecs(cand0, road) || !lane_connected(from_lane, cand0, road)) continue;
+        if (cand0 == requested_lane) continue;
+
+        float deg0 = fabsf(lane_signed_turn_deg(from_lane, cand0, road));
+        bool continuation = wide_group_continuation_candidate_ecs(from_lane, cand0, road);
+        if (!continuation && deg0 > MISSED_EXIT_STRAIGHT_MAX_DEG) continue;
+
+        int cand = cand0;
+        int balanced = connected_balanced_equivalent_lane_from_group_ecs(from_lane, cand0, road);
+        if (valid_lane_ecs(balanced, road) && lane_connected(from_lane, balanced, road)) {
+            cand = balanced;
+        }
+        if (cand == requested_lane) continue;
+
+        float deg = fabsf(lane_signed_turn_deg(from_lane, cand, road));
+        if (!continuation && deg > MISSED_EXIT_STRAIGHT_MAX_DEG) continue;
+
+        int to_idx = -1;
+        int to_count = lane_group_count_and_index_ecs(cand, road, to_idx);
+        if (to_count <= 0 || to_idx < 0) continue;
+
+        float score = deg;
+        // Prefer a real mainline continuation over another narrow ramp/side link.
+        if (from_count >= INTERCHANGE_MAIN_MIN_GROUP_LANES && to_count <= INTERCHANGE_RAMP_MAX_GROUP_LANES) {
+            score += MISSED_EXIT_STRAIGHT_RAMP_PENALTY;
+        }
+        // Prefer wider receiving bundles and a stable lane spread inside them.
+        score -= fminf((float)to_count, 6.0f) * 2.0f;
+        if (to_count >= 2) {
+            int target_idx = (int)(h % (uint32_t)to_count);
+            score += fabsf((float)(to_idx - target_idx)) * 3.25f;
+            if (to_count >= 3 && to_idx == 0) score += MISSED_EXIT_STRAIGHT_RIGHT_EDGE_PENALTY;
+        }
+        if (continuation) score -= 9.0f;
+        if (from_idx >= 0 && to_count > 1 && from_count > 1) {
+            int rel_idx = (int)floorf(((float)from_idx * (float)(to_count - 1) / fmaxf(1.0f, (float)(from_count - 1))) + 0.5f);
+            score += fabsf((float)(to_idx - clampi_cuda(rel_idx, 0, to_count - 1))) * 1.10f;
+        }
+
+        if (score < best_score) {
+            best_score = score;
+            best = cand;
+        }
+    }
+    return best;
+#else
+    (void)id; (void)from_lane; (void)requested_lane; (void)road;
+    return -1;
+#endif
 }
 
 __device__ __forceinline__ bool turn_requires_dedicated_lane_ecs(int turn) {
@@ -1949,6 +2439,112 @@ __device__ __forceinline__ int receiving_lane_for_turn_ecs(
     return candidate_lane;
 }
 
+__device__ __forceinline__ bool missed_exit_straight_target_ecs(
+    int id,
+    int from_lane,
+    int target_lane,
+    ECSArrays ecs,
+    const RoadNetwork road
+) {
+#if MISSED_EXIT_STRAIGHT_FALLBACK_ENABLED
+    if (!valid_lane_ecs(from_lane, road) || !valid_lane_ecs(target_lane, road)) return false;
+    if (!lane_connected(from_lane, target_lane, road)) return false;
+    int rid = ecs.route_id[id];
+    int rpos = ecs.route_pos[id];
+    if (rid < 0 || rid >= road.num_routes) return false;
+    int ro0 = road.route_offsets[rid];
+    int ro1 = road.route_offsets[rid + 1];
+    int route_len = ro1 - ro0;
+    if (route_len <= 0 || rpos < 0 || rpos >= route_len) return false;
+    int next_pos = rpos + 1;
+    if (next_pos < 0 || next_pos >= route_len) {
+#if MISSED_EXIT_OFFROUTE_TAIL_ENABLED
+        // EN/KO: Tail-sentinel case.  The car is already off the original route
+        // after a missed exit; treat the best straight continuation as the same
+        // missed-exit policy so connector entry/motion can clear the node.
+        int route_lane = road.route_lanes[ro0 + rpos];
+        if (!route_lane_current_compatible_ecs(route_lane, from_lane, road)) {
+            int fallback_tail = missed_exit_straight_fallback_lane_ecs(id, from_lane, -1, road);
+            return valid_lane_ecs(fallback_tail, road) && fallback_tail == target_lane;
+        }
+#endif
+        return false;
+    }
+    int requested = road.route_lanes[ro0 + next_pos];
+    int fallback = missed_exit_straight_fallback_lane_ecs(id, from_lane, requested, road);
+    if (valid_lane_ecs(fallback, road) && fallback == target_lane) return true;
+
+    // EN/KO: Decision may have excluded the adjusted edge/receiving lane rather
+    // than the raw route lane.  Try that exclusion as well so connector entry
+    // keeps the same missed-exit straight policy selected by decision.
+    if (valid_lane_ecs(requested, road) && lane_connected(from_lane, requested, road)) {
+        int route_turn = road.route_turns[ro0 + rpos];
+        int turn = effective_turn_code_ecs(from_lane, requested, route_turn, road);
+        int adjusted = interchange_receiving_outer_lane_ecs(from_lane, requested, road);
+        adjusted = receiving_lane_for_turn_ecs(adjusted, turn, road);
+        adjusted = interchange_receiving_outer_lane_ecs(from_lane, adjusted, road);
+        if (valid_lane_ecs(adjusted, road)) {
+            int fallback2 = missed_exit_straight_fallback_lane_ecs(id, from_lane, adjusted, road);
+            if (valid_lane_ecs(fallback2, road) && fallback2 == target_lane) return true;
+        }
+    }
+    return false;
+#else
+    (void)id; (void)from_lane; (void)target_lane; (void)ecs; (void)road;
+    return false;
+#endif
+}
+
+
+__device__ __forceinline__ void prepare_missed_exit_route_tail_ecs(
+    int id,
+    int from_lane,
+    int fallback_lane,
+    ECSArrays ecs,
+    const RoadNetwork road
+) {
+#if MISSED_EXIT_OFFROUTE_TAIL_ENABLED
+    /*
+        EN: Route arrays are immutable GPU buffers.  When a car misses a ramp/turn
+            and uses a straight fallback that is not present in the original route,
+            we cannot rewrite route_lanes.  Instead, just before connector entry we
+            move route_pos to the penultimate route slot.  Connector motion then
+            advances it to the final slot, so the vehicle drives to the end of the
+            fallback link and despawns instead of re-trying the missed exit forever.
+
+        KO: GPU route 배열은 고정되어 있어, 차량이 진출 타이밍을 놓쳐 원래 route에
+            없는 직진 fallback 차로를 타는 경우 route_lanes 자체를 바꿀 수 없습니다.
+            대신 connector 진입 직전에 route_pos를 route의 끝-1 위치로 옮깁니다.
+            connector를 빠져나오면 마지막 route 위치가 되므로, 차량은 fallback 링크
+            끝까지 주행 후 디스폰되고 놓친 진출을 반복 시도하지 않습니다.
+    */
+    if (!valid_lane_ecs(from_lane, road) || !valid_lane_ecs(fallback_lane, road)) return;
+    int rid = ecs.route_id[id];
+    int rpos = ecs.route_pos[id];
+    if (rid < 0 || rid >= road.num_routes) return;
+    int ro0 = road.route_offsets[rid];
+    int ro1 = road.route_offsets[rid + 1];
+    int route_len = ro1 - ro0;
+    if (route_len <= 1 || rpos < 0 || rpos >= route_len) return;
+
+    // If the chosen fallback lane actually appears later in the route, keep the
+    // route aligned normally.  Otherwise use the tail sentinel described above.
+    int scan_hi = min(route_len, rpos + ROUTE_NEXT_LANE_EQUIV_SCAN + 3);
+    for (int pos = rpos + 1; pos < scan_hi; ++pos) {
+        int route_lane = road.route_lanes[ro0 + pos];
+        if (route_lane_current_compatible_ecs(route_lane, fallback_lane, road)) {
+            ecs.route_pos[id] = max(0, pos - 1);
+            return;
+        }
+    }
+
+    ecs.route_pos[id] = max(0, route_len - 2);
+#else
+    (void)id; (void)from_lane; (void)fallback_lane; (void)ecs; (void)road;
+#endif
+}
+
+
 __device__ __forceinline__ int lane_steps_to_turn_lane_ecs(
     int lane,
     int turn,
@@ -2009,7 +2605,7 @@ __device__ __forceinline__ int upcoming_exit_lane_step_target_ecs(
     int rpos = ecs.route_pos[id];
     if (rid < 0 || rid >= road.num_routes) return -1;
 
-    int repaired_pos = repair_route_pos_for_current_lane_ecs(lane, rid, rpos, road);
+    int repaired_pos = repair_route_pos_unless_missed_exit_tail_ecs(lane, rid, rpos, road);
     if (repaired_pos >= 0) {
         rpos = repaired_pos;
         ecs.route_pos[id] = repaired_pos;
@@ -2099,15 +2695,29 @@ __device__ __forceinline__ int route_next_lane_for_vehicle_ecs(
     int route_len = ro1 - ro0;
     if (route_len <= 0 || route_len > 4096) return -1;
 
-    int repaired_pos = repair_route_pos_for_current_lane_ecs(lane, rid, rpos, road);
-    if (repaired_pos >= 0) {
-        rpos = repaired_pos;
-        ecs.route_pos[id] = repaired_pos;
+    bool skip_tail_repair = false;
+#if MISSED_EXIT_OFFROUTE_TAIL_ENABLED
+    if (rpos >= 0 && rpos < route_len && rpos >= route_len - 1) {
+        int tail_lane = road.route_lanes[ro0 + rpos];
+        skip_tail_repair = !route_lane_current_compatible_ecs(tail_lane, lane, road);
+    }
+#endif
+    if (!skip_tail_repair) {
+        int repaired_pos = repair_route_pos_unless_missed_exit_tail_ecs(lane, rid, rpos, road);
+        if (repaired_pos >= 0) {
+            rpos = repaired_pos;
+            ecs.route_pos[id] = repaired_pos;
+        }
     }
     if (rpos < 0 || rpos >= route_len) return -1;
 
     int next_pos = rpos + 1;
-    if (next_pos < 0 || next_pos >= route_len) return -1;
+    if (next_pos < 0 || next_pos >= route_len) {
+        // EN/KO: Normal route tail.  If this is a missed-exit off-route tail, the
+        // decision kernel keeps the vehicle alive until the current lane end and
+        // then despawns it; it should not keep inventing new route steps forever.
+        return -1;
+    }
 
     int scan_hi = min(route_len, next_pos + ROUTE_NEXT_LANE_EQUIV_SCAN);
     for (int pos = next_pos; pos < scan_hi; ++pos) {
@@ -2116,6 +2726,16 @@ __device__ __forceinline__ int route_next_lane_for_vehicle_ecs(
 
         int route_turn = road.route_turns[ro0 + max(0, pos - 1)];
         int turn = effective_turn_code_ecs(lane, candidate, route_turn, road);
+
+#if LANE_DROP_RECEIVING_BALANCE_ENABLED
+        if (turn == TURN_STRAIGHT || wide_group_continuation_candidate_ecs(lane, candidate, road)) {
+            int balanced = connected_balanced_equivalent_lane_from_group_ecs(lane, candidate, road);
+            if (valid_lane_ecs(balanced, road) && lane_connected(lane, balanced, road)) {
+                ecs.route_pos[id] = max(0, pos - 1);
+                return balanced;
+            }
+        }
+#endif
 
         int adjusted = interchange_receiving_outer_lane_ecs(lane, candidate, road);
         adjusted = receiving_lane_for_turn_ecs(adjusted, turn, road);
@@ -2147,6 +2767,20 @@ __device__ __forceinline__ int route_next_lane_for_vehicle_ecs(
         }
     }
 
+#if MISSED_EXIT_STRAIGHT_FALLBACK_ENABLED
+    // EN/KO: Off-route recovery.  If the cached route's next lane cannot be
+    // reached from the actual lane, keep the vehicle moving through the best
+    // straight continuation instead of leaving it stopped before the node.
+    {
+        int requested = (next_pos >= 0 && next_pos < route_len) ? road.route_lanes[ro0 + next_pos] : -1;
+        int fallback = missed_exit_straight_fallback_lane_ecs(id, lane, requested, road);
+        if (valid_lane_ecs(fallback, road) && lane_connected(lane, fallback, road)) {
+            ecs.route_pos[id] = max(0, next_pos - 1);
+            return fallback;
+        }
+    }
+#endif
+
     return -1;
 }
 
@@ -2170,7 +2804,7 @@ __device__ __forceinline__ int route_turn_for_vehicle_ecs(
     int lane = ecs.vehicle_state[id] == VEH_IN_CONNECTOR ? ecs.connector_from_lane[id] : ecs.lane_id[id];
     if (rid < 0 || rid >= road.num_routes) return TURN_STRAIGHT;
 
-    int repaired_pos = repair_route_pos_for_current_lane_ecs(lane, rid, rpos, road);
+    int repaired_pos = repair_route_pos_unless_missed_exit_tail_ecs(lane, rid, rpos, road);
     if (repaired_pos >= 0) {
         rpos = repaired_pos;
         ecs.route_pos[id] = repaired_pos;
@@ -3684,12 +4318,19 @@ __device__ __forceinline__ float desired_speed_ecs(
         aggr = dtype == AV ? 0.55f : 0.50f;
     }
 
+    // KO 문법 이유: lower bound를 변수로 계산한 뒤 clampf_cuda의 lo 인자로 넣습니다.
+    // KO 논리 이유: 사용자가 요구한 40km/h 이상은 "안전 제약이 없는 순항 희망속도"의
+    //    하한으로 적용합니다. 빨간불, 앞차, 차선변경 no-start, 급회전 connector는 기존
+    //    안전 로직이 계속 감속시킬 수 있어 충돌을 억지로 만들지 않습니다.
+    float min_cruise = avabm_min_cruise_speed_mps_ecs();
+    float effective_limit = fmaxf(limit, min_cruise);
+
     if (dtype == AV) {
-        return clampf_cuda(limit * factor, 3.0f, 36.0f);
+        return clampf_cuda(effective_limit * factor, fmaxf(3.0f, min_cruise), 36.0f);
     }
 
     float human_factor = factor + 0.10f * (aggr - 0.5f);
-    return clampf_cuda(limit * human_factor, 3.0f, 38.0f);
+    return clampf_cuda(effective_limit * human_factor, fmaxf(3.0f, min_cruise), 38.0f);
 }
 
 __device__ __forceinline__ float estimate_follow_accel_ecs(
@@ -3733,11 +4374,11 @@ __device__ __forceinline__ float estimate_follow_accel_ecs(
         v * T + (v * dv) / fmaxf(2.0f * sqrt_ab, 0.1f)
     );
 
-    float free_term = powf(v / fmaxf(desired_v, 0.1f), 4.0f);
+    float free_term = avabm_fourth_power_ecs(v / fmaxf(desired_v, 0.1f));
 
     float interact = 0.0f;
     if (front_gap < 1.0e8f) {
-        interact = powf(s_star / fmaxf(front_gap, 0.5f), 2.0f);
+        interact = avabm_second_power_ecs(s_star / fmaxf(front_gap, 0.5f));
     }
 
     float a = max_accel * (1.0f - free_term - interact);
@@ -4726,12 +5367,50 @@ __device__ __forceinline__ bool connector_exit_space_clear_ecs(
             int guard = 0;
             while (j >= 0 && guard < max_entities) {
                 if (j != self && ecs.alive[j] == ENTITY_ALIVE) {
+                    bool merge_bundle = lane_count_merge_transition_ecs(from_lane, to_lane, road);
                     bool on_surface = ecs.lane_id[j] == to_lane;
+#if LANE_DROP_CONNECTOR_GROUP_CLEAR_ENABLED
+                    if (merge_bundle && valid_lane_ecs(ecs.lane_id[j], road)) {
+#if CONNECTOR_GROUP_CLEAR_SAME_TARGET_ONLY
+                        on_surface = on_surface || (ecs.lane_id[j] == to_lane);
+#else
+                        on_surface = on_surface || lane_groups_same_ecs(ecs.lane_id[j], to_lane, road);
+#endif
+                    }
+#endif
                     if (ecs.vehicle_state[j] == VEH_IN_CONNECTOR) {
                         on_surface = on_surface || ecs.connector_from_lane[j] == to_lane || ecs.connector_to_lane[j] == to_lane;
+#if LANE_DROP_CONNECTOR_GROUP_CLEAR_ENABLED
+                        if (merge_bundle) {
+#if CONNECTOR_GROUP_CLEAR_SAME_TARGET_ONLY
+                            on_surface = on_surface || ecs.connector_from_lane[j] == to_lane || ecs.connector_to_lane[j] == to_lane;
+#else
+                            if (valid_lane_ecs(ecs.connector_from_lane[j], road)) {
+                                on_surface = on_surface || lane_groups_same_ecs(ecs.connector_from_lane[j], to_lane, road);
+                            }
+                            if (valid_lane_ecs(ecs.connector_to_lane[j], road)) {
+                                on_surface = on_surface || lane_groups_same_ecs(ecs.connector_to_lane[j], to_lane, road);
+                            }
+#endif
+                        }
+#endif
                     }
                     if (ecs.lane_change_active[j] != 0) {
                         on_surface = on_surface || ecs.lane_change_from_lane[j] == to_lane || ecs.lane_change_to_lane[j] == to_lane;
+#if LANE_DROP_CONNECTOR_GROUP_CLEAR_ENABLED
+                        if (merge_bundle) {
+#if CONNECTOR_GROUP_CLEAR_SAME_TARGET_ONLY
+                            on_surface = on_surface || ecs.lane_change_from_lane[j] == to_lane || ecs.lane_change_to_lane[j] == to_lane;
+#else
+                            if (valid_lane_ecs(ecs.lane_change_from_lane[j], road)) {
+                                on_surface = on_surface || lane_groups_same_ecs(ecs.lane_change_from_lane[j], to_lane, road);
+                            }
+                            if (valid_lane_ecs(ecs.lane_change_to_lane[j], road)) {
+                                on_surface = on_surface || lane_groups_same_ecs(ecs.lane_change_to_lane[j], to_lane, road);
+                            }
+#endif
+                        }
+#endif
                     }
                     if (!on_surface) {
                         j = grid.cell_next[j];
@@ -4748,6 +5427,18 @@ __device__ __forceinline__ bool connector_exit_space_clear_ecs(
                             eff_s = other_handoff - fmaxf(0.0f, clen - ecs.connector_s[j]);
                         } else if (ecs.connector_from_lane[j] == to_lane) {
                             eff_s = fmaxf(road.lane_length[to_lane], 0.1f) + ecs.connector_s[j];
+#if LANE_DROP_CONNECTOR_GROUP_CLEAR_ENABLED
+#if !CONNECTOR_GROUP_CLEAR_SAME_TARGET_ONLY
+                        } else if (merge_bundle && valid_lane_ecs(ecs.connector_to_lane[j], road) && lane_groups_same_ecs(ecs.connector_to_lane[j], to_lane, road)) {
+                            int cf = ecs.connector_from_lane[j];
+                            int ct = ecs.connector_to_lane[j];
+                            float clen = fmaxf(ecs.connector_length[j], CONNECTOR_MIN_LEN);
+                            float other_handoff = connector_exit_handoff_s(cf, ct, road);
+                            eff_s = other_handoff - fmaxf(0.0f, clen - ecs.connector_s[j]);
+                        } else if (merge_bundle && valid_lane_ecs(ecs.connector_from_lane[j], road) && lane_groups_same_ecs(ecs.connector_from_lane[j], to_lane, road)) {
+                            eff_s = fmaxf(road.lane_length[to_lane], 0.1f) + ecs.connector_s[j];
+#endif
+#endif
                         }
                     }
                     float ds = eff_s - handoff_s;
@@ -4773,7 +5464,11 @@ __device__ __forceinline__ bool zipper_merge_same_receiving_lanes_ecs(
 #if ZIPPER_MERGE_ENABLED
     if (!valid_lane_ecs(a_next, road) || !valid_lane_ecs(b_next, road)) return false;
     if (a_next == b_next) return true;
+#if LANE_DROP_TAPER_SAME_TARGET_ONLY
+    return false;
+#else
     return same_approach_same_direction_lanes_ecs(a_next, b_next, road);
+#endif
 #else
     return false;
 #endif
@@ -4873,6 +5568,34 @@ __device__ __forceinline__ bool connector_entry_clear_ecs(
                     int other_from = other_conn ? ecs.connector_from_lane[j] : ecs.lane_id[j];
                     int other_next = other_conn ? ecs.connector_to_lane[j] : route_next_lane_for_vehicle_ecs(j, ecs, road);
 
+                    /*
+                        EN: Syntax reason: the ternary expression above selects
+                            source/target fields by vehicle state; this if-block
+                            then refines only ON_LANE candidates whose final
+                            connector target has already been decided.
+                        KO: 문법 이유: 위 삼항 연산자는 차량 상태에 따라 source/target
+                            필드를 고르고, 이 if 블록은 decision_system_kernel이 최종
+                            connector 목표를 정한 ON_LANE 후보에만 target을 덮어씁니다.
+
+                        EN: Logic reason: decision may replace the raw route next
+                            lane with an edge-lane, missed-exit straight fallback,
+                            or repaired receiving lane.  Connector-entry conflict
+                            checks must compare against that final target; otherwise
+                            two cars aiming for the same receiving lane can miss the
+                            zipper/deadlock ordering rule.
+                        KO: 논리 이유: decision 단계에서 raw route next lane이 최외곽
+                            수신 차로, 진출 실패 직진 fallback, 또는 보정된 수신 차로로
+                            바뀔 수 있습니다. connector 진입 충돌 검사는 이 최종 target을
+                            기준으로 해야 같은 수신 차로 차량이 zipper/deadlock 순서 규칙을
+                            놓치지 않습니다.
+                    */
+                    if (!other_conn && decision.wants_connector[j] != 0) {
+                        int decided_next = decision.connector_target_lane[j];
+                        if (valid_lane_ecs(decided_next, road) && lane_connected(other_from, decided_next, road)) {
+                            other_next = decided_next;
+                        }
+                    }
+
                     if (other_from >= 0 && other_from < road.num_lanes && road.lane_end_node[other_from] == node) {
                         bool relevant = intersection_conflict_relevant_vehicles_ecs(
                             self,
@@ -4890,7 +5613,20 @@ __device__ __forceinline__ bool connector_entry_clear_ecs(
                         float dyp = ecs.y[j] - ecs.y[self];
                         float d = sqrtf(fmaxf(dxp * dxp + dyp * dyp, 0.001f));
 
-                        if (other_conn && relevant) {
+                        bool same_receiving_merge = zipper_merge_same_receiving_lanes_ecs(
+                            next_lane,
+                            other_next,
+                            road
+                        );
+                        bool lane_drop_gate = lane_count_merge_pair_conflict_ecs(
+                            lane,
+                            next_lane,
+                            other_from,
+                            other_next,
+                            road
+                        );
+
+                        if (other_conn && (relevant || same_receiving_merge || lane_drop_gate)) {
                             float other_len = fmaxf(ecs.connector_length[j], CONNECTOR_MIN_LEN);
                             float other_s = clampf_cuda(ecs.connector_s[j], 0.0f, other_len);
                             bool active_path_already_clear =
@@ -4902,7 +5638,25 @@ __device__ __forceinline__ bool connector_entry_clear_ecs(
                             //     prevents rear-end collisions.
                             // KO: 이미 충돌 지점을 지나 출구를 비우는 connector 때문에 노드 전체를
                             //     막지 않습니다. 같은 경로/앞차 gap 검사는 계속 추돌을 막습니다.
-                            if (!active_path_already_clear) {
+                            bool waited_overlap_release = false;
+#if OVERLAP_CONNECTOR_RELEASE_ENABLED
+                            if ((same_receiving_merge || lane_drop_gate) && !active_path_already_clear) {
+                                bool self_yields = zipper_merge_self_yields_ecs(
+                                    self, lane, next_lane, j, other_from, other_next, ecs, road, current_time
+                                );
+                                bool other_yields = zipper_merge_self_yields_ecs(
+                                    j, other_from, other_next, self, lane, next_lane, ecs, road, current_time
+                                );
+                                float self_wait = clampf_cuda(ecs.connector_length[self], 0.0f, 60.0f);
+                                bool exit_has_space = connector_exit_space_clear_ecs(self, lane, next_lane, ecs, road, grid, max_entities);
+                                waited_overlap_release =
+                                    self_wait >= OVERLAP_CONNECTOR_RELEASE_WAIT
+                                    && exit_has_space
+                                    && !self_yields
+                                    && other_yields;
+                            }
+#endif
+                            if (!active_path_already_clear && !waited_overlap_release) {
                                 return false;
                             }
                         }
@@ -4912,14 +5666,9 @@ __device__ __forceinline__ bool connector_entry_clear_ecs(
                             && decision.wants_connector[j] != 0
                             && d < CONNECTOR_ENTRY_CLEAR_RADIUS
                         ) {
-                            bool same_receiving_merge = zipper_merge_same_receiving_lanes_ecs(
-                                next_lane,
-                                other_next,
-                                road
-                            );
-                            bool merge_relevant = relevant || same_receiving_merge;
+                            bool merge_relevant = relevant || same_receiving_merge || lane_drop_gate;
                             if (merge_relevant) {
-                                if (same_receiving_merge) {
+                                if (same_receiving_merge || lane_drop_gate) {
                                     bool self_yields = zipper_merge_self_yields_ecs(
                                         self,
                                         lane,
@@ -5020,7 +5769,7 @@ __device__ __forceinline__ bool intersection_priority_context_ecs(
     int rpos = ecs.route_pos[id];
     if (rid < 0 || rid >= road.num_routes || rpos < 0) return false;
 
-    int repaired_pos = repair_route_pos_for_current_lane_ecs(lane, rid, rpos, road);
+    int repaired_pos = repair_route_pos_unless_missed_exit_tail_ecs(lane, rid, rpos, road);
     if (repaired_pos >= 0) {
         rpos = repaired_pos;
         ecs.route_pos[id] = repaired_pos;
@@ -5202,6 +5951,7 @@ __global__ void select_intersection_priority_candidates_kernel(
     int* priority_table,
     float* metrics,
     float current_time,
+    float dt,
     int max_entities
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -5336,7 +6086,21 @@ __device__ __forceinline__ bool priority_gate_path_blocked_ecs(
                                         other_s >= other_len * PRIORITY_GATE_ACTIVE_CLEAR_FRACTION
                                         || (other_len - other_s) <= PRIORITY_GATE_ACTIVE_EXIT_CLEAR_DIST;
 
+                                    bool waited_overlap_release = false;
+#if OVERLAP_CONNECTOR_RELEASE_ENABLED
                                     if (!active_path_already_clear) {
+                                        bool same_receiving_merge = zipper_merge_same_receiving_lanes_ecs(next_lane, other_next, road);
+                                        bool lane_drop_gate = lane_count_merge_pair_conflict_ecs(lane, next_lane, other_lane, other_next, road);
+                                        bool self_front_clear = priority_front_clear_ecs(self, perception, ecs);
+                                        float self_wait = clampf_cuda(ecs.connector_length[self], 0.0f, 60.0f);
+                                        waited_overlap_release =
+                                            (same_receiving_merge || lane_drop_gate)
+                                            && self_wait >= OVERLAP_CONNECTOR_RELEASE_WAIT
+                                            && self_front_clear
+                                            && connector_exit_space_clear_ecs(self, lane, next_lane, ecs, road, grid, max_entities);
+                                    }
+#endif
+                                    if (!active_path_already_clear && !waited_overlap_release) {
                                         if (out_active_hold) *out_active_hold = true;
                                         blocked = true;
                                     }
@@ -5685,6 +6449,44 @@ __global__ void clear_decision_kernel(
     decision.should_exit[i] = 0;
 }
 
+static inline void avabm_clear_int_async(
+    int* data,
+    int n,
+    int value,
+    cudaStream_t stream
+) {
+    if (data == nullptr || n <= 0) return;
+#if AVABM_USE_ASYNC_MEMSET_CLEAR
+    // KO 문법 이유: cudaMemsetAsync는 byte 값을 채우므로 int -1은 0xff 패턴일 때만
+    //    안전합니다. 여기서는 0과 -1만 빠른 경로로 보냅니다.
+    // KO 논리 이유: world grid와 reservation table은 매 tick 여러 번 전체 초기화됩니다.
+    //    별도 clear kernel launch 대신 CUDA runtime의 최적화된 memset을 쓰면 결과값은
+    //    같고 clear 비용과 launch overhead가 줄어듭니다.
+    if (value == 0 || value == -1) {
+        cudaMemsetAsync(data, value == 0 ? 0 : 0xff, (size_t)n * sizeof(int), stream);
+        return;
+    }
+#endif
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    clear_int_kernel<<<blocks, threads, 0, stream>>>(data, n, value);
+}
+
+static inline void avabm_clear_float_zero_async(
+    float* data,
+    int n,
+    cudaStream_t stream
+) {
+    if (data == nullptr || n <= 0) return;
+#if AVABM_USE_ASYNC_MEMSET_CLEAR
+    cudaMemsetAsync(data, 0, (size_t)n * sizeof(float), stream);
+#else
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    clear_float_kernel<<<blocks, threads, 0, stream>>>(data, n, 0.0f);
+#endif
+}
+
 // ============================================================
 // Spatial Hash System
 // ============================================================
@@ -5715,6 +6517,35 @@ __global__ void spatial_hash_build_system(
 
     int old = atomicExch(&grid.cell_head[cell], i);
     grid.cell_next[i] = old;
+}
+
+__device__ __forceinline__ void insert_new_spawn_into_grid_ecs(
+    int id,
+    ECSArrays ecs,
+    SpatialGrid grid
+) {
+    if (id < 0) return;
+
+    int cell = world_cell_index(
+        ecs.x[id],
+        ecs.y[id],
+        grid.min_x,
+        grid.min_y,
+        grid.cell_size,
+        grid.width,
+        grid.height
+    );
+
+    if (cell < 0) return;
+
+    // KO 문법 이유: atomicCAS loop는 next 포인터를 head 공개 전에 먼저 써 둘 수 있습니다.
+    // KO 논리 이유: spawn 중 다른 thread가 같은 grid를 읽으므로 atomicExch(head) 후
+    //    next를 쓰는 방식보다 연결 리스트 중간 상태를 덜 노출합니다.
+    int old_head;
+    do {
+        old_head = grid.cell_head[cell];
+        grid.cell_next[id] = old_head;
+    } while (atomicCAS(&grid.cell_head[cell], old_head, id) != old_head);
 }
 
 // ============================================================
@@ -5781,6 +6612,7 @@ __device__ __forceinline__ bool spawn_area_clear(
         limit = road.lane_speed_limit[lane];
         if (!isfinite(limit) || limit < 2.0f) limit = MAX_SPEED_FALLBACK;
     }
+    limit = fmaxf(limit, avabm_min_cruise_speed_mps_ecs());
 
     /* The safer driver model needs enough initial time headway.  The previous
        8 m spawn gap let cars appear inside another car's safe following zone,
@@ -5802,7 +6634,12 @@ __device__ __forceinline__ bool spawn_area_clear(
             int guard = 0;
 
             while (j >= 0 && guard < max_entities) {
-                if (j != exclude && ecs.alive[j] == ENTITY_ALIVE) {
+                int alive_state_j = ecs.alive[j];
+                bool blocks_spawn_j = alive_state_j == ENTITY_ALIVE;
+#if AVABM_SPAWN_GRID_INSERT_FASTPATH
+                blocks_spawn_j = blocks_spawn_j || alive_state_j == ENTITY_SPAWNING;
+#endif
+                if (j != exclude && blocks_spawn_j) {
                     float ddx = ecs.x[j] - px;
                     float ddy = ecs.y[j] - py;
                     float d2 = ddx * ddx + ddy * ddy;
@@ -5850,6 +6687,7 @@ __device__ __forceinline__ bool spawn_area_clear_fullscan(
         limit = road.lane_speed_limit[lane];
         if (!isfinite(limit) || limit < 2.0f) limit = MAX_SPEED_FALLBACK;
     }
+    limit = fmaxf(limit, avabm_min_cruise_speed_mps_ecs());
 
     float required_gap = fmaxf(12.0f, new_len + 0.80f * limit);
     float radial_gap = fmaxf(7.0f, 0.65f * required_gap);
@@ -5941,6 +6779,7 @@ __global__ void resolve_spawn_overlap_system_kernel(
         limit = road.lane_speed_limit[lane_i];
         if (!isfinite(limit) || limit < 2.0f) limit = MAX_SPEED_FALLBACK;
     }
+    limit = fmaxf(limit, avabm_min_cruise_speed_mps_ecs());
 
     float required_gap = fmaxf(14.0f, ecs.length[i] + 0.95f * limit);
     float radial_gap = fmaxf(8.0f, 0.70f * required_gap);
@@ -6174,6 +7013,7 @@ __global__ void spawn_system_kernel(
 
         float limit = road.lane_speed_limit[ln];
         if (!isfinite(limit) || limit < 2.0f) limit = MAX_SPEED_FALLBACK;
+        limit = fmaxf(limit, avabm_min_cruise_speed_mps_ecs());
 
         /* EN: A scheduled spawn is preserved, but it is not forced into an
            occupied entry cell.  The backlog remains in spawn_accumulator, which
@@ -6211,6 +7051,7 @@ __global__ void spawn_system_kernel(
             -1
         );
 
+#if !AVABM_SPAWN_GRID_INSERT_FASTPATH
         if (entry_clear) {
             // EN/KO: Full scan sees vehicles spawned earlier in this same step,
             // which are not present in the spatial grid until the rebuild below.
@@ -6226,6 +7067,7 @@ __global__ void spawn_system_kernel(
                 -1
             );
         }
+#endif
 
         if (!entry_clear) {
             deferred += count - c;
@@ -6278,7 +7120,19 @@ __global__ void spawn_system_kernel(
 
         // EN/KO: Only physically clear entries spawn.  Therefore every new car
         // can start as normal rolling traffic; congested demand waits invisibly.
+        // KO 문법 이유: spawn_v를 별도 변수로 계산해 lower bound가 upper bound보다
+        //    커지는 clamp 실수를 피합니다.
+        // KO 논리 이유: 40km/h 순항 하한을 켠 경우, 새 차량도 너무 낮은 초기속도로
+        //    긴 시간 가속하지 않게 합니다. 대신 위의 entry gap도 같은 하한 속도로
+        //    넓혔으므로 겹침 방지 로직은 유지됩니다.
+#if AVABM_MIN_CRUISE_SPEED_ENABLED
+        float min_spawn_v = avabm_min_cruise_speed_mps_ecs();
+        float spawn_v = fmaxf(limit * 0.45f, min_spawn_v);
+        spawn_v = fminf(spawn_v, fmaxf(limit, min_spawn_v));
+        ecs.speed[id] = fmaxf(0.0f, spawn_v);
+#else
         ecs.speed[id] = clampf_cuda(limit * 0.45f, 3.0f, limit * 0.7f);
+#endif
         ecs.accel[id] = 0.0f;
         ecs.heading[id] = lane_heading(ln, road);
         ecs.steer_angle[id] = 0.0f;
@@ -6320,6 +7174,14 @@ __global__ void spawn_system_kernel(
         rng_state[id + spawn.num_spawn_points] = rs;
 
         __threadfence();
+#if AVABM_SPAWN_GRID_INSERT_FASTPATH
+        // KO 문법 이유: 전처리 define으로 fast path를 컴파일 시 켜고 끌 수 있습니다.
+        // KO 논리 이유: 이전에는 같은 step에 이미 spawn된 차량을 찾기 위해
+        //    max_entities 전체를 full-scan했습니다. 이제 새 차량을 즉시 spatial grid에
+        //    넣어 다음 spawn 검사에서 같은 entry-clear 논리를 grid lookup으로 수행합니다.
+        insert_new_spawn_into_grid_ecs(id, ecs, grid);
+        __threadfence();
+#endif
         atomicExch((unsigned int*)&ecs.alive[id], (unsigned int)ENTITY_ALIVE);
         __threadfence();
 
@@ -6379,7 +7241,7 @@ __global__ void turn_signal_system_kernel(
         int rid = ecs.route_id[i];
         int rpos = ecs.route_pos[i];
         if (rid >= 0 && rid < road.num_routes) {
-            int repaired_pos = repair_route_pos_for_current_lane_ecs(lane, rid, rpos, road);
+            int repaired_pos = repair_route_pos_unless_missed_exit_tail_ecs(lane, rid, rpos, road);
             if (repaired_pos >= 0) {
                 rpos = repaired_pos;
                 ecs.route_pos[i] = repaired_pos;
@@ -6953,15 +7815,24 @@ __global__ void perception_system_kernel(
         return;
     }
 
-    int repaired_pos = repair_route_pos_for_current_lane_ecs(lane, rid, rpos, road);
-    if (repaired_pos >= 0) {
-        rpos = repaired_pos;
-        ecs.route_pos[i] = repaired_pos;
-    }
-
     int ro0 = road.route_offsets[rid];
     int ro1 = road.route_offsets[rid + 1];
     int route_len = ro1 - ro0;
+
+    bool skip_initial_tail_repair = false;
+#if MISSED_EXIT_OFFROUTE_TAIL_ENABLED
+    if (route_len > 0 && rpos >= 0 && rpos < route_len && rpos >= route_len - 1) {
+        int tail_lane = road.route_lanes[ro0 + rpos];
+        skip_initial_tail_repair = !route_lane_current_compatible_ecs(tail_lane, lane, road);
+    }
+#endif
+    if (!skip_initial_tail_repair) {
+        int repaired_pos = repair_route_pos_unless_missed_exit_tail_ecs(lane, rid, rpos, road);
+        if (repaired_pos >= 0) {
+            rpos = repaired_pos;
+            ecs.route_pos[i] = repaired_pos;
+        }
+    }
 
     if (route_len <= 0 || rpos < 0 || rpos >= route_len) {
         perception.front_gap[i] = 1.0e9f;
@@ -7540,6 +8411,23 @@ __device__ __forceinline__ int pick_open_lane_target_ecs(
         && cur_group_idx <= RIGHT_EDGE_BOTTLENECK_IDX_LIMIT;
 #endif
 
+    int balance_target_idx = -1;
+#if THROUGH_LANE_BALANCE_TARGET_ENABLED
+    if (allow_spread && cur_group_count > 1 && cur_group_idx >= 0) {
+        uint32_t lane_balance_hash = hash_u32_ecs(
+            ((uint32_t)(self + 701) * 1103515245u)
+            ^ ((uint32_t)(ecs.route_id[self] + 53) * 2654435761u)
+            ^ ((uint32_t)(road.lane_start_node[lane] + 17) * 747796405u)
+            ^ ((uint32_t)(road.lane_end_node[lane] + 29) * 2891336453u)
+        );
+        if (cur_group_count >= 3) {
+            balance_target_idx = 1 + (int)(lane_balance_hash % (uint32_t)(cur_group_count - 1));
+        } else {
+            balance_target_idx = (int)(lane_balance_hash % (uint32_t)cur_group_count);
+        }
+    }
+#endif
+
     int candidates[2] = {
         geometric_left_neighbor_ecs(lane, road),
         geometric_right_neighbor_ecs(lane, road)
@@ -7587,6 +8475,15 @@ __device__ __forceinline__ int pick_open_lane_target_ecs(
             && cur_group_idx >= 0
             && target_group_idx > cur_group_idx;
 
+        bool target_moves_toward_balance = false;
+#if THROUGH_LANE_BALANCE_TARGET_ENABLED
+        if (balance_target_idx >= 0 && target_group_count == cur_group_count && target_group_idx >= 0 && cur_group_idx >= 0) {
+            int cur_err = cur_group_idx > balance_target_idx ? cur_group_idx - balance_target_idx : balance_target_idx - cur_group_idx;
+            int tgt_err = target_group_idx > balance_target_idx ? target_group_idx - balance_target_idx : balance_target_idx - target_group_idx;
+            target_moves_toward_balance = tgt_err < cur_err;
+        }
+#endif
+
         bool empty_interval = fg >= LANE_SPREAD_EMPTY_FRONT_GAP && rg >= LANE_SPREAD_EMPTY_REAR_GAP;
 
         bool good_for_congestion =
@@ -7615,6 +8512,9 @@ __device__ __forceinline__ int pick_open_lane_target_ecs(
                 front_gain >= LANE_SPREAD_FRONT_GAIN
                 || (empty_interval && stable_random_preference)
                 || (front_gain >= 6.0f && rear_gain >= LANE_SPREAD_REAR_GAIN && stable_random_preference)
+#if THROUGH_LANE_BALANCE_TARGET_ENABLED
+                || (target_moves_toward_balance && front_gain >= -10.0f && rear_gain >= -4.0f)
+#endif
 #if RIGHT_EDGE_BOTTLENECK_AVOID_ENABLED
                 || (right_edge_pressure && target_is_inner && front_gain >= -RIGHT_EDGE_SAFE_FRONT_LOSS)
 #endif
@@ -7634,6 +8534,13 @@ __device__ __forceinline__ int pick_open_lane_target_ecs(
             if (right_edge_pressure && target_group_idx > cur_group_idx) score += RIGHT_EDGE_BOTTLENECK_PENALTY * 0.75f;
         }
 #endif
+#if THROUGH_LANE_BALANCE_TARGET_ENABLED
+        if (balance_target_idx >= 0 && target_group_count == cur_group_count && target_group_idx >= 0) {
+            int err = target_group_idx > balance_target_idx ? target_group_idx - balance_target_idx : balance_target_idx - target_group_idx;
+            score += THROUGH_LANE_BALANCE_TARGET_BONUS - (float)err * THROUGH_LANE_BALANCE_DISTANCE_PENALTY;
+            if (cur_group_count >= 3 && target_group_idx == 0) score -= THROUGH_LANE_BALANCE_RIGHT_EDGE_PENALTY;
+        }
+#endif
         if (good_for_congestion) score += 35.0f;
         if (front_lane_blocked && fg > blocked_gap * 2.0f) score += 12.0f;
 
@@ -7648,7 +8555,7 @@ __device__ __forceinline__ int pick_open_lane_target_ecs(
     }
 
 #if OPEN_LANE_EMPTIEST_GROUP_SCAN_ENABLED
-    if (best_lane < 0 && (spread_mode || congestion_mode)) {
+    if ((best_lane < 0 || right_edge_pressure) && (spread_mode || congestion_mode)) {
         // EN: If the adjacent lanes are not immediately compelling, scan the
         //     whole current lane bundle, pick the emptiest stable target lane,
         //     and move one adjacent lane toward it.  This keeps vehicles from
@@ -7665,6 +8572,13 @@ __device__ __forceinline__ int pick_open_lane_target_ecs(
             if (group_count >= RIGHT_EDGE_BOTTLENECK_MIN_GROUP) {
                 desired_score += (float)cur_idx * RIGHT_EDGE_INNER_BONUS;
                 if (cur_idx == 0) desired_score -= RIGHT_EDGE_BOTTLENECK_PENALTY;
+            }
+#endif
+#if THROUGH_LANE_BALANCE_TARGET_ENABLED
+            if (balance_target_idx >= 0) {
+                int err = cur_idx > balance_target_idx ? cur_idx - balance_target_idx : balance_target_idx - cur_idx;
+                desired_score += THROUGH_LANE_BALANCE_TARGET_BONUS - (float)err * THROUGH_LANE_BALANCE_DISTANCE_PENALTY;
+                if (group_count >= 3 && cur_idx == 0) desired_score -= THROUGH_LANE_BALANCE_RIGHT_EDGE_PENALTY;
             }
 #endif
             uint32_t slot = (uint32_t)floorf(current_time / OPEN_LANE_EMPTIEST_SCAN_PERIOD);
@@ -7702,11 +8616,25 @@ __device__ __forceinline__ int pick_open_lane_target_ecs(
                         if (right_edge_pressure && kk > cur_idx) score += RIGHT_EDGE_BOTTLENECK_PENALTY * 0.60f;
                     }
 #endif
+#if THROUGH_LANE_BALANCE_TARGET_ENABLED
+                    if (balance_target_idx >= 0) {
+                        int err = kk > balance_target_idx ? kk - balance_target_idx : balance_target_idx - kk;
+                        score += THROUGH_LANE_BALANCE_TARGET_BONUS - (float)err * THROUGH_LANE_BALANCE_DISTANCE_PENALTY;
+                        if (group_count >= 3 && kk == 0) score -= THROUGH_LANE_BALANCE_RIGHT_EDGE_PENALTY;
+                    }
+#endif
                     if (empty_interval) score += 18.0f;
                     if (fg > current_gap + OPEN_LANE_EMPTIEST_FRONT_GAIN) score += 7.0f;
                     float gain_need = OPEN_LANE_EMPTIEST_SCORE_GAIN;
 #if RIGHT_EDGE_BOTTLENECK_AVOID_ENABLED
                     if (right_edge_pressure && kk > cur_idx) gain_need = RIGHT_EDGE_SCAN_SCORE_GAIN;
+#endif
+#if THROUGH_LANE_BALANCE_TARGET_ENABLED
+                    if (balance_target_idx >= 0) {
+                        int cur_err = cur_idx > balance_target_idx ? cur_idx - balance_target_idx : balance_target_idx - cur_idx;
+                        int tgt_err = kk > balance_target_idx ? kk - balance_target_idx : balance_target_idx - kk;
+                        if (tgt_err < cur_err) gain_need = fminf(gain_need, -12.0f);
+                    }
 #endif
                     if (score > desired_score + gain_need) {
                         desired_score = score;
@@ -7739,11 +8667,18 @@ __device__ __forceinline__ int pick_open_lane_target_ecs(
                 );
                 bool safe_step = open_lane_candidate_safe_ecs(self, fg, fv, rg, rv, ecs, congestion_mode);
                 bool enough_step_gain = fg > current_gap + 3.0f || fg >= LANE_SPREAD_EMPTY_FRONT_GAP;
-#if RIGHT_EDGE_BOTTLENECK_AVOID_ENABLED
                 int step_idx = -1;
                 lane_group_count_and_index_ecs(step, road, step_idx);
+#if RIGHT_EDGE_BOTTLENECK_AVOID_ENABLED
                 if (right_edge_pressure && step_idx > cur_idx && fg >= current_gap - RIGHT_EDGE_SAFE_FRONT_LOSS) {
                     enough_step_gain = true;
+                }
+#endif
+#if THROUGH_LANE_BALANCE_TARGET_ENABLED
+                if (balance_target_idx >= 0 && step_idx >= 0) {
+                    int cur_err = cur_idx > balance_target_idx ? cur_idx - balance_target_idx : balance_target_idx - cur_idx;
+                    int step_err = step_idx > balance_target_idx ? step_idx - balance_target_idx : balance_target_idx - step_idx;
+                    if (step_err < cur_err && fg >= current_gap - 10.0f) enough_step_gain = true;
                 }
 #endif
                 if (safe_step && enough_step_gain) {
@@ -7793,6 +8728,7 @@ __device__ __forceinline__ bool mobil_decision_ecs(
     }
 
     bool human = ecs.driver_type[i] == HUMAN;
+    bool flow_balance_mandatory = mandatory && opportunistic;
 
     atomicAdd(&metrics[METRIC_MOBIL_EVAL], 1.0f);
 
@@ -7806,6 +8742,12 @@ __device__ __forceinline__ bool mobil_decision_ecs(
         * (1.20f - 0.55f * ecs.risk_tolerance[i]);
 
     rear_required += tr_v * (human ? 1.0f : 0.65f);
+    if (flow_balance_mandatory) {
+        // EN/KO: Special case for right-edge flow balancing.  This is still safety
+        // checked, but slightly less conservative than a legal turn-lane change so
+        // vehicles can actually leave the entry lane under dense but usable gaps.
+        rear_required *= FLOW_BALANCE_MANDATORY_REAR_SCALE;
+    }
 
     if (tr_gap < rear_required || (tr_v > ecs.speed[i] + 0.65f && tr_gap < rear_required * 1.55f)) {
         atomicAdd(&metrics[METRIC_LC_REJECT], 1.0f);
@@ -7817,6 +8759,9 @@ __device__ __forceinline__ bool mobil_decision_ecs(
         * (1.15f - 0.45f * ecs.risk_tolerance[i]);
 
     front_required += ecs.speed[i] * (human ? 0.85f : 0.55f);
+    if (flow_balance_mandatory) {
+        front_required *= FLOW_BALANCE_MANDATORY_FRONT_SCALE;
+    }
 
     if (tf_gap < front_required) {
         atomicAdd(&metrics[METRIC_LC_REJECT], 1.0f);
@@ -7930,15 +8875,24 @@ __global__ void decision_system_kernel(
         return;
     }
 
-    int repaired_pos = repair_route_pos_for_current_lane_ecs(lane, rid, rpos, road);
-    if (repaired_pos >= 0) {
-        rpos = repaired_pos;
-        ecs.route_pos[i] = repaired_pos;
-    }
-
     int ro0 = road.route_offsets[rid];
     int ro1 = road.route_offsets[rid + 1];
     int route_len = ro1 - ro0;
+
+    bool skip_initial_tail_repair = false;
+#if MISSED_EXIT_OFFROUTE_TAIL_ENABLED
+    if (route_len > 0 && rpos >= 0 && rpos < route_len && rpos >= route_len - 1) {
+        int tail_lane = road.route_lanes[ro0 + rpos];
+        skip_initial_tail_repair = !route_lane_current_compatible_ecs(tail_lane, lane, road);
+    }
+#endif
+    if (!skip_initial_tail_repair) {
+        int repaired_pos = repair_route_pos_unless_missed_exit_tail_ecs(lane, rid, rpos, road);
+        if (repaired_pos >= 0) {
+            rpos = repaired_pos;
+            ecs.route_pos[i] = repaired_pos;
+        }
+    }
 
     if (route_len <= 0 || rpos < 0 || rpos >= route_len) {
         decision.should_exit[i] = 1;
@@ -7946,12 +8900,26 @@ __global__ void decision_system_kernel(
     }
 
     int route_lane = road.route_lanes[ro0 + rpos];
-    if (!route_lane_current_compatible_ecs(route_lane, lane, road)) {
+    bool route_lane_incompatible_now = !route_lane_current_compatible_ecs(route_lane, lane, road);
+    if (route_lane_incompatible_now) {
         int downstream_next = (rpos + 1 < route_len) ? road.route_lanes[ro0 + rpos + 1] : -1;
-        if (!valid_lane_ecs(downstream_next, road) || !lane_connected(lane, downstream_next, road)) {
+        int straight_recovery = missed_exit_straight_fallback_lane_ecs(i, lane, downstream_next, road);
+        bool missed_exit_tail =
+#if MISSED_EXIT_OFFROUTE_TAIL_ENABLED
+            (rpos >= route_len - 1 && !valid_lane_ecs(downstream_next, road));
+#else
+            false;
+#endif
+        if (
+            (!valid_lane_ecs(downstream_next, road) || !lane_connected(lane, downstream_next, road))
+            && !valid_lane_ecs(straight_recovery, road)
+            && !missed_exit_tail
+        ) {
             // EN/KO: Irreparable route/lane mismatch must not leave a vehicle
             // parked in the road.  Remove the broken vehicle instead of feeding
-            // invalid route data into the controller forever.
+            // invalid route data into the controller forever.  A missed-exit tail
+            // sentinel is different: it is allowed to roll to the current lane end
+            // and then despawn, so it is not deleted mid-link.
             decision.should_exit[i] = 1;
             return;
         }
@@ -7966,18 +8934,26 @@ __global__ void decision_system_kernel(
         && next_lane < road.num_lanes
         && lane_connected(lane, next_lane, road);
 
+    bool missed_exit_straight_target = false;
     if (has_next) {
-        turn = effective_turn_code_ecs(lane, next_lane, turn, road);
+        missed_exit_straight_target = missed_exit_straight_target_ecs(i, lane, next_lane, ecs, road);
+        if (missed_exit_straight_target) {
+            turn = TURN_STRAIGHT;
+        } else {
+            turn = effective_turn_code_ecs(lane, next_lane, turn, road);
 
-        int adjusted_next = interchange_receiving_outer_lane_ecs(lane, next_lane, road);
-        adjusted_next = receiving_lane_for_turn_ecs(adjusted_next, turn, road);
-        adjusted_next = interchange_receiving_outer_lane_ecs(lane, adjusted_next, road);
-        if (valid_lane_ecs(adjusted_next, road) && lane_connected(lane, adjusted_next, road)) {
-            next_lane = adjusted_next;
+            int adjusted_next = interchange_receiving_outer_lane_ecs(lane, next_lane, road);
+            adjusted_next = receiving_lane_for_turn_ecs(adjusted_next, turn, road);
+            adjusted_next = interchange_receiving_outer_lane_ecs(lane, adjusted_next, road);
+            if (valid_lane_ecs(adjusted_next, road) && lane_connected(lane, adjusted_next, road)) {
+                next_lane = adjusted_next;
+            }
         }
     }
 
-    int interchange_source_lane = has_next ? interchange_source_outer_lane_ecs(lane, next_lane, road) : -1;
+    int interchange_source_lane = (has_next && !missed_exit_straight_target)
+        ? interchange_source_outer_lane_ecs(lane, next_lane, road)
+        : -1;
 
     bool human = ecs.driver_type[i] == HUMAN;
 
@@ -8042,22 +9018,70 @@ __global__ void decision_system_kernel(
     if (mandatory_lc_pending) {
         bool too_late_to_start_lc = dist_to_end <= fmaxf(lc_no_start_dist, MISSED_TURN_ESCAPE_DIST);
         float front_open = fmaxf(SMART_STALL_FRONT_GAP, ecs.length[i] + MIN_BUMPER_GAP + 8.0f);
-        if (too_late_to_start_lc) {
-            float w = ecs.connector_length[i];
-            if (!isfinite(w) || w < 0.0f || ecs.vehicle_state[i] != VEH_ON_LANE) w = 0.0f;
-            if (ecs.speed[i] < 1.0f || perception.front_gap[i] > front_open) {
-                w = fminf(w + dt, 30.0f);
-            }
-            ecs.connector_length[i] = w;
 
-            // EN: If a mandatory merge was missed, do not let the car park forever
-            // in the travel lane.  After a short wait and only with a clear front
-            // path, allow a slow late-turn escape.  This sacrifices strict lane
-            // compliance only to prevent network-wide deadlock.
-            // KO: 회전 전용 차선 진입을 놓쳤다고 주행 차로 한가운데 영구 정차하지
-            // 않게 합니다. 짧게 기다린 뒤 앞 경로가 열려 있을 때만 저속 late-turn
-            // escape를 허용합니다. 이는 네트워크 전체 데드락 방지를 위한 최후 수단입니다.
-            if (w >= MISSED_TURN_ESCAPE_WAIT && perception.front_gap[i] > front_open) {
+        // EN: Count how long the vehicle has been unable to reach a mandatory
+        //     turn/exit lane.  v21 only switched to straight fallback inside the
+        //     final no-start zone; on short or congested segments a car could brake
+        //     earlier, never get a safe adjacent gap, and become the head of a
+        //     deadlock queue.  Once the wait timer is high enough and the front is
+        //     not physically blocked, we treat the exit as missed and keep going
+        //     straight rather than freezing the network.
+        // KO: 필수 좌/우 진출 차로에 도달하지 못한 시간을 누적합니다. v21은 마지막
+        //     no-start 구간 안에서만 직진 fallback을 시도했기 때문에, 짧거나 혼잡한
+        //     segment에서는 차량이 더 일찍 감속한 뒤 옆 차선 gap을 못 잡고 대기열의
+        //     머리가 되는 경우가 있었습니다. 일정 시간 이상 막혔고 앞이 물리적으로
+        //     막힌 상황이 아니면, 해당 진출은 놓친 것으로 보고 직진시켜 네트워크를
+        //     멈추지 않습니다.
+        float w = ecs.connector_length[i];
+        if (!isfinite(w) || w < 0.0f || ecs.vehicle_state[i] != VEH_ON_LANE) w = 0.0f;
+        bool waiting_for_mandatory_gap =
+            dist_to_end <= fmaxf(turn_prep_dist, lc_no_start_dist + 24.0f)
+            && ecs.lane_change_active[i] == 0
+            && (ecs.speed[i] < 1.2f || perception.front_gap[i] > front_open);
+        if (waiting_for_mandatory_gap) {
+            w = fminf(w + dt, 30.0f);
+        } else if (dist_to_end > turn_prep_dist + 12.0f) {
+            w = 0.0f;
+        }
+        ecs.connector_length[i] = w;
+
+        bool waited_out_missed_exit =
+            w >= MISSED_TURN_ESCAPE_WAIT
+            && dist_to_end <= fmaxf(lc_no_start_dist + 18.0f, turn_prep_dist * 0.62f)
+            && perception.front_gap[i] > front_open;
+
+        if (too_late_to_start_lc || waited_out_missed_exit) {
+            int straight_escape = missed_exit_straight_fallback_lane_ecs(i, lane, next_lane, road);
+            if (valid_lane_ecs(straight_escape, road) && lane_connected(lane, straight_escape, road)) {
+                // EN: Missed exit policy.  A vehicle that failed to reach the
+                // required edge lane should continue straight; it must not stop
+                // forever or cut across several lanes at the node.
+                // KO: 진출 실패 정책입니다. 필수 가장자리 차로를 맞추지 못한 차량은
+                // 노드에서 멈추거나 여러 차선을 가로지르지 않고 직진 연결로를 탑니다.
+                next_lane = straight_escape;
+                has_next = true;
+                missed_exit_straight_target = true;
+                // EN: Do not advance route_pos here.  The vehicle may still be
+                // blocked by connector priority/safety this tick.  The route tail is
+                // committed in the connector-entry section after admission succeeds.
+                // KO: 여기서 route_pos를 먼저 넘기지 않습니다. 이번 tick에 connector
+                // 우선순위/안전 검사에서 막힐 수 있기 때문입니다. 실제 진입이 확정된
+                // 뒤 connector-entry 구간에서 route tail을 확정합니다.
+                turn = TURN_STRAIGHT;
+                interchange_source_lane = -1;
+                interchange_needs_outer_lane = false;
+                ordinary_turn_needs_dedicated_lane = false;
+                turn_needs_dedicated_lane = false;
+                turn_lane_ok = true;
+                turn_lc_target = -1;
+                turn_lane_steps = 0;
+                turn_prep_dist = 0.0f;
+                mandatory_lc_pending = false;
+                desired_v = fmaxf(desired_v, human ? SMART_STALL_RELEASE_SPEED_HUMAN : SMART_STALL_RELEASE_SPEED_AV);
+                atomicAdd(&metrics[METRIC_DEADLOCK_ESCAPE_GO], 1.0f);
+            } else if (w >= MISSED_TURN_ESCAPE_WAIT && perception.front_gap[i] > front_open) {
+                // EN/KO: If no straight continuation exists, keep the previous
+                // conservative late-turn escape as a final network-drain guard.
                 turn_lane_ok = true;
                 mandatory_lc_pending = false;
                 float escape_cap = human ? MISSED_TURN_ESCAPE_SPEED_HUMAN : MISSED_TURN_ESCAPE_SPEED_AV;
@@ -8465,8 +9489,30 @@ __global__ void decision_system_kernel(
             );
 
         if (no_adjacent_turn_lane || too_close_for_lane_change) {
-            acc_cmd = fminf(acc_cmd, turn_lane_hold_accel_ecs(dist_to_end, v, ecs.driver_type[i]));
-            atomicAdd(&metrics[METRIC_TURN_LANE_BLOCK], 1.0f);
+            int straight_escape = missed_exit_straight_fallback_lane_ecs(i, lane, next_lane, road);
+            if (valid_lane_ecs(straight_escape, road) && lane_connected(lane, straight_escape, road)) {
+                // EN: The old hard hold was a deadlock source: once the vehicle was
+                // too close to change into the required exit lane, it kept braking
+                // forever.  v23 converts that state into a straight fallback.
+                // KO: 기존 hard hold는 데드락 원인이었습니다. 필수 진출 차로로
+                // 바꾸기엔 이미 늦은 차량이 계속 감속만 했기 때문입니다. v23에서는
+                // 이 상태를 직진 fallback으로 바꿔 노드를 비우게 합니다.
+                next_lane = straight_escape;
+                has_next = true;
+                missed_exit_straight_target = true;
+                turn = TURN_STRAIGHT;
+                turn_needs_dedicated_lane = false;
+                turn_lane_ok = true;
+                mandatory_lc_pending = false;
+                // EN/KO: route_pos is intentionally left unchanged until the
+                // connector entry is actually granted; otherwise a blocked car could
+                // look off-route before it has moved.
+                acc_cmd = fmaxf(acc_cmd, 0.15f * max_accel);
+                atomicAdd(&metrics[METRIC_DEADLOCK_ESCAPE_GO], 1.0f);
+            } else {
+                acc_cmd = fminf(acc_cmd, turn_lane_hold_accel_ecs(dist_to_end, v, ecs.driver_type[i]));
+                atomicAdd(&metrics[METRIC_TURN_LANE_BLOCK], 1.0f);
+            }
         }
     }
 
@@ -8688,6 +9734,26 @@ __global__ void decision_system_kernel(
     }
 #endif
 
+    // EN: Right-edge override for ramp-entry balancing.  Ordinary random cruising
+    //     respects lc_cooldown, but the physical right receiving lane is also where
+    //     downstream ramps/exits attach.  If every entering vehicle waits for the
+    //     generic cooldown, the right lane becomes an artificial queue unrelated to
+    //     the bottleneck being studied.  This override only lets the decision logic
+    //     *attempt* a move; MOBIL/front-rear safety checks still decide whether it
+    //     can actually start.
+    // KO: 램프 전입 분산을 위한 우측 끝 차로 예외입니다. 일반 랜덤 순항 차선변경은
+    //     cooldown을 지키지만, 우측 수신 차로는 다른 전출입로와도 연결되는 분석 대상
+    //     차로입니다. 모든 전입 차량이 cooldown 때문에 우측 차로에 남아 있으면 실제
+    //     병목이 아니라 인위적인 줄이 생깁니다. 이 예외는 '시도'만 허용하며, 실제 시작은
+    //     기존 MOBIL/앞뒤 gap 안전검사를 통과해야 합니다.
+    int balance_cur_idx = -1;
+    int balance_group_count = lane_group_count_and_index_ecs(lane, road, balance_cur_idx);
+    bool right_edge_balance_override =
+        balance_group_count >= RIGHT_EDGE_BOTTLENECK_MIN_GROUP
+        && balance_cur_idx >= 0
+        && balance_cur_idx <= THROUGH_LANE_BALANCE_FORCE_RIGHT_IDX
+        && upcoming_event_dist > RIGHT_EDGE_FORCE_INNER_MIN_EXIT_DIST;
+
     int lc_target = -1;
     bool mandatory_lc = false;
     bool opportunistic_lc = false;
@@ -8729,6 +9795,43 @@ __global__ void decision_system_kernel(
         mandatory_lc = true;
         atomicAdd(&metrics[METRIC_TURN_LANE_PREP], 1.0f);
     } else if (
+#if THROUGH_LANE_BALANCE_LC_ENABLED
+        ecs.lane_change_active[i] == 0
+        && !turn_needs_dedicated_lane
+        && (turn == TURN_STRAIGHT || upcoming_event_dist > OPEN_LANE_EMPTIEST_MIN_EXIT_DIST)
+        && balance_group_count >= RIGHT_EDGE_BOTTLENECK_MIN_GROUP
+        && road.lane_length[lane] >= THROUGH_LANE_BALANCE_LC_MIN_LINK_LENGTH
+        && dist_to_end > fmaxf(THROUGH_LANE_BALANCE_LC_MIN_DIST_TO_NODE, lc_no_start_dist + 2.0f)
+        && (ecs.lc_cooldown[i] <= CRUISE_RANDOM_LANE_COOLDOWN_READY || right_edge_balance_override)
+#else
+        false
+#endif
+    ) {
+        // EN: Deterministic through-lane balancing.  Right-ramp entrants are
+        // physically inserted on the right edge, but once on a multi-lane
+        // mainline they should migrate to a stable spread target when safe.
+        // KO: 결정론적 직진 차로 분산입니다. 우측 전입로 차량은 물리적으로 우측
+        // 끝에서 진입하지만, 다차로 본선에 올라온 뒤에는 안전한 경우 안정 목표
+        // 차선으로 퍼집니다.
+        int cruise_target = random_cruise_lane_step_target_ecs(i, lane, ecs, road);
+        if (valid_lane_ecs(cruise_target, road) && same_approach_same_direction_lanes_ecs(lane, cruise_target, road)) {
+            lc_target = cruise_target;
+            opportunistic_lc = true;
+            int cur_idx_force = -1;
+            int tgt_idx_force = -1;
+            int cur_count_force = lane_group_count_and_index_ecs(lane, road, cur_idx_force);
+            int tgt_count_force = lane_group_count_and_index_ecs(cruise_target, road, tgt_idx_force);
+            if (
+                cur_count_force >= RIGHT_EDGE_BOTTLENECK_MIN_GROUP
+                && tgt_count_force == cur_count_force
+                && cur_idx_force <= THROUGH_LANE_BALANCE_FORCE_RIGHT_IDX
+                && tgt_idx_force > cur_idx_force
+            ) {
+                mandatory_lc = true;
+                opportunistic_lc = true;
+            }
+        }
+    } else if (
         ecs.lane_change_active[i] == 0
         && next_lane >= 0
         && next_lane != lane
@@ -8769,6 +9872,32 @@ __global__ void decision_system_kernel(
             lc_target = open_target;
             mandatory_lc = false;
             opportunistic_lc = true;
+#if RIGHT_EDGE_FORCE_INNER_LC_ENABLED
+            int cur_idx_force = -1;
+            int tgt_idx_force = -1;
+            int cur_count_force = lane_group_count_and_index_ecs(lane, road, cur_idx_force);
+            int tgt_count_force = lane_group_count_and_index_ecs(open_target, road, tgt_idx_force);
+            float force_blocked_gap = fmaxf(
+                CONGESTION_ESCAPE_CURRENT_GAP,
+                ecs.length[i] + MIN_BUMPER_GAP + fmaxf(0.0f, v) * 0.95f
+            );
+            bool force_front_blocked = perception.front_gap[i] < force_blocked_gap
+                || (perception.front_gap[i] < force_blocked_gap * 1.85f && perception.front_speed[i] + 2.0f < v);
+            bool force_right_to_inner =
+                cur_count_force >= RIGHT_EDGE_BOTTLENECK_MIN_GROUP
+                && tgt_count_force == cur_count_force
+                && cur_idx_force >= 0
+                && tgt_idx_force > cur_idx_force
+                && cur_idx_force <= RIGHT_EDGE_FORCE_INNER_MAX_CUR_IDX
+                && upcoming_event_dist > RIGHT_EDGE_FORCE_INNER_MIN_EXIT_DIST;
+            if (force_front_blocked || force_right_to_inner) {
+                // Safety gaps were already refreshed by pick_open_lane_target_ecs;
+                // treat this as a required flow-balancing move so MOBIL utility
+                // cannot keep every through vehicle glued to the right edge.
+                mandatory_lc = true;
+                opportunistic_lc = true;
+            }
+#endif
         }
 #if CRUISE_RANDOM_LANE_CHANGE_ENABLED
         else if (
@@ -8829,6 +9958,20 @@ __global__ void decision_system_kernel(
         if (valid_lane_ecs(open_target, road)) {
             lc_target = open_target;
             opportunistic_lc = true;
+#if RIGHT_EDGE_FORCE_INNER_LC_ENABLED
+            int cur_idx_force = -1;
+            int tgt_idx_force = -1;
+            int cur_count_force = lane_group_count_and_index_ecs(lane, road, cur_idx_force);
+            int tgt_count_force = lane_group_count_and_index_ecs(open_target, road, tgt_idx_force);
+            if (cur_count_force >= RIGHT_EDGE_BOTTLENECK_MIN_GROUP
+                && tgt_count_force == cur_count_force
+                && cur_idx_force >= 0
+                && tgt_idx_force > cur_idx_force
+                && cur_idx_force <= RIGHT_EDGE_FORCE_INNER_MAX_CUR_IDX) {
+                mandatory_lc = true;
+                opportunistic_lc = true;
+            }
+#endif
         }
 #if CRUISE_RANDOM_LANE_CHANGE_ENABLED
         else if (ecs.lc_cooldown[i] <= CRUISE_RANDOM_LANE_COOLDOWN_READY) {
@@ -8918,11 +10061,36 @@ __global__ void decision_system_kernel(
         );
     }
 
+    bool node_continuation_release = false;
+#if NODE_CONTINUATION_RELEASE_ENABLED
+    if (has_next && turn == TURN_STRAIGHT) {
+        int from_count_release = lane_group_count_ecs(lane, road);
+        int to_count_release = lane_group_count_ecs(next_lane, road);
+        bool taper_continuation = wide_lane_count_change_continuation_ecs(lane, next_lane, road);
+        bool ramp_edge_merge =
+            from_count_release <= INTERCHANGE_RAMP_MAX_GROUP_LANES
+            && to_count_release >= INTERCHANGE_MAIN_MIN_GROUP_LANES;
+        bool front_space_release = perception.front_gap[i] > fmaxf(
+            CONNECTOR_EXIT_SPACE_MIN,
+            ecs.length[i] + MIN_BUMPER_GAP + fmaxf(0.0f, v) * 0.75f
+        );
+        node_continuation_release =
+            (taper_continuation || ramp_edge_merge)
+            && front_space_release
+            && dist_to_end <= connector_trigger_dist + 4.0f;
+    }
+#endif
+
     bool priority_permits_connector =
         self_inside_intersection_box
         || !unsignal_node
         || !unsignal_blocked
-        || unsignal_deadlock_release;
+        || unsignal_deadlock_release
+        || node_continuation_release;
+
+    if (node_continuation_release) {
+        reservation_granted = true;
+    }
 
     if (
         has_next
@@ -8988,14 +10156,34 @@ __global__ void lane_change_system_kernel(
 
             int sig = indicator_from_lateral_move_ecs(lane, target, road);
             if (sig != INDICATOR_NONE && ecs.turn_signal != nullptr) {
-                if (ecs.turn_signal[i] != sig) {
-                    ecs.turn_signal[i] = sig;
-                    if (ecs.turn_signal_time != nullptr) ecs.turn_signal_time[i] = dt;
-                    return;
-                }
-                if (ecs.turn_signal_time != nullptr && ecs.turn_signal_time[i] < LANE_CHANGE_SIGNAL_LEAD_TIME) {
-                    ecs.turn_signal_time[i] = fminf(ecs.turn_signal_time[i] + dt, LANE_CHANGE_SIGNAL_LEAD_TIME);
-                    return;
+                /*
+                    EN: The decision kernel has already passed the safety-gap and
+                    MOBIL checks for this exact target lane.  In older builds this
+                    function returned for LANE_CHANGE_SIGNAL_LEAD_TIME after turning
+                    the indicator on.  That looked polite, but the earlier
+                    turn_signal_system_kernel often reset opportunistic through-lane
+                    indicators to OFF every frame because those lane changes are not
+                    encoded in the route.  The timer therefore never accumulated and
+                    right-ramp vehicles stayed in the entry lane forever.
+
+                    The indicator is still published for courtesy/yield logic, but a
+                    decision-approved lane change now starts in the same frame.  This
+                    keeps the behavior observable while ensuring that safe balancing
+                    requests are actually executed.
+
+                    KO: decision 커널에서 이미 해당 target 차선의 안전 gap과 MOBIL
+                    검사를 통과했습니다. 과거에는 여기서 방향지시등 lead time을 기다리며
+                    return 했는데, 직진 차로 분산은 route에 기록된 회전이 아니므로 앞단의
+                    turn_signal_system_kernel이 매 프레임 깜빡이를 꺼 버릴 수 있었습니다.
+                    그 결과 타이머가 누적되지 않아 우측 전입 차량이 계속 진입 차선에
+                    고착되었습니다.
+
+                    이제 깜빡이는 주변 차량 양보 로직을 위해 계속 켜되, 안전 판정을 통과한
+                    차선변경은 같은 프레임에 시작합니다.
+                */
+                ecs.turn_signal[i] = sig;
+                if (ecs.turn_signal_time != nullptr) {
+                    ecs.turn_signal_time[i] = fmaxf(ecs.turn_signal_time[i], LANE_CHANGE_SIGNAL_LEAD_TIME);
                 }
             }
 
@@ -9003,8 +10191,22 @@ __global__ void lane_change_system_kernel(
             ecs.lane_change_from_lane[i] = lane;
             ecs.lane_change_to_lane[i] = target;
             ecs.lane_change_t[i] = 0.0f;
-            ecs.lane_change_duration[i] =
-                human ? LANE_CHANGE_DURATION_HUMAN : LANE_CHANGE_DURATION_AV;
+
+            // EN: Fit the lane-change duration to the remaining usable straight
+            //     segment when the GIS link is short.  The request has already
+            //     passed safety checks; shortening only the animation duration lets
+            //     a safe move finish before the next node instead of being aborted
+            //     frame after frame by the finish-before-node guard.
+            // KO: GIS link가 짧을 때 남은 직선 구간 안에 차선변경이 끝나도록 시간을
+            //     조정합니다. 안전 gap 검사는 이미 통과했으므로, 여기서는 애니메이션
+            //     시간만 줄여 다음 노드 직전 finish guard에 매번 걸리지 않게 합니다.
+            float base_duration = human ? LANE_CHANGE_DURATION_HUMAN : LANE_CHANGE_DURATION_AV;
+            float min_duration = human ? LANE_CHANGE_MIN_DURATION_HUMAN : LANE_CHANGE_MIN_DURATION_AV;
+            float usable_dist = fmaxf(0.0f, dist_to_node - finish_dist);
+            float speed_for_duration = fmaxf(fmaxf(ecs.speed[i], road.lane_speed_limit[lane] * 0.25f), 2.0f);
+            float fit_duration = 0.85f * usable_dist / speed_for_duration;
+            ecs.lane_change_duration[i] = clampf_cuda(fminf(base_duration, fit_duration), min_duration, base_duration);
+
             ecs.lc_cooldown[i] =
                 human ? LC_COOLDOWN_HUMAN : LC_COOLDOWN_AV;
             if (sig != INDICATOR_NONE && ecs.turn_signal != nullptr) {
@@ -9199,6 +10401,32 @@ __global__ void motion_system_kernel(
             && valid_lane_ecs(from_ln, road)
             && valid_lane_ecs(to_ln, road)
         ) {
+#if LANE_DROP_ACTIVE_LC_ABORT_ON_UNSAFE
+            // EN: v17 could force-finish a late lane change even when the target
+            //     gap had already closed.  That fixed some stalls but created
+            //     side-overlap collisions in 4->3 tapers.  In v18, an unsafe
+            //     target at the no-start barrier is aborted back to the original
+            //     lane; the connector zipper gate then meters the taper one-by-one.
+            // KO: v17은 target gap이 닫힌 상태에서도 후반 차선변경을 강제 완료할 수
+            //     있어 4->3 테이퍼에서 측면 겹침 충돌이 생길 수 있었습니다. v18은
+            //     no-start 경계에서 target이 안전하지 않으면 원 차로로 취소하고, 이후
+            //     connector 지퍼 게이트가 병목을 한 대씩 통과시킵니다.
+            ecs.lane_change_active[i] = 0;
+            ecs.lane_change_from_lane[i] = from_ln;
+            ecs.lane_change_to_lane[i] = from_ln;
+            ecs.lane_change_t[i] = 0.0f;
+            ecs.lane_id[i] = from_ln;
+            lane = from_ln;
+            L = fmaxf(road.lane_length[lane], 0.1f);
+            s_next = fminf(s_next, L - 0.05f);
+            v_next = fminf(v_next, fmaxf(0.55f, v));
+            acc_cmd = fmaxf(acc_cmd, 0.0f);
+            if (ecs.turn_signal != nullptr) {
+                ecs.turn_signal[i] = INDICATOR_NONE;
+                if (ecs.turn_signal_time != nullptr) ecs.turn_signal_time[i] = 0.0f;
+            }
+            atomicAdd(&metrics[METRIC_LC_REJECT], 1.0f);
+#else
             if (t_prog < 0.50f || t_prog <= LANE_DROP_ACTIVE_LC_ABORT_T) {
                 ecs.lane_change_active[i] = 0;
                 ecs.lane_change_from_lane[i] = from_ln;
@@ -9218,6 +10446,7 @@ __global__ void motion_system_kernel(
                 force_lc_finish_now = true;
                 ecs.lane_change_t[i] = dur;
             }
+#endif
         }
 
         if (ecs.lane_change_active[i] != 0 && s_next > lc_stop_s && !force_lc_finish_now) {
@@ -9305,7 +10534,7 @@ __global__ void motion_system_kernel(
                 atomicAdd(&metrics[METRIC_LANE_CHANGE_TIME_COUNT], 1.0f);
 
                 ecs.lane_id[i] = to_ln;
-                int repaired_after_lc = repair_route_pos_for_current_lane_ecs(to_ln, ecs.route_id[i], ecs.route_pos[i], road);
+                int repaired_after_lc = repair_route_pos_unless_missed_exit_tail_ecs(to_ln, ecs.route_id[i], ecs.route_pos[i], road);
                 if (repaired_after_lc >= 0) {
                     ecs.route_pos[i] = repaired_after_lc;
                 }
@@ -9360,6 +10589,7 @@ __global__ void connector_enter_system_kernel(
     SpatialGrid grid,
     float* metrics,
     float current_time,
+    float dt,
     int max_entities
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -9380,9 +10610,12 @@ __global__ void connector_enter_system_kernel(
     }
 
     int turn = turn_code_from_lanes_ecs(lane, next_lane, road);
+    bool missed_exit_straight_target = missed_exit_straight_target_ecs(i, lane, next_lane, ecs, road);
     int rid = ecs.route_id[i];
     int rpos = ecs.route_pos[i];
-    if (rid >= 0 && rid < road.num_routes && rpos >= 0) {
+    if (missed_exit_straight_target) {
+        turn = TURN_STRAIGHT;
+    } else if (rid >= 0 && rid < road.num_routes && rpos >= 0) {
         int ro0 = road.route_offsets[rid];
         int ro1 = road.route_offsets[rid + 1];
         if (ro1 > ro0 && ro0 + rpos < ro1) {
@@ -9395,15 +10628,17 @@ __global__ void connector_enter_system_kernel(
         turn = effective_turn_code_ecs(lane, next_lane, TURN_STRAIGHT, road);
     }
 
-    int adjusted_next = interchange_receiving_outer_lane_ecs(lane, next_lane, road);
-    adjusted_next = receiving_lane_for_turn_ecs(adjusted_next, turn, road);
-    adjusted_next = interchange_receiving_outer_lane_ecs(lane, adjusted_next, road);
-    if (valid_lane_ecs(adjusted_next, road) && lane_connected(lane, adjusted_next, road)) {
-        next_lane = adjusted_next;
-        decision.connector_target_lane[i] = adjusted_next;
+    if (!missed_exit_straight_target) {
+        int adjusted_next = interchange_receiving_outer_lane_ecs(lane, next_lane, road);
+        adjusted_next = receiving_lane_for_turn_ecs(adjusted_next, turn, road);
+        adjusted_next = interchange_receiving_outer_lane_ecs(lane, adjusted_next, road);
+        if (valid_lane_ecs(adjusted_next, road) && lane_connected(lane, adjusted_next, road)) {
+            next_lane = adjusted_next;
+            decision.connector_target_lane[i] = adjusted_next;
+        }
     }
 
-    int interchange_source_lane = interchange_source_outer_lane_ecs(lane, next_lane, road);
+    int interchange_source_lane = missed_exit_straight_target ? -1 : interchange_source_outer_lane_ecs(lane, next_lane, road);
     if (valid_lane_ecs(interchange_source_lane, road) && lane != interchange_source_lane) {
         atomicAdd(&metrics[METRIC_TURN_LANE_ILLEGAL], 1.0f);
         bool late_escape = ecs.connector_length[i] >= fmaxf(MISSED_TURN_ESCAPE_WAIT, WRONG_LANE_STALL_FORCE_WAIT);
@@ -9441,6 +10676,11 @@ __global__ void connector_enter_system_kernel(
     }
 
     if (!connector_entry_clear_ecs(i, lane, next_lane, ecs, decision, road, grid, current_time, max_entities)) {
+#if CONNECTOR_ENTRY_WAIT_RELEASE_ENABLED
+        float wait_time = ecs.connector_length[i];
+        if (!isfinite(wait_time) || wait_time < 0.0f || ecs.vehicle_state[i] != VEH_ON_LANE) wait_time = 0.0f;
+        ecs.connector_length[i] = fminf(wait_time + fmaxf(dt, 0.0f), CONNECTOR_ENTRY_WAIT_RELEASE_MAX);
+#endif
         atomicAdd(&metrics[METRIC_CONNECTOR_SAFE_YIELD], 1.0f);
         atomicAdd(&metrics[METRIC_PRIORITY_ENTRY_BLOCK], 1.0f);
         return;
@@ -9456,6 +10696,13 @@ __global__ void connector_enter_system_kernel(
 
     float clen = connector_length_between_lanes(lane, next_lane, road);
     float overflow = fmaxf(0.0f, ecs.s[i] - connector_start_s);
+
+    if (missed_exit_straight_target) {
+        // EN/KO: Commit the missed-exit policy only when the connector is actually
+        // entered.  If priority/safety blocks entry this tick, the route is not
+        // prematurely advanced.
+        prepare_missed_exit_route_tail_ecs(i, lane, next_lane, ecs, road);
+    }
 
     ecs.vehicle_state[i] = VEH_IN_CONNECTOR;
     ecs.connector_from_lane[i] = lane;
@@ -9707,6 +10954,7 @@ __global__ void connector_motion_system_kernel(
         return;
     }
 
+    bool missed_exit_connector = missed_exit_straight_target_ecs(i, from_ln, to_ln, ecs, road);
     bool human = ecs.driver_type[i] == HUMAN;
 
     float max_accel = human ? MAX_ACCEL_HUMAN : MAX_ACCEL_AV;
@@ -9747,7 +10995,7 @@ __global__ void connector_motion_system_kernel(
     );
 
     float acc_cmd =
-        max_accel * (1.0f - powf(v / fmaxf(target_v, 0.1f), 4.0f));
+        max_accel * (1.0f - avabm_fourth_power_ecs(v / fmaxf(target_v, 0.1f)));
 
     // EN: Once a vehicle has entered the intersection, it owns a protected
     //     clearing movement.  Cross-traffic is stopped by the entry priority gate
@@ -9896,10 +11144,12 @@ __global__ void connector_motion_system_kernel(
         return;
     }
 
-    int repaired_pos = repair_route_pos_for_current_lane_ecs(from_ln, rid, rpos, road);
-    if (repaired_pos >= 0) {
-        rpos = repaired_pos;
-        ecs.route_pos[i] = repaired_pos;
+    if (!missed_exit_connector) {
+        int repaired_pos = repair_route_pos_unless_missed_exit_tail_ecs(from_ln, rid, rpos, road);
+        if (repaired_pos >= 0) {
+            rpos = repaired_pos;
+            ecs.route_pos[i] = repaired_pos;
+        }
     }
 
     int ro0 = road.route_offsets[rid];
@@ -9913,10 +11163,17 @@ __global__ void connector_motion_system_kernel(
     int next_pos = rpos + 1;
 
     if (next_pos >= route_len) {
-        ecs.alive[i] = ENTITY_FREE;
-        atomicAdd(&metrics[METRIC_EXITED], 1.0f);
-        atomicAdd(&metrics[METRIC_TRAVEL_TIME], fmaxf(0.0f, current_time - ecs.entry_time[i]));
-        return;
+        if (missed_exit_connector) {
+            // EN/KO: A missed-exit connector may be using the route tail sentinel.
+            // Do not delete the car inside the connector; let it clear the node and
+            // then despawn on the fallback lane end.
+            next_pos = max(0, route_len - 1);
+        } else {
+            ecs.alive[i] = ENTITY_FREE;
+            atomicAdd(&metrics[METRIC_EXITED], 1.0f);
+            atomicAdd(&metrics[METRIC_TRAVEL_TIME], fmaxf(0.0f, current_time - ecs.entry_time[i]));
+            return;
+        }
     }
 
     if (cs_next >= clen - CONNECTOR_EXIT_EPS) {
@@ -9942,9 +11199,11 @@ __global__ void connector_motion_system_kernel(
 
             ecs.lane_id[i] = to_ln;
             ecs.route_pos[i] = next_pos;
-            int repaired_after_connector = repair_route_pos_for_current_lane_ecs(to_ln, rid, ecs.route_pos[i], road);
-            if (repaired_after_connector >= 0) {
-                ecs.route_pos[i] = repaired_after_connector;
+            if (!missed_exit_connector) {
+                int repaired_after_connector = repair_route_pos_unless_missed_exit_tail_ecs(to_ln, rid, ecs.route_pos[i], road);
+                if (repaired_after_connector >= 0) {
+                    ecs.route_pos[i] = repaired_after_connector;
+                }
             }
 
             float handoff_s = connector_exit_handoff_s(from_ln, to_ln, road);
@@ -10238,7 +11497,19 @@ __global__ void route_lane_repair_system_kernel(
             return;
         }
 
-        int repaired = repair_route_pos_for_current_lane_ecs(lane, rid, rpos, road);
+        bool missed_exit_tail = false;
+#if MISSED_EXIT_OFFROUTE_TAIL_ENABLED
+        {
+            int ro0_tail = road.route_offsets[rid];
+            int ro1_tail = road.route_offsets[rid + 1];
+            int len_tail = ro1_tail - ro0_tail;
+            if (len_tail > 0 && rpos >= len_tail - 1 && rpos < len_tail) {
+                int route_tail_lane = road.route_lanes[ro0_tail + rpos];
+                missed_exit_tail = !route_lane_current_compatible_ecs(route_tail_lane, lane, road);
+            }
+        }
+#endif
+        int repaired = missed_exit_tail ? -1 : repair_route_pos_unless_missed_exit_tail_ecs(lane, rid, rpos, road);
         if (repaired >= 0 && repaired != rpos) {
             ecs.route_pos[i] = repaired;
             if (ecs.speed[i] < ROUTE_LANE_REPAIR_SPEED_CAP) {
@@ -10593,9 +11864,15 @@ __global__ void contact_resolve_system_kernel(
                                     if (fabsf(ecs.entry_time[i] - ecs.entry_time[j]) <= 0.001f) loser = i > j ? i : j;
                                 }
 
+                                int winner = loser == i ? j : i;
                                 float back = CONTACT_CROSS_BACKOFF_MIN + fmaxf(ecs.speed[loser], 0.0f) * CONTACT_CROSS_BACKOFF_SPEED_TIME;
                                 back = fminf(CONTACT_RESOLVE_MAX_PUSH, fmaxf(back, CONTACT_RESOLVE_BACKOFF));
                                 move_vehicle_back_on_path_ecs(loser, back, ecs, road);
+#if OVERLAP_CONTACT_PRIORITY_NUDGE_ENABLED
+                                move_vehicle_forward_on_path_ecs(winner, OVERLAP_CONTACT_WINNER_NUDGE, ecs, road);
+                                ecs.speed[winner] = fmaxf(ecs.speed[winner], OVERLAP_CONTACT_WINNER_MIN_SPEED);
+                                ecs.accel[winner] = fmaxf(ecs.accel[winner], 0.0f);
+#endif
                             }
 
                             if (metrics != nullptr) {
@@ -10835,6 +12112,11 @@ __device__ __forceinline__ bool local_avoid_pair_relevant_ecs(
 
     int na = route_next_lane_for_vehicle_ecs(a, ecs, road);
     int nb = route_next_lane_for_vehicle_ecs(b, ecs, road);
+    if (valid_lane_ecs(na, road) && valid_lane_ecs(nb, road) && lane_count_merge_pair_conflict_ecs(la, na, lb, nb, road)) {
+        float da = fmaxf(0.0f, road.lane_length[la] - ecs.s[a]);
+        float db = fmaxf(0.0f, road.lane_length[lb] - ecs.s[b]);
+        if (da <= LANE_COUNT_CHANGE_PREP_MAX_DIST || db <= LANE_COUNT_CHANGE_PREP_MAX_DIST) return true;
+    }
     if (valid_lane_ecs(na, road) && valid_lane_ecs(nb, road) && road.lane_end_node[la] == road.lane_end_node[lb]) {
         float da = fmaxf(0.0f, road.lane_length[la] - ecs.s[a]);
         float db = fmaxf(0.0f, road.lane_length[lb] - ecs.s[b]);
@@ -10962,9 +12244,32 @@ __global__ void local_obstacle_avoidance_system_kernel(
 
                             bool other_front_clear = priority_front_clear_ecs(j, perception, ecs);
                             int other_score = local_avoid_priority_score_ecs(j, ecs, road, perception);
+                            int other_from_lane = ecs.vehicle_state[j] == VEH_IN_CONNECTOR ? ecs.connector_from_lane[j] : ecs.lane_id[j];
+                            int other_next_lane = ecs.vehicle_state[j] == VEH_IN_CONNECTOR ? ecs.connector_to_lane[j] : route_next_lane_for_vehicle_ecs(j, ecs, road);
+                            bool merge_pair_priority = lane_count_merge_pair_conflict_ecs(
+                                lane,
+                                next_lane,
+                                other_from_lane,
+                                other_next_lane,
+                                road
+                            );
 
                             bool self_goes_first = false;
-                            if (complete_overlap) {
+                            bool pair_priority_decided = false;
+                            if (!complete_overlap && merge_pair_priority) {
+                                bool self_yields = zipper_merge_self_yields_ecs(
+                                    i, lane, next_lane, j, other_from_lane, other_next_lane, ecs, road, current_time
+                                );
+                                bool other_yields = zipper_merge_self_yields_ecs(
+                                    j, other_from_lane, other_next_lane, i, lane, next_lane, ecs, road, current_time
+                                );
+                                if (self_yields != other_yields) {
+                                    self_goes_first = !self_yields;
+                                    pair_priority_decided = true;
+                                }
+                            }
+
+                            if (!pair_priority_decided && complete_overlap) {
                                 self_goes_first = timed_pair_random_self_wins_ecs(
                                     i,
                                     j,
@@ -10972,17 +12277,17 @@ __global__ void local_obstacle_avoidance_system_kernel(
                                     COMPLETE_OVERLAP_RELEASE_PERIOD
                                 );
                                 if (self_goes_first) overlap_release_go = true;
-                            } else if (self_front_clear && !other_front_clear) {
+                            } else if (!pair_priority_decided && self_front_clear && !other_front_clear) {
                                 self_goes_first = true;
-                            } else if (!self_front_clear && other_front_clear) {
+                            } else if (!pair_priority_decided && !self_front_clear && other_front_clear) {
                                 self_goes_first = false;
-                            } else if (self_inside_box && ecs.vehicle_state[j] != VEH_IN_CONNECTOR) {
+                            } else if (!pair_priority_decided && self_inside_box && ecs.vehicle_state[j] != VEH_IN_CONNECTOR) {
                                 self_goes_first = true;
-                            } else if (ecs.vehicle_state[j] == VEH_IN_CONNECTOR && !self_inside_box) {
+                            } else if (!pair_priority_decided && ecs.vehicle_state[j] == VEH_IN_CONNECTOR && !self_inside_box) {
                                 self_goes_first = false;
-                            } else if (self_score != other_score) {
+                            } else if (!pair_priority_decided && self_score != other_score) {
                                 self_goes_first = self_score > other_score;
-                            } else {
+                            } else if (!pair_priority_decided) {
                                 self_goes_first = i < j;
                             }
 
@@ -11490,7 +12795,7 @@ extern "C" void launch_step_cuda_ecs(
     int spawn_blocks = (spawn.num_spawn_points + threads - 1) / threads;
 
     // Step-scoped metrics reset.  Spawned/exited remain cumulative at 0 and 1.
-    clear_float_kernel<<<1, 256, 0, stream>>>(metrics + 6, METRICS_SIZE - 6, 0.0f);
+    avabm_clear_float_zero_async(metrics + 6, METRICS_SIZE - 6, stream);
 
     clear_decision_kernel<<<entity_blocks, threads, 0, stream>>>(
         decision,
@@ -11502,19 +12807,20 @@ extern "C" void launch_step_cuda_ecs(
         : 0;
 
     if (total_slots > 0) {
-        int res_blocks = (total_slots + threads - 1) / threads;
-
-        clear_reservation_system<<<res_blocks, threads, 0, stream>>>(
+        avabm_clear_int_async(
             reservation_table,
-            total_slots
+            total_slots,
+            RESERVATION_FREE,
+            stream
         );
     }
 
     // Build grid before spawn.
-    clear_int_kernel<<<world_blocks, threads, 0, stream>>>(
+    avabm_clear_int_async(
         grid.cell_head,
         world_cells,
-        WORLD_CELL_EMPTY
+        WORLD_CELL_EMPTY,
+        stream
     );
 
     spatial_hash_build_system<<<entity_blocks, threads, 0, stream>>>(
@@ -11548,19 +12854,21 @@ extern "C" void launch_step_cuda_ecs(
     //     스폰 직후 즉시 비워서 신호/우선순위 예약 로직이 스폰 lock을 가짜
     //     교차로 점유자로 오해하지 않게 합니다.
     if (total_slots > 0) {
-        int res_blocks = (total_slots + threads - 1) / threads;
-        clear_reservation_system<<<res_blocks, threads, 0, stream>>>(
+        avabm_clear_int_async(
             reservation_table,
-            total_slots
+            total_slots,
+            RESERVATION_FREE,
+            stream
         );
     }
 
     // Rebuild grid after spawn, then damp same-step entry overlaps with a
     // local grid lookup instead of an O(max_entities) full scan.
-    clear_int_kernel<<<world_blocks, threads, 0, stream>>>(
+    avabm_clear_int_async(
         grid.cell_head,
         world_cells,
-        WORLD_CELL_EMPTY
+        WORLD_CELL_EMPTY,
+        stream
     );
 
     spatial_hash_build_system<<<entity_blocks, threads, 0, stream>>>(
@@ -11581,10 +12889,11 @@ extern "C" void launch_step_cuda_ecs(
     );
 
     // Rebuild once more so forced/queued spawn states are visible to perception.
-    clear_int_kernel<<<world_blocks, threads, 0, stream>>>(
+    avabm_clear_int_async(
         grid.cell_head,
         world_cells,
-        WORLD_CELL_EMPTY
+        WORLD_CELL_EMPTY,
+        stream
     );
 
     spatial_hash_build_system<<<entity_blocks, threads, 0, stream>>>(
@@ -11604,10 +12913,11 @@ extern "C" void launch_step_cuda_ecs(
 
     // Route repair can remove invalid actors or clamp their lane position.
     // Rebuild the grid so perception never sees stale repaired/free vehicles.
-    clear_int_kernel<<<world_blocks, threads, 0, stream>>>(
+    avabm_clear_int_async(
         grid.cell_head,
         world_cells,
-        WORLD_CELL_EMPTY
+        WORLD_CELL_EMPTY,
+        stream
     );
 
     spatial_hash_build_system<<<entity_blocks, threads, 0, stream>>>(
@@ -11677,6 +12987,7 @@ extern "C" void launch_step_cuda_ecs(
             reservation_table,
             metrics,
             current_time,
+            dt,
             max_entities
         );
 
@@ -11734,15 +13045,17 @@ extern "C" void launch_step_cuda_ecs(
         grid,
         metrics,
         current_time,
+        dt,
         max_entities
     );
 
     // Connector entry changes state and position semantics, so rebuild before
     // connector car-following reads nearby vehicles.
-    clear_int_kernel<<<world_blocks, threads, 0, stream>>>(
+    avabm_clear_int_async(
         grid.cell_head,
         world_cells,
-        WORLD_CELL_EMPTY
+        WORLD_CELL_EMPTY,
+        stream
     );
 
     spatial_hash_build_system<<<entity_blocks, threads, 0, stream>>>(
@@ -11762,10 +13075,11 @@ extern "C" void launch_step_cuda_ecs(
     );
 
     // Rebuild grid after movement.
-    clear_int_kernel<<<world_blocks, threads, 0, stream>>>(
+    avabm_clear_int_async(
         grid.cell_head,
         world_cells,
-        WORLD_CELL_EMPTY
+        WORLD_CELL_EMPTY,
+        stream
     );
 
     spatial_hash_build_system<<<entity_blocks, threads, 0, stream>>>(
@@ -11785,10 +13099,11 @@ extern "C" void launch_step_cuda_ecs(
             max_entities
         );
 
-        clear_int_kernel<<<world_blocks, threads, 0, stream>>>(
+        avabm_clear_int_async(
             grid.cell_head,
             world_cells,
-            WORLD_CELL_EMPTY
+            WORLD_CELL_EMPTY,
+            stream
         );
 
         spatial_hash_build_system<<<entity_blocks, threads, 0, stream>>>(

@@ -144,6 +144,11 @@ NUM_ROUTES = cfg_int("NUM_ROUTES", 8192)
 
 DT = cfg_float("DT", 0.05)
 AV_PENETRATION = cfg_float("AV_PENETRATION", 0.0)
+# KO 문법 이유: CUDA setup.py도 같은 config key를 읽어 컴파일 define으로 넘깁니다.
+# KO 논리 이유: main.py에서는 이 값을 직접 계산에 쓰지 않지만, 시작 로그에 보여 주면
+#    현재 바이너리가 어떤 순항속도 하한을 목표로 빌드되어야 하는지 사용자가 확인할 수 있습니다.
+SPEED_MIN_CRUISE_ENABLED = cfg_bool("SPEED_MIN_CRUISE_ENABLED", True)
+SPEED_MIN_CRUISE_KMH = cfg_float("SPEED_MIN_CRUISE_KMH", 40.0)
 
 ROUTE_SEED = cfg_int("ROUTE_SEED", 20260529)
 MIN_TRIP_DISTANCE = cfg_float("MIN_TRIP_DISTANCE", 3000.0)
@@ -166,7 +171,21 @@ ROUTE_SPAWN_EXPANSION_BACKEND = str(cfg("ROUTE_SPAWN_EXPANSION_BACKEND", "thread
 _route_spawn_workers_cfg = cfg_int("ROUTE_SPAWN_EXPANSION_WORKERS", 0)
 ROUTE_SPAWN_EXPANSION_WORKERS = max(1, int(ROUTE_WORKERS if _route_spawn_workers_cfg <= 0 else _route_spawn_workers_cfg))
 ROUTE_SPAWN_EXPANSION_MIN_ROUTES = cfg_int("ROUTE_SPAWN_EXPANSION_MIN_ROUTES", 1024)
-ROUTE_CACHE_VERSION = "ecs_v29_spawn_expansion_parallel_ready_cache"
+ROUTE_CACHE_VERSION = "ecs_v38_deadlock_spawn_route_rotation_lane_balance"
+
+# EN: The main per-tick simulator is still a CUDA extension because perception,
+#     lane-change decisions, motion, connector admission and collisions are all
+#     large per-vehicle kernels.  CPU parallelism is most useful for route/static
+#     network preprocessing and metrics I/O, where GPU launch overhead and graph
+#     branching would dominate.  "hybrid" makes that split explicit.
+# KO: 매 tick 시뮬레이션 본체는 차량별 인지, 차선변경 의사결정, 운동, connector 진입,
+#     충돌 처리가 모두 대규모 CUDA 커널이므로 CUDA 확장을 사용합니다. CPU 병렬처리는
+#     route/정적 네트워크 전처리와 metrics I/O처럼 그래프 분기와 I/O가 많은 작업에 더
+#     유리합니다. "hybrid"는 이 역할 분담을 명시적으로 보여 주는 모드입니다.
+SIM_ACCELERATION_MODE = str(cfg("SIM_ACCELERATION_MODE", "hybrid")).strip().lower()
+if SIM_ACCELERATION_MODE not in {"hybrid", "cuda"}:
+    print(f"[Config Warning] Unsupported SIM_ACCELERATION_MODE={SIM_ACCELERATION_MODE!r}; using 'hybrid'.")
+    SIM_ACCELERATION_MODE = "hybrid"
 
 WORLD_CELL_SIZE = cfg_float("WORLD_CELL_SIZE", 20.0)
 WORLD_GRID_MAX_W = cfg_int("WORLD_GRID_MAX_W", 2048)
@@ -311,6 +330,16 @@ MAX_TOTAL_VPS = cfg_float("MAX_TOTAL_VPS", 40.0)
 #     스폰 슬롯을 만들고 수요를 균등 분배합니다. 경로 생성기가 처음 고른 한
 #     차로에만 차량이 몰리는 현상을 막습니다.
 SPAWN_MULTI_LANE_BALANCE = cfg_bool("SPAWN_MULTI_LANE_BALANCE", True)
+# EN: One physical spawn lane can now own several route choices.  The CUDA
+#     ABI still accepts one route id per spawn slot, so Python creates repeated
+#     spawn slots with the same lane id but different route ids.  Demand is
+#     divided across those slots later, and the CUDA lane mutex lets only one
+#     of them enter the physical lane per tick.
+# KO: 하나의 실제 진입 차로가 여러 route 후보를 가질 수 있게 합니다. CUDA ABI는
+#     spawn slot 하나당 route id 하나만 받으므로, Python에서 같은 lane id를 가진
+#     slot을 여러 개 만들고 route id만 다르게 넣습니다. 아래 수요 계산에서 slot별로
+#     나누고, CUDA 차로 mutex가 tick마다 실제 차로에는 한 대씩만 넣어 줍니다.
+SPAWN_ROUTE_CHOICES_PER_LANE = max(1, cfg_int("SPAWN_ROUTE_CHOICES_PER_LANE", 4))
 
 # EN: Route-lane intent model.  Keep the current relative lane on straight
 #     multi-lane arterials, move toward the correct edge before left/right exits,
@@ -330,18 +359,58 @@ ROUTE_VALIDATE_LANE_CONNECTIVITY = cfg_bool("ROUTE_VALIDATE_LANE_CONNECTIVITY", 
 ROUTE_DROP_INVALID_LANE_PATHS = cfg_bool("ROUTE_DROP_INVALID_LANE_PATHS", True)
 
 # EN: Multi-lane continuation / destination spread guard.  Some GIS links split
-#     a continuous mainline into 4->3 or 3->4 lane-count changes with a curved
-#     heading, which can be misread as a left/right turn.  Treat those wide
-#     lane-count transitions as straight continuations, and keep destination
-#     links from collapsing to a single edge lane.
-# KO: 다차로 본선이 4->3 또는 3->4처럼 차로 수만 바뀌며 이어지는 경우, 곡선
-#     각도 때문에 좌/우회전으로 오인되어 가장자리 차선 대기가 걸릴 수 있습니다.
-#     이런 넓은 차로수 변화 구간은 직진 연속 구간으로 보고, 도착 링크도 한쪽
-#     차선으로만 몰리지 않도록 분산합니다.
+#     a continuous mainline into separate curved segments.  Whether lane count
+#     changes or stays the same, wide same-node mainline continuations should not
+#     be misread as left/right exits.  Treat them as straight, and keep
+#     destination links from collapsing to a single edge lane.
+# KO: 다차로 본선이 별도 곡선 segment로 끊겨 있을 때, 차로 수가 바뀌든 그대로든
+#     실제 본선 연속 구간을 좌/우 진출로 오인하면 가장자리 차선 대기가 걸립니다.
+#     이런 넓은 본선 연속 구간은 직진으로 보고, 도착 링크도 한쪽 차선으로만
+#     몰리지 않도록 분산합니다.
 ROUTE_WIDE_LANE_CHANGE_AS_STRAIGHT = cfg_bool("ROUTE_WIDE_LANE_CHANGE_AS_STRAIGHT", True)
 ROUTE_WIDE_CONTINUATION_MAX_TURN_DEG = cfg_float("ROUTE_WIDE_CONTINUATION_MAX_TURN_DEG", 62.0)
 ROUTE_LANE_COUNT_CHANGE_BALANCE = cfg_bool("ROUTE_LANE_COUNT_CHANGE_BALANCE", True)
 ROUTE_DESTINATION_LANE_SPREAD = cfg_bool("ROUTE_DESTINATION_LANE_SPREAD", True)
+
+# EN: Ramp-entry lane spreading is deliberately done in the route arrays, not
+# only in the live MOBIL lane-change logic.  A one-lane right on-ramp must first
+# enter the physical right edge, but after the first mainline segment the route
+# nudges through traffic one lane at a time toward a stable inner-lane target.
+# KO: 전입 차량 분산은 CUDA의 실시간 차선변경에만 맡기지 않고 route 배열에도
+# 직접 반영합니다. 1차로 우측 램프 차량은 실제 합류 순간에는 우측 끝 차로로
+# 들어오되, 본선에 올라온 뒤 이어지는 직진 segment에서 한 차로씩 안정 목표
+# 안쪽 차로로 이동하도록 경로 의도를 심습니다.
+ROUTE_RAMP_ENTRY_INNER_SPREAD = cfg_bool("ROUTE_RAMP_ENTRY_INNER_SPREAD", True)
+ROUTE_RAMP_ENTRY_SPREAD_MIN_MAIN_LANES = cfg_int("ROUTE_RAMP_ENTRY_SPREAD_MIN_MAIN_LANES", 3)
+ROUTE_RAMP_ENTRY_SPREAD_LOOKAHEAD_LINKS = cfg_int("ROUTE_RAMP_ENTRY_SPREAD_LOOKAHEAD_LINKS", 24)
+
+# EN: Physical lane-drop taper geometry.  When a 4->3 or 3->2 mainline
+#     reduction is detected, the surviving receiving lanes are aligned to the
+#     continuing lanes and the disappearing outside lane is pulled inward near
+#     the node.  This avoids generating a new 3-lane bundle in the center of a
+#     4-lane approach and greatly reduces side-overlap deadlocks.
+# KO: 물리적 차로 감소 테이퍼입니다. 4->3 또는 3->2 본선 차로 감소가
+#     감지되면 살아남는 수신 차로를 기존 연속 차로에 맞추고, 사라지는 최외곽
+#     차로의 끝점을 안쪽으로 당깁니다. 접근부 4차로 가운데에 갑자기 새로운
+#     3차로 묶음이 생기는 현상과 측면 겹침 데드락을 줄입니다.
+LANE_DROP_TAPER_GEOMETRY = cfg_bool("LANE_DROP_TAPER_GEOMETRY", True)
+LANE_DROP_TAPER_ALIGN_SURVIVOR_LANES = cfg_bool("LANE_DROP_TAPER_ALIGN_SURVIVOR_LANES", True)
+LANE_DROP_TAPER_RENDER_WIDTH = cfg_bool("LANE_DROP_TAPER_RENDER_WIDTH", True)
+LANE_DROP_TAPER_AMBIGUOUS_RIGHT_FALLBACK = cfg_bool("LANE_DROP_TAPER_AMBIGUOUS_RIGHT_FALLBACK", True)
+LANE_DROP_TAPER_END_PULL = cfg_float("LANE_DROP_TAPER_END_PULL", 0.86)
+LANE_DROP_TAPER_EDGE_ALIGN_EPS = cfg_float("LANE_DROP_TAPER_EDGE_ALIGN_EPS", 1.25)
+
+# EN: Physical lane-gain taper geometry.  When a 3->4 or 2->3 mainline
+#     expansion is detected, continuing lanes remain connected and only the
+#     newly added outside lane starts narrow, then opens outward along the link.
+# KO: 물리적 차로 증가 테이퍼입니다. 3->4 또는 2->3 본선 차로 증가가
+#     감지되면 기존 차선 흐름은 그대로 이어지고, 새로 생기는 최외곽 차선만
+#     좁게 시작해 링크를 따라 바깥쪽으로 열리도록 보정합니다.
+LANE_GAIN_TAPER_GEOMETRY = cfg_bool("LANE_GAIN_TAPER_GEOMETRY", True)
+LANE_GAIN_TAPER_ALIGN_CONTINUING_LANES = cfg_bool("LANE_GAIN_TAPER_ALIGN_CONTINUING_LANES", True)
+LANE_GAIN_TAPER_RENDER_WIDTH = cfg_bool("LANE_GAIN_TAPER_RENDER_WIDTH", True)
+LANE_GAIN_TAPER_AMBIGUOUS_RIGHT_FALLBACK = cfg_bool("LANE_GAIN_TAPER_AMBIGUOUS_RIGHT_FALLBACK", True)
+LANE_GAIN_TAPER_START_PULL = cfg_float("LANE_GAIN_TAPER_START_PULL", 0.86)
 
 # EN: Route path cost bias.  Pure shortest-path routing can choose narrow side
 #     links beside a multi-lane arterial.  These knobs keep Dongbu-like mainline
@@ -2171,6 +2240,394 @@ def apply_interchange_outer_edge_geometry(nodes, links, lanes, link_to_lanes):
     return len(changed)
 
 
+def _lane_group_average_endpoint(group, at_end=False, indices=None):
+    if not group:
+        return None
+    if indices is None:
+        indices = range(len(group))
+    xs = []
+    ys = []
+    for idx in indices:
+        if idx < 0 or idx >= len(group):
+            continue
+        x, y = _lane_endpoint_xy(group[idx], at_end=at_end)
+        xs.append(float(x))
+        ys.append(float(y))
+    if not xs:
+        return None
+    return float(sum(xs) / len(xs)), float(sum(ys) / len(ys))
+
+
+def _lane_group_mean_width(group):
+    vals = []
+    for lane in group or []:
+        try:
+            vals.append(max(2.4, float(lane.get("lane_width", DEFAULT_LANE_WIDTH))))
+        except Exception:
+            pass
+    if not vals:
+        return float(DEFAULT_LANE_WIDTH)
+    vals.sort()
+    return float(vals[len(vals) // 2])
+
+
+def lane_drop_side_from_groups_py(from_group, to_group):
+    """Return -1 for right-edge drop, +1 for left-edge drop, 0 unknown."""
+    if not from_group or not to_group:
+        return 0
+    n0 = len(from_group)
+    n1 = len(to_group)
+    if n0 <= n1 or n0 < 2 or n1 < 1:
+        return 0
+
+    frx, fry = _lane_endpoint_xy(from_group[0], at_end=True)
+    flx, fly = _lane_endpoint_xy(from_group[-1], at_end=True)
+    trx, try_ = _lane_endpoint_xy(to_group[0], at_end=False)
+    tlx, tly = _lane_endpoint_xy(to_group[-1], at_end=False)
+    dr = (frx - trx) * (frx - trx) + (fry - try_) * (fry - try_)
+    dl = (flx - tlx) * (flx - tlx) + (fly - tly) * (fly - tly)
+    eps = max(0.05, float(LANE_DROP_TAPER_EDGE_ALIGN_EPS))
+    eps2 = eps * eps
+    if dr > dl + eps2:
+        return -1
+    if dl > dr + eps2:
+        return 1
+    return -1 if LANE_DROP_TAPER_AMBIGUOUS_RIGHT_FALLBACK else 0
+
+
+def _set_link_render_width(link, width, at_end=False):
+    if not LANE_DROP_TAPER_RENDER_WIDTH:
+        return
+    key = "render_width_end" if at_end else "render_width_start"
+    link[key] = float(max(1.0, width))
+    other_key = "render_width_start" if at_end else "render_width_end"
+    if other_key not in link:
+        link[other_key] = float(link.get("width", width))
+
+
+def _update_link_length_from_group(link, group):
+    vals = [float(lane.get("length", 0.0)) for lane in group or [] if float(lane.get("length", 0.0)) > 0.0]
+    if vals:
+        link["length"] = float(sum(vals) / len(vals))
+
+
+def apply_lane_drop_taper_geometry(nodes, links, lanes, link_to_lanes):
+    """Align 4->3 / 3->2 mainline lane-drop geometry as a taper.
+
+    EN: For wide same-direction lane-count reductions, the old network kept each
+        link centered on its source centerline.  A 4-lane approach followed by a
+        3-lane link therefore created a new centered 3-lane bundle at the node,
+        which made vehicles cross laterally at the connector and deadlock.  This
+        pass keeps the surviving lanes continuous and pulls only the disappearing
+        outside lane inward, so the reduction behaves like a physical taper.
+    KO: 다차로 본선 차로 감소에서 각 링크가 원본 중심선에 따로 중앙 정렬되면,
+        4차로 접근 뒤에 3차로가 노드 중앙에 새로 생기면서 차량들이 connector에서
+        서로 가로질러 충돌/데드락이 생깁니다. 이 보정은 살아남는 차선을 그대로
+        이어 붙이고 사라지는 최외곽 차로만 안쪽으로 당겨 실제 테이퍼처럼 만듭니다.
+    """
+    if not (LANE_DROP_TAPER_GEOMETRY and LANE_DROP_TAPER_ALIGN_SURVIVOR_LANES):
+        return 0
+
+    incoming = {}
+    outgoing = {}
+    for link in links:
+        incoming.setdefault(int(link["to_node"]), []).append(int(link["link_id"]))
+        outgoing.setdefault(int(link["from_node"]), []).append(int(link["link_id"]))
+
+    start_lane_candidates = {}
+    incoming_render_candidates = {}
+    incoming_width_candidates = {}
+    changed_lanes = set()
+    changed_links = set()
+    taper_pairs = 0
+
+    def add_start_candidate(lane_id, x, y):
+        lane = lanes[int(lane_id)]
+        ox, oy = _lane_endpoint_xy(lane, at_end=False)
+        d2 = (float(ox) - float(x)) ** 2 + (float(oy) - float(y)) ** 2
+        old = start_lane_candidates.get(int(lane_id))
+        if old is None or d2 < old[0]:
+            start_lane_candidates[int(lane_id)] = (float(d2), float(x), float(y))
+
+    def add_in_render_candidate(link_id, x, y, width):
+        link = links[int(link_id)]
+        coords = _render_coords_for_link(link)
+        if coords:
+            ox, oy = coords[-1]
+        else:
+            geom = link.get("geometry")
+            c = list(geom.coords) if geom is not None else [(x, y)]
+            ox, oy = c[-1]
+        d2 = (float(ox) - float(x)) ** 2 + (float(oy) - float(y)) ** 2
+        old = incoming_render_candidates.get(int(link_id))
+        if old is None or d2 < old[0]:
+            incoming_render_candidates[int(link_id)] = (float(d2), float(x), float(y))
+            incoming_width_candidates[int(link_id)] = float(width)
+
+    for node_id in range(len(nodes)):
+        inc_ids = incoming.get(int(node_id), [])
+        out_ids = outgoing.get(int(node_id), [])
+        if not inc_ids or not out_ids:
+            continue
+        for in_id in inc_ids:
+            from_group = link_to_lanes.get(int(in_id), [])
+            if len(from_group) < 3:
+                continue
+            for out_id in out_ids:
+                to_group = link_to_lanes.get(int(out_id), [])
+                if len(to_group) < 2 or len(from_group) <= len(to_group):
+                    continue
+                if not is_wide_lane_count_continuation_py(in_id, out_id, link_to_lanes, links):
+                    continue
+
+                n0 = len(from_group)
+                n1 = len(to_group)
+                drop = max(1, n0 - n1)
+                side = lane_drop_side_from_groups_py(from_group, to_group)
+                if side == 0:
+                    continue
+
+                if side < 0:
+                    survivor_indices = list(range(drop, n0))[:n1]
+                    dropped_indices = list(range(0, drop))
+                    pull_target_index = min(drop, n0 - 1)
+                else:
+                    survivor_indices = list(range(0, n1))
+                    dropped_indices = list(range(n1, n0))
+                    pull_target_index = max(0, n1 - 1)
+
+                if len(survivor_indices) != n1:
+                    continue
+
+                # Align the receiving bundle start to the surviving incoming lanes.
+                for j, src_idx in enumerate(survivor_indices):
+                    sx, sy = _lane_endpoint_xy(from_group[src_idx], at_end=True)
+                    add_start_candidate(int(to_group[j]["lane_id"]), sx, sy)
+
+                # Pull the disappearing outside lane(s) inward so the lane itself
+                # visibly tapers instead of ending as a full-width parallel lane.
+                tx, ty = _lane_endpoint_xy(from_group[pull_target_index], at_end=True)
+                pull = max(0.0, min(0.98, float(LANE_DROP_TAPER_END_PULL)))
+                for src_idx in dropped_indices:
+                    lane = from_group[src_idx]
+                    ox, oy = _lane_endpoint_xy(lane, at_end=True)
+                    nx = ox + (tx - ox) * pull
+                    ny = oy + (ty - oy) * pull
+                    _set_lane_endpoint(lane, nx, ny, at_end=True)
+                    changed_lanes.add(int(lane["lane_id"]))
+                    changed_links.add(int(lane["link_id"]))
+
+                center = _lane_group_average_endpoint(from_group, at_end=True, indices=survivor_indices)
+                lane_w = _lane_group_mean_width(from_group)
+                taper_width = lane_w * float(n1)
+                if center is not None:
+                    add_in_render_candidate(in_id, center[0], center[1], taper_width)
+
+                # Receiving link starts with its natural 3-lane width at the aligned survivor center.
+                out_center = _lane_group_average_endpoint(to_group, at_end=False, indices=range(n1))
+                if out_center is not None:
+                    _set_link_render_endpoint(links[int(out_id)], out_center[0], out_center[1], at_end=False)
+                    _set_link_render_width(links[int(out_id)], lane_w * float(n1), at_end=False)
+                    changed_links.add(int(out_id))
+
+                links[int(in_id)]["lane_drop_taper_to_link"] = int(out_id)
+                links[int(out_id)]["lane_drop_taper_from_link"] = int(in_id)
+                taper_pairs += 1
+
+    for lane_id, (_, x, y) in start_lane_candidates.items():
+        _set_lane_endpoint(lanes[int(lane_id)], x, y, at_end=False)
+        changed_lanes.add(int(lane_id))
+        changed_links.add(int(lanes[int(lane_id)]["link_id"]))
+
+    # Refresh receiving-link render centers after the actual lane starts were
+    # rewritten.  The first candidate pass can still reflect the old centered
+    # 3-lane bundle; this pass makes rendering and vehicle geometry agree.
+    for link_id in {int(lanes[int(lane_id)]["link_id"]) for lane_id in start_lane_candidates.keys()}:
+        group = link_to_lanes.get(int(link_id), [])
+        if not group or int(link_id) not in links:
+            continue
+        center = _lane_group_average_endpoint(group, at_end=False)
+        lane_w = _lane_group_mean_width(group)
+        if center is not None:
+            _set_link_render_endpoint(links[int(link_id)], center[0], center[1], at_end=False)
+            _set_link_render_width(links[int(link_id)], lane_w * float(max(1, len(group))), at_end=False)
+            changed_links.add(int(link_id))
+
+    for link_id, (_, x, y) in incoming_render_candidates.items():
+        _set_link_render_endpoint(links[int(link_id)], x, y, at_end=True)
+        _set_link_render_width(links[int(link_id)], incoming_width_candidates.get(int(link_id), links[int(link_id)].get("width", 1.0)), at_end=True)
+        changed_links.add(int(link_id))
+
+    for link_id in sorted(changed_links):
+        group = link_to_lanes.get(int(link_id), [])
+        _update_link_length_from_group(links[int(link_id)], group)
+
+    if taper_pairs or changed_lanes:
+        print(
+            "[LaneDrop] tapered geometry:",
+            "pairs=", int(taper_pairs),
+            "lanes_adjusted=", int(len(changed_lanes)),
+            "links_adjusted=", int(len(changed_links)),
+        )
+    return len(changed_lanes) + len(changed_links)
+
+
+
+
+def lane_gain_side_from_groups_py(from_group, to_group):
+    """Return -1 when the new outside lane appears on the right, +1 on the left."""
+    if not from_group or not to_group:
+        return 0
+    n0 = len(from_group)
+    n1 = len(to_group)
+    if n0 >= n1 or n0 < 1 or n1 < 2:
+        return 0
+
+    frx, fry = _lane_endpoint_xy(from_group[0], at_end=True)
+    flx, fly = _lane_endpoint_xy(from_group[-1], at_end=True)
+    trx, try_ = _lane_endpoint_xy(to_group[0], at_end=False)
+    tlx, tly = _lane_endpoint_xy(to_group[-1], at_end=False)
+    dr = (frx - trx) * (frx - trx) + (fry - try_) * (fry - try_)
+    dl = (flx - tlx) * (flx - tlx) + (fly - tly) * (fly - tly)
+    eps = max(0.05, float(LANE_DROP_TAPER_EDGE_ALIGN_EPS))
+    eps2 = eps * eps
+    if dr > dl + eps2:
+        return -1
+    if dl > dr + eps2:
+        return 1
+    return -1 if LANE_GAIN_TAPER_AMBIGUOUS_RIGHT_FALLBACK else 0
+
+
+def apply_lane_gain_taper_geometry(nodes, links, lanes, link_to_lanes):
+    """Align 3->4 / 2->3 mainline lane-gain geometry as a physical taper.
+
+    EN: Without this pass, a wider receiving link is centered independently at
+        the node, so an extra lane can appear as if a new middle lane was born
+        in the connector.  Vehicles then cross laterally at the node and may
+        deadlock with ramp/merge traffic.  This keeps continuing lanes aligned
+        and lets only the newly added outside lane open gradually from its
+        neighboring lane.
+    KO: 이 보정이 없으면 더 넓은 수신 링크가 노드에서 독립적으로 중앙 정렬되어,
+        새 차선이 connector 안쪽/중앙에서 갑자기 생기는 것처럼 됩니다. 차량들이
+        노드에서 가로질러 이동하면서 전출입로/합류 교통과 데드락을 만들 수 있으므로,
+        기존 차선은 그대로 이어 붙이고 새 최외곽 차선만 이웃 차선에서 점점 열리게 합니다.
+    """
+    if not (LANE_GAIN_TAPER_GEOMETRY and LANE_GAIN_TAPER_ALIGN_CONTINUING_LANES):
+        return 0
+
+    incoming = {}
+    outgoing = {}
+    for link in links:
+        incoming.setdefault(int(link["to_node"]), []).append(int(link["link_id"]))
+        outgoing.setdefault(int(link["from_node"]), []).append(int(link["link_id"]))
+
+    start_lane_candidates = {}
+    changed_lanes = set()
+    changed_links = set()
+    gain_pairs = 0
+
+    def add_start_candidate(lane_id, x, y):
+        lane = lanes[int(lane_id)]
+        ox, oy = _lane_endpoint_xy(lane, at_end=False)
+        d2 = (float(ox) - float(x)) ** 2 + (float(oy) - float(y)) ** 2
+        old = start_lane_candidates.get(int(lane_id))
+        if old is None or d2 < old[0]:
+            start_lane_candidates[int(lane_id)] = (float(d2), float(x), float(y))
+
+    def set_render_width(link, width, at_end=False):
+        if not LANE_GAIN_TAPER_RENDER_WIDTH:
+            return
+        _set_link_render_width(link, width, at_end=at_end)
+
+    for node_id in range(len(nodes)):
+        inc_ids = incoming.get(int(node_id), [])
+        out_ids = outgoing.get(int(node_id), [])
+        if not inc_ids or not out_ids:
+            continue
+        for in_id in inc_ids:
+            from_group = link_to_lanes.get(int(in_id), [])
+            if len(from_group) < 2:
+                continue
+            for out_id in out_ids:
+                to_group = link_to_lanes.get(int(out_id), [])
+                if len(to_group) < 3 or len(from_group) >= len(to_group):
+                    continue
+                if not is_wide_lane_count_continuation_py(in_id, out_id, link_to_lanes, links):
+                    continue
+
+                n0 = len(from_group)
+                n1 = len(to_group)
+                add = max(1, n1 - n0)
+                side = lane_gain_side_from_groups_py(from_group, to_group)
+                if side == 0:
+                    continue
+
+                if side < 0:
+                    # Right-edge gain: receiving lane 0 is new; old lanes continue into add..n1-1.
+                    survivor_target_indices = list(range(add, n1))[:n0]
+                    added_indices = list(range(0, add))
+                    pull_source_index = 0
+                    pull_target_index = min(add, n1 - 1)
+                else:
+                    # Left-edge gain: right-side lanes keep their index; new lane(s) open on the left.
+                    survivor_target_indices = list(range(0, n0))
+                    added_indices = list(range(n0, n1))
+                    pull_source_index = n0 - 1
+                    pull_target_index = max(0, n0 - 1)
+
+                if len(survivor_target_indices) != n0:
+                    continue
+
+                # Align continuing receiving-lane starts to the incoming lane ends.
+                for src_idx, dst_idx in enumerate(survivor_target_indices):
+                    sx, sy = _lane_endpoint_xy(from_group[src_idx], at_end=True)
+                    add_start_candidate(int(to_group[dst_idx]["lane_id"]), sx, sy)
+
+                # Start the newly-added outside lane near its neighbor instead of
+                # letting it appear as a full lane at the node center.
+                tx, ty = _lane_endpoint_xy(from_group[pull_source_index], at_end=True)
+                pull = max(0.0, min(0.98, float(LANE_GAIN_TAPER_START_PULL)))
+                for dst_idx in added_indices:
+                    lane = to_group[dst_idx]
+                    ox, oy = _lane_endpoint_xy(lane, at_end=False)
+                    nx = ox + (tx - ox) * pull
+                    ny = oy + (ty - oy) * pull
+                    # Avoid making two lane centerlines exactly identical; a tiny
+                    # residual width at the taper nose prevents spawn/repair aliasing.
+                    add_start_candidate(int(lane["lane_id"]), nx, ny)
+
+                lane_w = _lane_group_mean_width(from_group)
+                cont_center = _lane_group_average_endpoint(from_group, at_end=True)
+                if cont_center is not None:
+                    _set_link_render_endpoint(links[int(in_id)], cont_center[0], cont_center[1], at_end=True)
+                    set_render_width(links[int(in_id)], lane_w * float(n0), at_end=True)
+                    _set_link_render_endpoint(links[int(out_id)], cont_center[0], cont_center[1], at_end=False)
+                    set_render_width(links[int(out_id)], lane_w * float(n0), at_end=False)
+                    changed_links.add(int(in_id))
+                    changed_links.add(int(out_id))
+
+                links[int(in_id)]["lane_gain_taper_to_link"] = int(out_id)
+                links[int(out_id)]["lane_gain_taper_from_link"] = int(in_id)
+                gain_pairs += 1
+
+    for lane_id, (_, x, y) in start_lane_candidates.items():
+        _set_lane_endpoint(lanes[int(lane_id)], x, y, at_end=False)
+        changed_lanes.add(int(lane_id))
+        changed_links.add(int(lanes[int(lane_id)]["link_id"]))
+
+    for link_id in sorted(changed_links):
+        group = link_to_lanes.get(int(link_id), [])
+        _update_link_length_from_group(links[int(link_id)], group)
+
+    if gain_pairs or changed_lanes:
+        print(
+            "[LaneGain] tapered geometry:",
+            "pairs=", int(gain_pairs),
+            "lanes_adjusted=", int(len(changed_lanes)),
+            "links_adjusted=", int(len(changed_links)),
+        )
+    return len(changed_lanes) + len(changed_links)
+
 def route_graph_weight_for_link(link):
     length = max(0.01, float(link.get("length", 0.0)))
     if not ROUTE_USE_WIDTH_BIASED_COST:
@@ -2458,14 +2915,43 @@ def is_wide_lane_count_continuation_py(link_id_a, link_id_b, link_to_lanes, link
         group_b = link_to_lanes.get(b, [])
         ca = len(group_a)
         cb = len(group_b)
-        if ca < 2 or cb < 2 or ca == cb:
+        if ca < 2 or cb < 2:
             return False
         if min(ca, cb) <= int(INTERCHANGE_RAMP_MAX_LANES):
             return False
         if int(links[a].get("to_node", -1)) != int(links[b].get("from_node", -2)):
             return False
+
         angle = abs(signed_turn_angle_deg_between_links(links[a], links[b]))
-        return angle <= float(ROUTE_WIDE_CONTINUATION_MAX_TURN_DEG)
+        if angle > float(ROUTE_WIDE_CONTINUATION_MAX_TURN_DEG):
+            return False
+
+        # EN: Lane-count changes are the original wide-continuation case.  For
+        #     same-count curved links, require source-row continuity so a real
+        #     multi-lane turn is not flattened into straight movement.
+        # KO: 차로 수 변화는 기존 본선 연속 판정입니다. 차로 수가 같은 곡선 link는
+        #     같은 원본 row/part/direction의 연속 segment일 때만 직진으로 보아
+        #     실제 다차로 좌/우회전을 무시하지 않게 합니다.
+        if ca != cb:
+            return True
+
+        same_source = (
+            links[a].get("source_row", None) == links[b].get("source_row", None)
+            and links[a].get("source_part", None) == links[b].get("source_part", None)
+            and links[a].get("direction", None) == links[b].get("direction", None)
+        )
+        if not same_source:
+            return False
+
+        seg_a = links[a].get("source_segment", None)
+        seg_b = links[b].get("source_segment", None)
+        if seg_a is not None and seg_b is not None:
+            try:
+                if abs(int(seg_b) - int(seg_a)) > 1:
+                    return False
+            except Exception:
+                pass
+        return True
     except Exception:
         return False
 
@@ -2488,17 +2974,40 @@ def _balanced_lane_count_change_lane_id(group, previous_group=None, previous_lan
     if prev_idx < 0 or n0 <= 1 or n1 <= 1 or n0 == n1:
         return _relative_lane_id(group, previous_group, previous_lane_id, default_key=key)
 
-    # Keep both outside edges available, but distribute ambiguous middle lanes
-    # with a deterministic jitter so 4->3 does not always collapse into one
-    # middle lane.  Example 4->3: 0->0, 3->2, while lanes 1/2 are split
-    # between neighboring target lanes by route/vehicle key.
-    if prev_idx == 0:
-        mapped_idx = 0
-    elif prev_idx == n0 - 1:
-        mapped_idx = n1 - 1
+    # Physical taper mapping.  For a right-edge 4->3 drop, lanes map as
+    # 0/1 -> new 0, 2 -> new 1, 3 -> new 2.  For a left-edge drop, right-side
+    # lanes keep their index and only the left edge compresses.  This matches
+    # the geometry post-process above and prevents a new centered 3-lane bundle
+    # from being selected at the node.
+    if n0 > n1:
+        drop = max(1, n0 - n1)
+        side = lane_drop_side_from_groups_py(previous_group, group)
+        if side == 0 and LANE_DROP_TAPER_AMBIGUOUS_RIGHT_FALLBACK:
+            side = -1
+        if side < 0:
+            mapped_idx = max(0, prev_idx - drop)
+        elif side > 0:
+            mapped_idx = min(prev_idx, n1 - 1)
+        else:
+            mapped_idx = int(round(float(prev_idx) * float(n1 - 1) / float(max(1, n0 - 1))))
+    elif n0 < n1:
+        add = max(1, n1 - n0)
+        # Physical lane-gain mapping. If the new lane opens on the right edge,
+        # continuing traffic shifts left by the added count; if it opens on the
+        # left edge, right-side lanes keep their index.  New lanes are reached
+        # later by normal lane changes after the taper, not by a sudden connector
+        # jump at the node.
+        side = lane_gain_side_from_groups_py(previous_group, group)
+        if side == 0 and LANE_GAIN_TAPER_AMBIGUOUS_RIGHT_FALLBACK:
+            side = -1
+        if side < 0:
+            mapped_idx = min(n1 - 1, prev_idx + add)
+        elif side > 0:
+            mapped_idx = min(prev_idx, n1 - 1)
+        else:
+            mapped_idx = int(round(float(prev_idx) * float(n1 - 1) / float(max(1, n0 - 1))))
     else:
-        jitter = (_stable_lane_mix((int(key) ^ (prev_idx * 2654435761) ^ (n0 * 131071) ^ n1)) & 65535) / 65536.0
-        mapped_idx = int(math.floor((float(prev_idx) + jitter) * float(n1) / float(n0)))
+        mapped_idx = prev_idx
     mapped_idx = max(0, min(n1 - 1, int(mapped_idx)))
     return int(group[mapped_idx]["lane_id"])
 
@@ -2804,6 +3313,76 @@ def _pack_route_lists(route_lane_lists, route_turn_lists):
     return as_contig_i32(route_offsets), as_contig_i32(route_lanes), as_contig_i32(route_turns)
 
 
+def _stable_route_choices_for_spawn_lane(lane_id, candidates, max_choices, seed):
+    """Pick deterministic route choices for one physical spawn lane.
+
+    EN: CUDA spawn slots store exactly one route id.  To avoid every vehicle on
+    the same entry lane following one fixed route, Python repeats the spawn lane
+    across several slots and assigns a different route to each slot.  This helper
+    chooses a stable subset so repeated runs with the same seed are reproducible.
+
+    KO: CUDA spawn slot은 route id를 하나만 저장합니다. 같은 진입 차로의 모든
+    차량이 하나의 고정 route만 따라가는 문제를 막기 위해 Python에서 동일 lane을
+    여러 slot으로 반복하고 slot마다 다른 route를 배정합니다. 이 함수는 같은 seed에서
+    항상 같은 후보를 고르도록 안정적인 부분집합을 선택합니다.
+    """
+    # 문법 이유: set(...)으로 중복 route id를 제거한 뒤 sorted(...)로 정렬하면
+    # 병렬 route 생성 순서가 조금 달라도 출력 slot 순서가 안정적입니다.
+    # 논리 이유: spawn slot 순서가 안정적이어야 CUDA rng_state[p]와 demand 누적기가
+    # 실행마다 같은 의미를 유지합니다.
+    unique = sorted({int(r) for r in candidates})
+    if not unique:
+        return []
+
+    max_choices = max(1, int(max_choices))
+    if len(unique) <= max_choices:
+        return unique
+
+    # 문법 이유: numpy Generator는 Python list index 배열을 직접 만들기 쉽고,
+    # replace=False로 같은 route를 두 번 뽑지 않습니다.
+    # 논리 이유: lane id와 seed를 섞어 lane마다 다른 route 조합을 고르되, 같은
+    # 프로젝트 설정에서는 매번 동일한 route 분포가 나오게 합니다.
+    lane_key = (int(seed) & 0xFFFFFFFF) ^ ((int(lane_id) + 1) * 2654435761 & 0xFFFFFFFF)
+    rng = np.random.default_rng(lane_key)
+    chosen_idx = sorted(int(x) for x in rng.choice(len(unique), size=max_choices, replace=False))
+    return [int(unique[i]) for i in chosen_idx]
+
+
+def build_spawn_route_slots(routes_by_first_lane, route_seed, route_choices_per_lane):
+    """Return spawn_lane and spawn_route arrays with several route choices per lane.
+
+    EN: Older builds stored one spawn route per lane, so an entry lane could look
+    "fixed" even after multi-lane spawn balancing.  The returned arrays may
+    contain repeated lane ids; each repeated row is an independent demand queue
+    for a different route, while CUDA's per-lane lock still prevents same-tick
+    overlap on the physical lane.
+
+    KO: 이전 빌드는 차로 하나에 spawn route 하나만 저장해서 다차로 스폰 균등화를
+    해도 진입 차량이 한 경로/차선 의도에 고정된 것처럼 보일 수 있었습니다. 반환
+    배열에는 같은 lane id가 여러 번 들어갈 수 있고, 각 행은 다른 route의 독립
+    대기열입니다. 실제 차로 중첩은 CUDA의 lane lock이 계속 막습니다.
+    """
+    spawn_lanes = []
+    spawn_routes = []
+    per_lane_counts = {}
+
+    for lane_id in sorted(int(x) for x in routes_by_first_lane.keys()):
+        choices = _stable_route_choices_for_spawn_lane(
+            lane_id,
+            routes_by_first_lane.get(lane_id, []),
+            route_choices_per_lane,
+            route_seed,
+        )
+        if not choices:
+            continue
+        per_lane_counts[int(lane_id)] = int(len(choices))
+        for rid in choices:
+            spawn_lanes.append(int(lane_id))
+            spawn_routes.append(int(rid))
+
+    return as_contig_i32(spawn_lanes), as_contig_i32(spawn_routes), per_lane_counts
+
+
 def retarget_route_start_lane_path(lane_path, turn_path, new_first_lane, link_to_lanes, lanes):
     """Adjust a cloned route so straight-through segments keep lane position."""
     if not lane_path:
@@ -2914,6 +3493,162 @@ def route_lane_path_is_connected(lane_path, turn_path, link_to_lanes, lanes):
             return False
 
     return True
+
+
+def recompute_turns_for_lane_path(lane_path, link_to_lanes, lanes, links):
+    """Rebuild turn metadata after a route-lane post-process.
+
+    KO: route lane만 수정하고 turn 배열을 그대로 두면 CUDA 쪽에서 직진 본선을
+    좌/우회전으로 오인할 수 있습니다. 따라서 차로 배열이 바뀐 뒤에는 항상
+    link 전환 기준으로 turn 배열을 다시 만듭니다.
+    """
+    out_turns = []
+    for i in range(max(0, len(lane_path) - 1)):
+        a = int(lane_path[i])
+        b = int(lane_path[i + 1])
+        if not (0 <= a < len(lanes) and 0 <= b < len(lanes)):
+            out_turns.append(TURN_STRAIGHT)
+            continue
+        a_link = int(lanes[a].get("link_id", -1))
+        b_link = int(lanes[b].get("link_id", -1))
+        out_turns.append(route_turn_for_link_transition(a_link, b_link, link_to_lanes, links))
+    while len(out_turns) < len(lane_path):
+        out_turns.append(TURN_STRAIGHT)
+    return out_turns[:len(lane_path)]
+
+
+def _stable_inner_route_index(group_len, key):
+    """Stable inner-lane target for ordinary through traffic on 3+ lane roads.
+
+    KO: group[0]은 우측 끝 차로입니다. 전출입로가 이 차로에 붙기 때문에,
+    3차로 이상 본선에서는 일반 직진 차량의 목표 차로를 1..N-1 안쪽 차로에
+    분산해 우측 병목이 과도하게 가려지지 않도록 합니다.
+    """
+    group_len = int(group_len)
+    if group_len <= 0:
+        return -1
+    if group_len >= max(3, int(ROUTE_RAMP_ENTRY_SPREAD_MIN_MAIN_LANES)):
+        return 1 + int(_stable_lane_mix(key) % max(1, group_len - 1))
+    return int(_stable_lane_mix(key) % max(1, group_len))
+
+
+def spread_right_entry_route_lane_path(route_id, lane_path, turn_path, link_to_lanes, lanes, links):
+    """Move ramp-entering through routes away from the right edge after merging.
+
+    EN: The old v21 fix relied mostly on live lane-change decisions.  In practice,
+    short GIS segments, no-start zones, turn-prep guards, and strict MOBIL gaps can
+    prevent a ramp vehicle from ever leaving the receiving right lane.  This helper
+    writes the intent into the route itself: keep the legal edge lane for the actual
+    ramp->mainline handoff, then on subsequent straight mainline segments shift one
+    adjacent lane at a time toward a stable inner target.
+
+    KO: v21에서는 전입 후 분산을 주로 실시간 차선변경에 맡겼습니다. 그런데 GIS
+    segment가 짧거나 no-start 구간/회전 준비 guard/MOBIL gap 조건이 겹치면 전입
+    차량이 계속 우측 끝 차로에 묶입니다. 여기서는 route 배열 자체에 의도를
+    심습니다. 실제 램프->본선 연결은 법적으로 우측 끝 차로를 유지하고, 그 다음
+    직진 본선 segment부터 한 번에 한 차로씩 안정 목표 안쪽 차로로 이동합니다.
+    """
+    if not ROUTE_RAMP_ENTRY_INNER_SPREAD or not lane_path:
+        return list(lane_path), 0
+
+    min_main = max(2, int(ROUTE_RAMP_ENTRY_SPREAD_MIN_MAIN_LANES))
+    lookahead = max(1, int(ROUTE_RAMP_ENTRY_SPREAD_LOOKAHEAD_LINKS))
+    out = [int(x) for x in lane_path]
+    changed = 0
+    target_idx = -1
+    spread_budget = 0
+
+    for step in range(1, len(out)):
+        prev_lane = int(out[step - 1])
+        cur_lane = int(out[step])
+        if not (0 <= prev_lane < len(lanes) and 0 <= cur_lane < len(lanes)):
+            spread_budget = 0
+            continue
+
+        prev_group = link_to_lanes.get(int(lanes[prev_lane].get("link_id", -1)), [])
+        cur_group = link_to_lanes.get(int(lanes[cur_lane].get("link_id", -1)), [])
+        prev_count = len(prev_group)
+        cur_count = len(cur_group)
+
+        # Ramp/side-link -> mainline handoff detected.  Keep this immediate
+        # receiving lane unchanged because INTERCHANGE_EDGE_ONLY requires it, but
+        # arm a short downstream lane-spread window for the following mainline
+        # segments.
+        if prev_count <= int(INTERCHANGE_RAMP_MAX_LANES) and cur_count >= min_main:
+            key = (int(route_id) * 1000003) ^ (int(cur_lane) * 9176) ^ (int(step) * 131071)
+            target_idx = _stable_inner_route_index(cur_count, key)
+            spread_budget = lookahead
+            continue
+
+        if spread_budget <= 0 or target_idx < 0:
+            continue
+
+        prev_turn = int(turn_path[step - 1]) if step - 1 < len(turn_path) else TURN_STRAIGHT
+        next_turn = int(turn_path[step]) if step < len(turn_path) else TURN_STRAIGHT
+
+        # Do not fight a real upcoming left/right exit.  Route-level spread is only
+        # for ordinary through traffic after entering the mainline.
+        if prev_turn != TURN_STRAIGHT or next_turn in (TURN_LEFT, TURN_RIGHT):
+            spread_budget = 0
+            continue
+
+        if prev_count < min_main or cur_count < min_main:
+            spread_budget -= 1
+            continue
+
+        prev_idx = lane_index_in_group(prev_group, prev_lane)
+        cur_idx = lane_index_in_group(cur_group, cur_lane)
+        if prev_idx < 0 or cur_idx < 0:
+            spread_budget -= 1
+            continue
+
+        local_target = max(0, min(cur_count - 1, int(target_idx)))
+        if cur_count >= 3:
+            local_target = max(1, local_target)
+
+        # Move only one lane per segment.  That keeps the path realistic and avoids
+        # creating a connector that visually cuts across multiple lanes at a node.
+        if prev_idx < local_target:
+            desired_idx = min(cur_count - 1, prev_idx + 1)
+        elif prev_idx > local_target:
+            desired_idx = max(0, prev_idx - 1)
+        else:
+            desired_idx = max(0, min(cur_count - 1, prev_idx))
+
+        desired_lane = int(cur_group[desired_idx]["lane_id"])
+
+        # If this segment is actually a ramp receiving edge, never override the
+        # edge-lane rule.  For true mainline->mainline continuations this returns -1.
+        edge_receive = interchange_receiving_outer_lane_id(prev_group, cur_group)
+        if edge_receive >= 0 and int(edge_receive) != desired_lane:
+            spread_budget = 0
+            continue
+
+        if desired_lane != cur_lane and _py_lane_connected(prev_lane, desired_lane, lanes):
+            out[step] = desired_lane
+            changed += 1
+            cur_idx = desired_idx
+
+        # EN: Keep the target for the whole downstream window, even after the
+        # vehicle first reaches it.  The v21-v23 behavior stopped as soon as one
+        # segment touched the target, so the next generated mainline segment could
+        # fall back to the original right-edge lane.  Continuing the window makes
+        # the route stay balanced across many short GIS segments.
+        # KO: 목표 차로에 처음 도달해도 즉시 종료하지 않고 downstream window 동안
+        # 계속 유지합니다. v21/v22에서는 한 segment에서 목표에 닿으면 종료되어 다음
+        # 본선 segment가 다시 우측 끝 차로로 돌아갈 수 있었습니다. 짧은 GIS segment가
+        # 많은 네트워크에서도 차로 분산이 유지되도록 window를 끝까지 씁니다.
+        spread_budget -= 1
+
+    if changed <= 0:
+        return list(lane_path), 0
+
+    new_turns = recompute_turns_for_lane_path(out, link_to_lanes, lanes, links)
+    if not route_lane_path_is_connected(out, new_turns, link_to_lanes, lanes):
+        # Safety first: if a strange GIS node makes the spread invalid, keep the
+        # conservative original path rather than dropping an otherwise usable route.
+        return list(lane_path), 0
+    return out, changed
 
 
 def filter_invalid_route_arrays(route_offsets, route_lanes, route_turns, link_to_lanes, lanes):
@@ -3273,6 +4008,19 @@ def make_route_cache_key(gpkg_path, network_crs, num_routes, min_trip_distance, 
         ("ROUTE_WIDE_CONTINUATION_MAX_TURN_DEG", ROUTE_WIDE_CONTINUATION_MAX_TURN_DEG),
         ("ROUTE_LANE_COUNT_CHANGE_BALANCE", ROUTE_LANE_COUNT_CHANGE_BALANCE),
         ("ROUTE_DESTINATION_LANE_SPREAD", ROUTE_DESTINATION_LANE_SPREAD),
+        ("ROUTE_RAMP_ENTRY_INNER_SPREAD", ROUTE_RAMP_ENTRY_INNER_SPREAD),
+        ("ROUTE_RAMP_ENTRY_SPREAD_MIN_MAIN_LANES", ROUTE_RAMP_ENTRY_SPREAD_MIN_MAIN_LANES),
+        ("ROUTE_RAMP_ENTRY_SPREAD_LOOKAHEAD_LINKS", ROUTE_RAMP_ENTRY_SPREAD_LOOKAHEAD_LINKS),
+        ("LANE_DROP_TAPER_GEOMETRY", LANE_DROP_TAPER_GEOMETRY),
+        ("LANE_DROP_TAPER_ALIGN_SURVIVOR_LANES", LANE_DROP_TAPER_ALIGN_SURVIVOR_LANES),
+        ("LANE_DROP_TAPER_RENDER_WIDTH", LANE_DROP_TAPER_RENDER_WIDTH),
+        ("LANE_DROP_TAPER_AMBIGUOUS_RIGHT_FALLBACK", LANE_DROP_TAPER_AMBIGUOUS_RIGHT_FALLBACK),
+        ("LANE_DROP_TAPER_END_PULL", LANE_DROP_TAPER_END_PULL),
+        ("LANE_GAIN_TAPER_GEOMETRY", LANE_GAIN_TAPER_GEOMETRY),
+        ("LANE_GAIN_TAPER_ALIGN_CONTINUING_LANES", LANE_GAIN_TAPER_ALIGN_CONTINUING_LANES),
+        ("LANE_GAIN_TAPER_RENDER_WIDTH", LANE_GAIN_TAPER_RENDER_WIDTH),
+        ("LANE_GAIN_TAPER_AMBIGUOUS_RIGHT_FALLBACK", LANE_GAIN_TAPER_AMBIGUOUS_RIGHT_FALLBACK),
+        ("LANE_GAIN_TAPER_START_PULL", LANE_GAIN_TAPER_START_PULL),
         ("INTERCHANGE_EDGE_ONLY", INTERCHANGE_EDGE_ONLY),
         ("INTERCHANGE_RAMP_MAX_LANES", INTERCHANGE_RAMP_MAX_LANES),
         ("INTERCHANGE_MAIN_MIN_LANES", INTERCHANGE_MAIN_MIN_LANES),
@@ -3330,6 +4078,17 @@ def make_route_cache_key(gpkg_path, network_crs, num_routes, min_trip_distance, 
         "wide_continuation_max_turn_deg": float(ROUTE_WIDE_CONTINUATION_MAX_TURN_DEG),
         "lane_count_change_balance": bool(ROUTE_LANE_COUNT_CHANGE_BALANCE),
         "destination_lane_spread": bool(ROUTE_DESTINATION_LANE_SPREAD),
+        "ramp_entry_inner_spread": bool(ROUTE_RAMP_ENTRY_INNER_SPREAD),
+        "ramp_entry_spread_min_main_lanes": int(ROUTE_RAMP_ENTRY_SPREAD_MIN_MAIN_LANES),
+        "ramp_entry_spread_lookahead_links": int(ROUTE_RAMP_ENTRY_SPREAD_LOOKAHEAD_LINKS),
+        "lane_drop_taper_geometry": bool(LANE_DROP_TAPER_GEOMETRY),
+        "lane_drop_taper_align_survivors": bool(LANE_DROP_TAPER_ALIGN_SURVIVOR_LANES),
+        "lane_drop_taper_render_width": bool(LANE_DROP_TAPER_RENDER_WIDTH),
+        "lane_drop_taper_end_pull": float(LANE_DROP_TAPER_END_PULL),
+        "lane_gain_taper_geometry": bool(LANE_GAIN_TAPER_GEOMETRY),
+        "lane_gain_taper_align_continuing": bool(LANE_GAIN_TAPER_ALIGN_CONTINUING_LANES),
+        "lane_gain_taper_render_width": bool(LANE_GAIN_TAPER_RENDER_WIDTH),
+        "lane_gain_taper_start_pull": float(LANE_GAIN_TAPER_START_PULL),
     }
     h.update(json.dumps(route_identity, sort_keys=True, ensure_ascii=True).encode("utf-8"))
     return h.hexdigest()[:20]
@@ -3459,6 +4218,13 @@ def make_routes_ready_cached(G, nodes, links, lanes, link_to_lanes, origin_nodes
             "route_wide_lane_change_as_straight": bool(ROUTE_WIDE_LANE_CHANGE_AS_STRAIGHT),
             "route_lane_count_change_balance": bool(ROUTE_LANE_COUNT_CHANGE_BALANCE),
             "route_destination_lane_spread": bool(ROUTE_DESTINATION_LANE_SPREAD),
+            "route_ramp_entry_inner_spread": bool(ROUTE_RAMP_ENTRY_INNER_SPREAD),
+            "route_ramp_entry_spread_min_main_lanes": int(ROUTE_RAMP_ENTRY_SPREAD_MIN_MAIN_LANES),
+            "route_ramp_entry_spread_lookahead_links": int(ROUTE_RAMP_ENTRY_SPREAD_LOOKAHEAD_LINKS),
+            "lane_drop_taper_geometry": bool(LANE_DROP_TAPER_GEOMETRY),
+            "lane_drop_taper_align_survivors": bool(LANE_DROP_TAPER_ALIGN_SURVIVOR_LANES),
+            "lane_gain_taper_geometry": bool(LANE_GAIN_TAPER_GEOMETRY),
+            "lane_gain_taper_align_continuing": bool(LANE_GAIN_TAPER_ALIGN_CONTINUING_LANES),
             "interchange_edge_only": bool(INTERCHANGE_EDGE_ONLY),
             "nodes": len(nodes),
             "links": len(links),
@@ -4064,8 +4830,10 @@ def road_vertices_for_chunk(chunk):
         coords = list(geom.coords) if geom is not None else []
         if len(coords) < 2:
             continue
-        half_w = float(link["width"]) * 0.5
-        for a, b in zip(coords[:-1], coords[1:]):
+        width_start = float(link.get("render_width_start", link.get("width", 1.0)))
+        width_end = float(link.get("render_width_end", link.get("width", width_start)))
+        nseg = max(1, len(coords) - 1)
+        for seg_idx, (a, b) in enumerate(zip(coords[:-1], coords[1:])):
             dx = float(b[0]) - float(a[0])
             dy = float(b[1]) - float(a[1])
             L = math.hypot(dx, dy)
@@ -4073,10 +4841,14 @@ def road_vertices_for_chunk(chunk):
                 continue
             nx = -dy / L
             ny = dx / L
-            p0 = (a[0] + nx * half_w, a[1] + ny * half_w)
-            p1 = (a[0] - nx * half_w, a[1] - ny * half_w)
-            p2 = (b[0] + nx * half_w, b[1] + ny * half_w)
-            p3 = (b[0] - nx * half_w, b[1] - ny * half_w)
+            f0 = float(seg_idx) / float(nseg)
+            f1 = float(seg_idx + 1) / float(nseg)
+            half_w0 = 0.5 * ((1.0 - f0) * width_start + f0 * width_end)
+            half_w1 = 0.5 * ((1.0 - f1) * width_start + f1 * width_end)
+            p0 = (a[0] + nx * half_w0, a[1] + ny * half_w0)
+            p1 = (a[0] - nx * half_w0, a[1] - ny * half_w0)
+            p2 = (b[0] + nx * half_w1, b[1] + ny * half_w1)
+            p3 = (b[0] - nx * half_w1, b[1] - ny * half_w1)
             def add(p):
                 verts.extend([p[0], p[1], 0.25, 0.25, 0.25, 1.0, 1.0])
             add(p0); add(p1); add(p2); add(p1); add(p2); add(p3)
@@ -4812,6 +5584,7 @@ def sanitize_and_repair_route_arrays(route_offsets_np, route_lanes_np, route_tur
     truncated = 0
     fixed_steps = 0
     impossible_steps = 0
+    ramp_spread_steps = 0
 
     for rid in range(max(0, len(route_offsets_np) - 1)):
         off0 = int(route_offsets_np[rid])
@@ -4893,6 +5666,22 @@ def sanitize_and_repair_route_arrays(route_offsets_np, route_lanes_np, route_tur
             out_turns.append(TURN_STRAIGHT)
         else:
             out_turns = out_turns[:len(out_lanes)]
+
+        # EN: v24 route-level ramp-entry distribution.  This is intentionally
+        # placed after the hard connectivity repair so it works on the final lane
+        # path that CUDA will receive, and it revalidates before accepting changes.
+        # KO: v23 route 단 전입 차량 분산입니다. CUDA로 넘길 최종 경로를 기준으로
+        # 작동해야 하므로 연결성 보정 뒤에 수행하고, 변경 후 다시 검증합니다.
+        spread_lanes, spread_changes = spread_right_entry_route_lane_path(
+            rid, out_lanes, out_turns, link_to_lanes, lanes, links
+        )
+        if spread_changes > 0:
+            spread_turns = recompute_turns_for_lane_path(spread_lanes, link_to_lanes, lanes, links)
+            if route_lane_path_is_connected(spread_lanes, spread_turns, link_to_lanes, lanes):
+                out_lanes = spread_lanes
+                out_turns = spread_turns
+                ramp_spread_steps += int(spread_changes)
+
         repaired_lists.append(out_lanes)
         repaired_turns.append(out_turns)
 
@@ -4900,12 +5689,13 @@ def sanitize_and_repair_route_arrays(route_offsets_np, route_lanes_np, route_tur
         raise RuntimeError("No valid routes after route lane safety repair.")
 
     out_offsets, out_lanes, out_turns = _pack_route_lists(repaired_lists, repaired_turns)
-    if fixed_steps or dropped or truncated or impossible_steps:
+    if fixed_steps or dropped or truncated or impossible_steps or ramp_spread_steps:
         print(
             "[Routes] lane safety repair:",
             "routes_in=", int(len(route_offsets_np) - 1),
             "routes_out=", int(len(out_offsets) - 1),
             "fixed_steps=", int(fixed_steps),
+            "ramp_entry_spread_steps=", int(ramp_spread_steps),
             "truncated_routes=", int(truncated),
             "dropped_routes=", int(dropped),
             "impossible_steps=", int(impossible_steps),
@@ -4951,13 +5741,23 @@ def main():
 
     print("[Info] build static network")
     G, link_to_lanes, left_np, right_np = build_static_network(nodes, links, lanes)
+    _taper_adjusted = apply_lane_drop_taper_geometry(nodes, links, lanes, link_to_lanes)
+    if _taper_adjusted:
+        # Rebuild after lane-drop tapers so side ordering, graph lengths and
+        # CUDA neighbor arrays use the adjusted survivor-lane geometry.
+        G, link_to_lanes, left_np, right_np = build_static_network(nodes, links, lanes)
+    _gain_taper_adjusted = apply_lane_gain_taper_geometry(nodes, links, lanes, link_to_lanes)
+    if _gain_taper_adjusted:
+        # Rebuild after lane-gain tapers so newly opened lanes do not appear as
+        # full-width middle lanes at node boundaries.
+        G, link_to_lanes, left_np, right_np = build_static_network(nodes, links, lanes)
     _interchange_adjusted = apply_interchange_outer_edge_geometry(nodes, links, lanes, link_to_lanes)
     if _interchange_adjusted:
         # Rebuild graph weights and lane adjacency after ramp lane endpoints are
         # snapped from GIS centerlines to the nearest physical outside lane.
         G, link_to_lanes, left_np, right_np = build_static_network(nodes, links, lanes)
     print("[Graph] nodes:", G.number_of_nodes(), "edges:", G.number_of_edges())
-    print("[Network] lane side ordering: geometry-normalized right->left; surface-aware turns enabled; interchange ramps use outer edge lanes")
+    print("[Network] lane side ordering: geometry-normalized right->left; tapered lane drops/gains enabled; interchange ramps use outer edge lanes")
 
     spawn_records, spawn_crs = load_spawn_records(SPAWN_GPKG, layer=SPAWN_GPKG_LAYER, label="Spawn")
     origin_nodes, destination_nodes, spawn_nodes, node_spawn_profiles = match_spawn_records(
@@ -5012,18 +5812,26 @@ def main():
         first_lane = int(route_lanes_np[off0])
         if 0 <= first_lane < num_lanes:
             routes_by_first_lane.setdefault(first_lane, []).append(rid)
-    spawn_lanes = sorted(routes_by_first_lane.keys())
-    if not spawn_lanes:
+    # EN: Build repeated spawn slots: same physical lane, several route choices.
+    # KO: 동일 실제 차로에 대해 여러 route 선택지를 가진 반복 spawn slot을 만듭니다.
+    spawn_lane_np, spawn_route_np, spawn_route_choice_counts = build_spawn_route_slots(
+        routes_by_first_lane,
+        ROUTE_SEED,
+        SPAWN_ROUTE_CHOICES_PER_LANE,
+    )
+    if len(spawn_lane_np) <= 0:
         raise RuntimeError("No spawn lanes from routes.")
-    rng = np.random.default_rng(ROUTE_SEED)
-    spawn_lane_np = as_contig_i32(spawn_lanes)
-    spawn_route_np = np.full(len(spawn_lanes), -1, dtype=np.int32)
-    for i, lane_id in enumerate(spawn_lane_np):
-        candidates = routes_by_first_lane[int(lane_id)]
-        spawn_route_np[i] = int(candidates[int(rng.integers(0, len(candidates)))])
-    spawn_route_np = as_contig_i32(spawn_route_np)
     num_spawn_points = int(len(spawn_lane_np))
-    print("[Spawn] slots:", num_spawn_points)
+    unique_spawn_lane_count = int(len(spawn_route_choice_counts))
+    max_route_choices_seen = int(max(spawn_route_choice_counts.values())) if spawn_route_choice_counts else 0
+    avg_route_choices_seen = float(num_spawn_points) / max(1, unique_spawn_lane_count)
+    print(
+        "[Spawn] lanes:", unique_spawn_lane_count,
+        "slots:", num_spawn_points,
+        "route_choices_per_lane_max_cfg:", int(SPAWN_ROUTE_CHOICES_PER_LANE),
+        "max_seen:", max_route_choices_seen,
+        "avg_seen:", f"{avg_route_choices_seen:.2f}",
+    )
 
     lane_road_width = np.zeros(num_lanes, dtype=np.float32)
     lane_count_dir = np.ones(num_lanes, dtype=np.float32)
@@ -5042,6 +5850,13 @@ def main():
         spawn_group_slots.setdefault((origin_node, link_id), []).append(int(i))
         spawn_node_slots.setdefault(origin_node, []).append(int(i))
 
+    # 문법 이유: bool(...)로 설정 값을 명확히 True/False로 고정해 아래 삼항식에서
+    # 숫자 0/1 또는 numpy scalar가 섞여도 동일하게 동작하게 합니다.
+    # 논리 이유: 같은 실제 spawn lane을 route 선택지 때문에 여러 slot으로 반복하면,
+    # SPAWN_MULTI_LANE_BALANCE를 끈 경우에도 route slot끼리는 수요를 나누어야 전체
+    # 유입량이 route 후보 수만큼 부풀지 않습니다.
+    split_spawn_group_demand = bool(SPAWN_MULTI_LANE_BALANCE or SPAWN_ROUTE_CHOICES_PER_LANE > 1)
+
     demand_np = np.zeros(num_spawn_points, dtype=np.float32)
     for slots in spawn_group_slots.values():
         if not slots:
@@ -5053,7 +5868,7 @@ def main():
         width_mult = min(width_mult, SPAWN_MAX_MULT)
         lane_mult = lanes_here ** SPAWN_LANE_POWER
         group_rate = BASE_VPS * width_mult * lane_mult
-        per_lane_rate = group_rate / max(1, len(slots)) if SPAWN_MULTI_LANE_BALANCE else group_rate
+        per_lane_rate = group_rate / max(1, len(slots)) if split_spawn_group_demand else group_rate
         for i in slots:
             demand_np[int(i)] = float(per_lane_rate)
 
@@ -5079,18 +5894,20 @@ def main():
         if prof is None:
             continue
         prof = np.maximum(np.asarray(prof, dtype=np.float32), 0.0)
-        per_slot_prof = prof / max(1, len(slots)) if SPAWN_MULTI_LANE_BALANCE else prof
+        per_slot_prof = prof / max(1, len(slots)) if split_spawn_group_demand else prof
         for i in slots:
             spawn_profile_np[int(i), :] = per_slot_prof
             spawn_profile_has_np[int(i)] = 1
 
     multi_lane_groups = sum(1 for slots in spawn_group_slots.values() if len(slots) > 1)
     multi_lane_slots = sum(len(slots) for slots in spawn_group_slots.values() if len(slots) > 1)
-    if SPAWN_MULTI_LANE_BALANCE:
+    if split_spawn_group_demand:
         print(
-            "[Spawn] multi-lane balance:",
+            "[Spawn] demand split:",
             "groups=", int(multi_lane_groups),
             "balanced_slots=", int(multi_lane_slots),
+            "multi_lane_balance=", int(bool(SPAWN_MULTI_LANE_BALANCE)),
+            "route_choice_split=", int(SPAWN_ROUTE_CHOICES_PER_LANE > 1),
             "node_profile_split=", int(sum(1 for slots in spawn_node_slots.values() if len(slots) > 1)),
         )
 
@@ -5132,9 +5949,14 @@ def main():
     torch.cuda.set_device(0)
     device = torch.device("cuda:0")
     print("[CUDA] device:", torch.cuda.get_device_name(0))
+    if SIM_ACCELERATION_MODE == "hybrid":
+        print("[Accel] mode=hybrid | CUDA: per-tick vehicles/perception/decision/motion/collision | CPU parallel: routes/static repair/metrics")
+    else:
+        print("[Accel] mode=cuda | CUDA-focused per-tick simulation; CPU preprocessing follows ROUTE_PARALLEL settings")
     print("[Render] vehicle vertices:", RENDER_VERTS_PER_VEHICLE, "wheels:", bool(RENDER_WHEELS), "interval:", RENDER_INTERVAL, "textured:", bool(USE_TEXTURED_CARS))
     print("[Metrics] size:", METRICS_SIZE)
     print("[PriorityGate/Clearance] world_cell_size:", WORLD_CELL_SIZE, "fps_limit:", FPS_LIMIT, "metrics_interval:", METRICS_INTERVAL, "lane_markings:", DRAW_LANE_MARKINGS, "centerlines:", DRAW_LANE_CENTERLINES, "edges:", DRAW_LANE_EDGES, "line_width:", LANE_MARKING_WIDTH, "group_by_source:", LANE_MARKING_GROUP_BY_SOURCE, "vehicle_hover:", SHOW_VEHICLE_HOVER)
+    print("[SpeedFloor] desired_cruise_enabled:", bool(SPEED_MIN_CRUISE_ENABLED), "min_cruise_kmh:", float(SPEED_MIN_CRUISE_KMH), "safety_limited:", True)
 
     pygame.init()
     pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)

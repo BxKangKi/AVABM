@@ -8,3 +8,6 @@
 *.pyd
 *.qgz
 *.ipynb
+/avabm_cuda/build
+avabm_cuda/.avabm_cuda_build_fingerprint.json
+*.zip

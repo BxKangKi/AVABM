@@ -1,7 +1,8 @@
 # AVABM unified configuration
-CONFIG_VERSION=17
+CONFIG_VERSION=31
 # EN: Python and batch files read this file instead of hard-coded environment variables.
-# KO: Python과 배치 파일이 환경 변수 set 대신 이 파일을 공통 설정으로 읽습니다.
+# Korean explanations were moved to AVABM_PATCH_REVIEW_KO.md because Windows CMD
+# can mis-parse UTF-8 comments in batch/config files on some systems.
 # Format: KEY=VALUE.  Use None for optional layer names.
 
 # ------------------------------------------------------------
@@ -12,9 +13,51 @@ CONDA_ACTIVATE_PATH=%USERPROFILE%\miniforge3\Scripts\activate.bat
 PYTHON_COMMAND=python
 CUDA_HOME=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6
 TORCH_NVCC_FLAGS=-allow-unsupported-compiler
+# EN: Skip PyTorch's noisy cl version probe. The real compile still checks cl by actually building.
+TORCH_DONT_CHECK_COMPILER_ABI=1
 CUDA_EXTRA_NVCC_FLAGS=
 CUDA_EXTRA_CXX_FLAGS=
-MAX_JOBS=16
+# EN: Runtime-speed profile.  Use CUDA_BUILD_MODE=fastdev only when rebuild speed matters more.
+CUDA_BUILD_MODE=release
+# EN: Build binding.cpp with C++17 by default. C++20 is not needed here and can compile slower.
+CUDA_CXX_STANDARD=17
+# EN: Disable MSVC /GL link-time code generation for this Python extension to reduce build time.
+CUDA_DISABLE_MSVC_GL=1
+# EN: 0 uses lighter torch headers. Set 1 only if your local PyTorch version rejects the light-header build.
+CUDA_USE_FULL_TORCH_EXTENSION_HEADER=0
+# EN: nvcc worker threads. 0 disables the option for maximum compatibility.
+CUDA_NVCC_THREADS=4
+# EN: Optional nvcc split-compile. Leave 0 unless your CUDA version benefits from it.
+CUDA_SPLIT_COMPILE=0
+# EN: Hide external CUDA/PyTorch/MSVC deprecation warnings so real AVABM errors are visible.
+CUDA_SUPPRESS_HEADER_WARNINGS=1
+CUDA_VERBOSE_BUILD=0
+CUDA_BUILD_LOG_TAIL=120
+# EN: Keep normal builds incremental.  Use avabm_cuda\build.bat clean only for a full rebuild.
+CUDA_INCREMENTAL_BUILD=1
+CUDA_SKIP_IF_UP_TO_DATE=1
+CUDA_FORCE_REBUILD=0
+# EN: Hide warnings by default; set to 1 only when debugging compiler warnings.
+CUDA_SHOW_WARNINGS=0
+# EN: O1 compiles faster for development. Use 2 or 3 only for final performance benchmarking.
+CUDA_OPT_LEVEL=3
+CUDA_FAST_MATH=1
+CUDA_FAST_EQUIV_MATH=1
+CUDA_USE_ASYNC_MEMSET_CLEAR=1
+CUDA_SPAWN_GRID_INSERT_FASTPATH=1
+# EN: Minimum desired cruise speed on open road.  This is not a collision-unsafe hard clamp.
+SPEED_MIN_CRUISE_ENABLED=1
+SPEED_MIN_CRUISE_KMH=40.0
+# EN: Very high MAX_JOBS does not help because this extension has only main.cu and binding.cpp.
+MAX_JOBS=4
+CUDA_BUILD_MAX_JOBS=4
+TORCH_CUDA_ARCH_LIST=8.6
+
+# Optional: full path to Visual Studio vcvars64.bat.
+# Leave blank to let avabm_cuda\build.bat auto-detect Visual Studio 2022.
+# Example:
+# MSVC_VCVARS64_BAT=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat
+MSVC_VCVARS64_BAT=
 
 # ------------------------------------------------------------
 # Data sources
@@ -35,7 +78,6 @@ SIGNAL_NODE_MATCH_MAX_DIST=0
 #   auto          : use ONEWAY/ONE_WAY fields and OSM other_tags like "oneway"=>"yes".
 #   force_oneway  : never split the centerline; all lanes follow geometry direction.
 #   force_two_way : always split the centerline into opposing directions.
-# KO: 중앙선을 양방향으로 분리할지 결정합니다. Dongbu 레이어는 auto 권장.
 ROAD_ONEWAY_MODE=force_oneway
 ROAD_DEFAULT_ONEWAY=0
 ROAD_PARSE_OSM_OTHER_TAGS=1
@@ -49,10 +91,15 @@ ROAD_NARROW_ONEWAY_MAX_WIDTH=3.6
 # Route/lane safety repair
 # ------------------------------------------------------------
 # EN: Validate generated route lane paths before CUDA receives them.
-# KO: CUDA로 넘기기 전에 route 차로 연결성을 검사해 잘못된 lane 때문에
-#     차량이 도로 중간에 멈추는 상황을 줄입니다.
 ROUTE_VALIDATE_LANE_CONNECTIVITY=1
 ROUTE_DROP_INVALID_LANE_PATHS=1
+
+# EN: v24 right-ramp entry balancing.  Keep the physical right-edge receiving
+#     lane at the merge, then keep through vehicles distributed over inner lanes
+#     for many short downstream GIS segments.
+ROUTE_RAMP_ENTRY_INNER_SPREAD=1
+ROUTE_RAMP_ENTRY_SPREAD_MIN_MAIN_LANES=3
+ROUTE_RAMP_ENTRY_SPREAD_LOOKAHEAD_LINKS=24
 
 # ------------------------------------------------------------
 # Simulation scale / runtime
@@ -60,13 +107,22 @@ ROUTE_DROP_INVALID_LANE_PATHS=1
 SCREEN_W=1600
 SCREEN_H=900
 MAX_AGENTS=150000
-NUM_ROUTES=2048
+NUM_ROUTES=4096
 DT=0.05
 AV_PENETRATION=0.0
+
+# ------------------------------------------------------------
+# Acceleration mode
+# ------------------------------------------------------------
+# EN: hybrid = CUDA for per-tick vehicle dynamics/perception/decision kernels,
+#     CPU parallelism for route building, static network repair and async metrics.
+#     cuda = keep CPU preprocessing parallel settings as configured, but report as
+#     CUDA-focused.  Current simulator still requires CUDA for the main step.
+SIM_ACCELERATION_MODE=hybrid
 FPS_LIMIT=0
 RENDER_INTERVAL=1
 # 24h run helper: run this many physics ticks per rendered frame. 1 = real-time-style visual loop.
-PHYSICS_STEPS_PER_FRAME=10
+PHYSICS_STEPS_PER_FRAME=20
 METRICS_INTERVAL=2.0
 METRICS_PATH=data/results/simulation_metrics.csv
 DEBUG_SYNC=0
@@ -80,11 +136,11 @@ DEBUG_SYNC=0
 # SECTION_LENGTH_M=-1 stores a single whole-network section.
 SCENARIO_ID=default
 SCENARIO_SEED=20260529
-SIMULATION_DURATION_SECONDS=6000
+SIMULATION_DURATION_SECONDS=86400
 SECTION_STATS_ENABLED=1
 SECTION_LENGTH_M=250
 SECTION_STATS_INTERVAL=300
-SECTION_OUTPUT_DIR=data
+SECTION_OUTPUT_DIR=data/results
 SECTION_TIME_BINS_CSV_PATH=data/results/section_time_bins_{section_length_label}.csv
 SECTION_SCENARIO_CSV_PATH=data/results/scenario_summary_{section_length_label}.csv
 SECTION_ROAD_GPKG_PATH=data/results/road_sections_{section_length_label}.gpkg
@@ -119,19 +175,14 @@ BACKUP_ROUTE_CACHE=1
 ROUTE_PARALLEL=1
 ROUTE_PARALLEL_BACKEND=process
 ROUTE_WORKERS=15
-# 1이면 multi-lane spawn expansion + lane safety repair가 끝난 최종 route를 별도 cache로 저장합니다.
-# 첫 실행 후에는 [Routes] multi-lane spawn expansion 단계를 건너뜁니다.
 ROUTE_READY_CACHE=1
-# 1이면 multi-lane spawn expansion을 route chunk 단위로 안정 병렬 처리합니다.
 ROUTE_SPAWN_EXPANSION_PARALLEL=1
 ROUTE_SPAWN_EXPANSION_BACKEND=thread
-# 0이면 ROUTE_WORKERS 값을 그대로 사용합니다.
 ROUTE_SPAWN_EXPANSION_WORKERS=0
 ROUTE_SPAWN_EXPANSION_MIN_ROUTES=1024
 TURN_LANE_ROUTE_PREP_BASE=30.0
 TURN_LANE_ROUTE_PREP_PER_LANE=24.0
 STRICT_ROUTE_TURN_LANE_FILTER=0
-# 1이면 넓은/다차로 본선 링크를 우선해 좁은 측도로나 램프 선택을 줄입니다.
 ROUTE_USE_WIDTH_BIASED_COST=1
 ROUTE_WIDE_LINK_REF_LANES=3.0
 ROUTE_WIDE_LINK_POWER=0.80
@@ -139,7 +190,6 @@ ROUTE_NARROW_LINK_PENALTY=4.25
 ROUTE_NARROW_WIDTH_MAX=7.5
 ROUTE_WIDE_LINK_MIN_COST_FACTOR=0.75
 ROUTE_WIDE_LINK_MAX_COST_FACTOR=5.50
-# 1이면 직진 구간에서 기존 상대 차선을 유지하고, 좌/우 진출 전에는 해당 가장자리 차선을 선호합니다.
 ROUTE_KEEP_RELATIVE_LANE=1
 ROUTE_DESTINATION_LANE_INTENT=1
 ROUTE_STRAIGHT_LANE_RANDOMIZE=1
@@ -148,14 +198,15 @@ ROUTE_RANDOM_LANE_SALT=91127
 # ------------------------------------------------------------
 # v13 lane safety / lane change behavior
 # ------------------------------------------------------------
-# CUDA v17 repairs route_pos/lane mismatches at runtime, exits vehicles only at
-# true route ends, and uses probabilistic straight-lane spreading, blocked-lane escape, lane-drop merge prep, destination lane spread,
-# zero-acceleration anti-stall recovery, active lane-change deadlock release, and right-edge bottleneck avoidance.
+# CUDA v21 repairs route_pos/lane mismatches at runtime, exits vehicles only at
+# true route ends, sends missed left/right exits through the best straight continuation,
+# spreads through traffic away from the right-edge ramp lane on 3+ lane roads, and uses
+# blocked-lane escape, lane-drop/gain merge prep, zero-acceleration anti-stall recovery,
+# active lane-change deadlock release, and connector-entry wait release.
 # These knobs are compiled in avabm_cuda/main.cu for speed; rebuild the extension after updating.
 ROUTE_LANE_RUNTIME_REPAIR=1
 PROBABILISTIC_STRAIGHT_LANE_CHANGE=1
 CONGESTION_OPEN_LANE_ESCAPE=1
-# 나들목/램프는 다차로 본선의 중앙 차선이 아니라 가장 가까운 최외곽 차로로만 연결합니다.
 INTERCHANGE_EDGE_ONLY=1
 INTERCHANGE_RAMP_MAX_LANES=1
 INTERCHANGE_MAIN_MIN_LANES=2
@@ -209,12 +260,6 @@ INTERSECTION_APRON_SEMICIRCLE_FLIP=1
 #     active lane-change no-start release, blocked-lane escape, interchange
 #     edge-lane preparation, turn-signal lane-change etiquette and filtered
 #     connector local avoidance are compiled into avabm_cuda/main.cu.
-# KO: 데드락 해소, 완전 중첩 랜덤 통과, 실시간 route/lane 불일치 복구,
-#     음수/0가속도 stale hold 정리, 확률/빈 차선 우선 직진 차선 분산,
-#     우측 병목 차선 회피, 차선변경 no-start 데드락 해소, 막힌 차선 회피,
-#     나들목 최외곽 차로 사전 준비, 깜빡이 기반 차선변경 예절/거부,
-#     connector 국소 회피는 avabm_cuda/main.cu에 컴파일되어 있습니다.
-#     이 값을 바꾸려면 main.cu의 상수를 조정한 뒤 avabm_cuda/build.bat로 재빌드하세요.
 
 # ------------------------------------------------------------
 # Spawn demand
@@ -224,9 +269,11 @@ SPAWN_REF_WIDTH=10.5
 SPAWN_WIDTH_EXP_K=1.25
 SPAWN_LANE_POWER=1.15
 SPAWN_MAX_MULT=18.0
-MAX_TOTAL_VPS=2000.0
-# 1이면 다차로 스폰 지점의 수요를 각 차로 슬롯에 균등 분배합니다.
+MAX_TOTAL_VPS=40.0
 SPAWN_MULTI_LANE_BALANCE=1
+# EN: Route choices per physical spawn lane. Python repeats the same lane as several
+#     spawn slots with different route ids so entering vehicles are not locked to one route.
+SPAWN_ROUTE_CHOICES_PER_LANE=4
 SPAWN_PROFILE_SLOTS=24
 SPAWN_PROFILE_SLOT_SECONDS=3600.0
 SPAWN_PROFILE_FIELD_PREFIX=SPWN
@@ -235,19 +282,41 @@ SPAWN_PROFILE_UNIT=vph
 # ------------------------------------------------------------
 # Lane-drop / destination spread behavior added in v14
 # ------------------------------------------------------------
-# 4->3, 3->4처럼 차로 수만 바뀌며 이어지는 다차로 본선은 좌/우회전이 아니라 직진 연속 구간으로 처리합니다.
 ROUTE_WIDE_LANE_CHANGE_AS_STRAIGHT=1
 ROUTE_WIDE_CONTINUATION_MAX_TURN_DEG=62.0
-# 차로 수 변화 구간에서 route lane target을 한 중앙 차선으로 몰지 않고 안정 랜덤으로 분산합니다.
 ROUTE_LANE_COUNT_CHANGE_BALANCE=1
-# 마지막 도착 링크가 다차로이면 한쪽 차선에 고착되지 않고 빈 차선/랜덤 차선으로 퍼지게 합니다.
 ROUTE_DESTINATION_LANE_SPREAD=1
+
+# ------------------------------------------------------------
+# v19 physical lane-drop taper / node deadlock relief
+# ------------------------------------------------------------
+LANE_DROP_TAPER_GEOMETRY=1
+LANE_DROP_TAPER_ALIGN_SURVIVOR_LANES=1
+LANE_DROP_TAPER_RENDER_WIDTH=1
+LANE_DROP_TAPER_AMBIGUOUS_RIGHT_FALLBACK=1
+LANE_DROP_TAPER_END_PULL=0.86
+LANE_DROP_TAPER_EDGE_ALIGN_EPS=1.25
+
+
+
+# ------------------------------------------------------------
+# v20 physical lane-gain taper / overlap-deadlock relief / lane balance
+# ------------------------------------------------------------
+LANE_GAIN_TAPER_GEOMETRY=1
+LANE_GAIN_TAPER_ALIGN_CONTINUING_LANES=1
+LANE_GAIN_TAPER_RENDER_WIDTH=1
+LANE_GAIN_TAPER_AMBIGUOUS_RIGHT_FALLBACK=1
+LANE_GAIN_TAPER_START_PULL=0.86
 
 
 # ------------------------------------------------------------
 # Lane-drop / right-edge anti-stall behavior added in v17
 # ------------------------------------------------------------
-# 아래 기능은 avabm_cuda/main.cu에 상수로 컴파일되어 있습니다.
-# - 4->3 같은 차로 감소 no-start 경계에서 차선변경이 얼어붙으면 초반 취소/후반 완료로 정지 해소
-# - 앞이 비었는데 accel=0으로 중간 정지한 차량을 hard stop이 아닐 때 재출발
-# - 나들목이 가깝지 않은 직진 차량은 우측 끝 병목 차선을 피하고 안전한 안쪽/빈 차선으로 분산
+
+# ------------------------------------------------------------
+# v18 lane-drop merge gate / inner-lane balancing
+# ------------------------------------------------------------
+# EN: CUDA v18 treats 4->3 / 3->2 lane-count reductions as taper merges with
+#     a hard connector gate, aborts unsafe late lane changes instead of forcing
+#     side-overlap completion, and lets through traffic leave the right edge
+#     when the next exit is not close. Rebuild avabm_cuda after updating.
