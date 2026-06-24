@@ -1,0 +1,1438 @@
+#ifndef AVABM_PART_SKIP_COMMON
+#include "main_common.cuh"
+#endif
+AVABM_DINLINE void avabm_lane_change_one(int i, ECSArrays ecs, DecisionSoA decision, RoadNetwork road, float dt, int max_entities,
+        const int* active_ids, const int* active_count) {
+    if (ecs.alive[i] != ENTITY_ALIVE) return;
+    if (ecs.vehicle_state[i] != VEH_ON_LANE) return;
+    bool human = ecs.driver_type[i] == HUMAN;
+    if (ecs.lc_cooldown[i] > 0.0f) {
+        ecs.lc_cooldown[i] = fmaxf(0.0f, ecs.lc_cooldown[i] - dt);
+    }
+    if (decision.wants_lane_change[i] != 0 && ecs.lane_change_active[i] == 0) {
+        int target = decision.lane_change_target[i];
+        if (target >= 0 && target < road.num_lanes) {
+            int lane = ecs.lane_id[i];
+            if (!valid_lane_ecs(lane, road) || !same_approach_same_direction_lanes_ecs(lane, target, road)) return;
+            float dist_to_node = road.lane_length[lane] - ecs.s[i];
+            float no_start_dist = lane_change_no_start_distance_ecs(lane, road);
+            float finish_dist = lane_change_finish_distance_ecs(lane, road);
+            int next_lane = route_next_lane_for_vehicle_ecs(i, ecs, road);
+            bool inside_box = valid_lane_ecs(next_lane, road) && lane_connected(lane, next_lane, road) &&
+                    inside_intersection_box_ecs(dist_to_node, lane, next_lane, road);
+            if (inside_box || dist_to_node < fmaxf(no_start_dist, finish_dist)) {
+                return;
+            }
+            int sig = indicator_from_lateral_move_ecs(lane, target, road);
+            if (sig != INDICATOR_NONE && ecs.turn_signal != nullptr) {
+                ecs.turn_signal[i] = sig;
+                if (ecs.turn_signal_time != nullptr) {
+                    ecs.turn_signal_time[i] = fmaxf(ecs.turn_signal_time[i], LANE_CHANGE_SIGNAL_LEAD_TIME);
+                }
+            }
+            ecs.lane_change_active[i] = 1;
+            ecs.lane_change_from_lane[i] = lane;
+            ecs.lane_change_to_lane[i] = target;
+            ecs.lane_change_t[i] = 0.0f;
+            float base_duration = human ? LANE_CHANGE_DURATION_HUMAN : LANE_CHANGE_DURATION_AV;
+            float min_duration = human ? LANE_CHANGE_MIN_DURATION_HUMAN : LANE_CHANGE_MIN_DURATION_AV;
+            float usable_dist = fmaxf(0.0f, dist_to_node - finish_dist);
+            float speed_for_duration = fmaxf(fmaxf(ecs.speed[i], road.lane_speed_limit[lane] * 0.25f), 2.0f);
+            float fit_duration = 0.85f * usable_dist / speed_for_duration;
+            ecs.lane_change_duration[i] = clampf_cuda(fminf(base_duration, fit_duration), min_duration, base_duration);
+            ecs.lc_cooldown[i] = human ? LC_COOLDOWN_HUMAN : LC_COOLDOWN_AV;
+            if (sig != INDICATOR_NONE && ecs.turn_signal != nullptr) {
+                ecs.turn_signal[i] = sig;
+                if (ecs.turn_signal_time != nullptr) {
+                    ecs.turn_signal_time[i] = fmaxf(ecs.turn_signal_time[i], LANE_CHANGE_SIGNAL_LEAD_TIME);
+                }
+            }
+        }
+    }
+}
+__global__ void lane_change_system_kernel(ECSArrays ecs, DecisionSoA decision, RoadNetwork road, float dt, int max_entities,
+        const int* active_ids, const int* active_count) {
+    AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) avabm_lane_change_one(i, ecs, decision, road, dt, max_entities,
+            active_ids, active_count);
+    AVABM_ACTIVE_LOOP_END()
+}
+AVABM_DINLINE void avabm_lane_motion_one(int i, ECSArrays ecs, DecisionSoA decision, RoadNetwork road, PerceptionSoA perception,
+        float* metrics, float current_time, float dt, int max_entities, const int* active_ids, const int* active_count) {
+    if (ecs.alive[i] != ENTITY_ALIVE) return;
+    if (ecs.vehicle_state[i] != VEH_ON_LANE) return;
+    if (decision.should_exit[i] != 0) {
+        ecs.alive[i] = ENTITY_FREE;
+        AVABM_METRIC_ADD(metrics, METRIC_EXITED, 1.0f);
+        AVABM_METRIC_ADD(metrics, METRIC_TRAVEL_TIME, fmaxf(0.0f, current_time - ecs.entry_time[i]));
+        return;
+    }
+    int lane = ecs.lane_id[i];
+    if (lane < 0 || lane >= road.num_lanes) {
+        ecs.alive[i] = ENTITY_FREE;
+        return;
+    }
+    bool human = ecs.driver_type[i] == HUMAN;
+    float max_accel = human ? MAX_ACCEL_HUMAN : MAX_ACCEL_AV;
+    float s_curr = ecs.s[i];
+    float v = ecs.speed[i];
+    float target_acc_cmd = clampf_cuda(decision.target_accel[i], -EMERGENCY_DECEL, max_accel);
+    float prev_accel_for_delay = ecs.accel[i];
+    float L_for_stale = fmaxf(road.lane_length[lane], 0.1f);
+    float dist_to_end_for_stale = fmaxf(0.0f, L_for_stale - s_curr);
+    bool front_clear_for_stale = perception.front_gap[i] > fmaxf(STALE_BRAKE_CLEAR_FRONT_GAP,
+            ecs.length[i] + MIN_BUMPER_GAP + 6.0f);
+    if (prev_accel_for_delay < -1.5f && target_acc_cmd > 0.05f && v < SMART_STALL_SPEED_EPS && front_clear_for_stale) {
+        prev_accel_for_delay = 0.0f;
+        float clear_a = (human ? STALE_BRAKE_CLEAR_ACCEL_HUMAN : STALE_BRAKE_CLEAR_ACCEL_AV) * max_accel;
+        target_acc_cmd = fmaxf(target_acc_cmd, clear_a);
+        if (metrics != nullptr) AVABM_METRIC_ADD(metrics, METRIC_DEADLOCK_CREEP, 1.0f);
+    }
+#if MIDROAD_NEG_ACCEL_WATCHDOG_ENABLED
+    if (prev_accel_for_delay < -0.25f && target_acc_cmd < 0.02f && v <= MIDROAD_NEG_ACCEL_CLEAR_SPEED && front_clear_for_stale &&
+            dist_to_end_for_stale > MIDROAD_NEG_ACCEL_CLEAR_MIN_END_DIST) {
+        prev_accel_for_delay = 0.0f;
+        float clear_a = max_accel * MIDROAD_NEG_ACCEL_RELEASE_SCALE;
+        target_acc_cmd = fmaxf(target_acc_cmd, clear_a);
+        if (metrics != nullptr) AVABM_METRIC_ADD(metrics, METRIC_DEADLOCK_CREEP, 1.0f);
+    }
+#endif
+#if MIDROAD_ZERO_ACCEL_WATCHDOG_ENABLED
+    if (target_acc_cmd >= -0.04f && target_acc_cmd <= 0.035f && v <= MIDROAD_ZERO_ACCEL_CLEAR_SPEED && front_clear_for_stale &&
+            dist_to_end_for_stale > fmaxf(28.0f, MIDROAD_ZERO_ACCEL_MIN_END_DIST + 8.0f)) {
+        target_acc_cmd = fmaxf(target_acc_cmd, max_accel * MIDROAD_ZERO_ACCEL_RELEASE_SCALE);
+        if (prev_accel_for_delay < 0.0f) prev_accel_for_delay = 0.0f;
+        if (metrics != nullptr) AVABM_METRIC_ADD(metrics, METRIC_DEADLOCK_CREEP, 1.0f);
+    }
+#endif
+    float acc_cmd = apply_reaction_delay_accel(prev_accel_for_delay, target_acc_cmd, ecs.reaction_time[i], ecs.driver_type[i], dt,
+            metrics);
+    acc_cmd = clampf_cuda(acc_cmd, -EMERGENCY_DECEL, max_accel);
+    if (acc_cmd < -2.0f) {
+        AVABM_METRIC_ADD(metrics, METRIC_COMFORT_BRAKE, 1.0f);
+    }
+    float v_next = fmaxf(0.0f, v + acc_cmd * dt);
+    float s_next = s_curr + 0.5f * (v + v_next) * dt;
+    if (v <= STOPPED_NEG_ACCEL_ZERO_SPEED && v_next <= STOPPED_NEG_ACCEL_ZERO_SPEED && acc_cmd < 0.0f) {
+        acc_cmd = 0.0f;
+    }
+    if (perception.front_gap[i] < 1.0e8f) {
+        float max_advance = fmaxf(0.0f, perception.front_gap[i] - ANTI_PASS_THROUGH_GAP);
+        float attempted = s_next - s_curr;
+        if (attempted > max_advance) {
+            s_next = s_curr + max_advance;
+            v_next = fminf(v_next, max_advance / fmaxf(dt, 0.001f));
+            acc_cmd = (v_next - v) / fmaxf(dt, 0.001f);
+            acc_cmd = clampf_cuda(acc_cmd, -EMERGENCY_DECEL, max_accel);
+            AVABM_METRIC_ADD(metrics, METRIC_PENETRATION_PREVENTED, 1.0f);
+            AVABM_METRIC_ADD(metrics, METRIC_ANTI_COLLISION_BRAKE, 1.0f);
+        }
+    }
+#if AVABM_MIN_CRUISE_HARD_FREEFLOW
+    {
+        float min_floor_v = avabm_min_cruise_speed_mps_ecs();
+        float floor_target_v = min_floor_v;
+        bool free_front_for_floor = perception.front_gap[i] > fmaxf(28.0f, ecs.length[i] + MIN_BUMPER_GAP + fmaxf(min_floor_v,
+                v_next) * 1.35f);
+        int floor_conn_lane = decision.connector_target_lane[i];
+        bool straight_connector_floor = decision.wants_connector[i] != 0 && valid_lane_ecs(floor_conn_lane, road) &&
+                (turn_angle_deg(lane, floor_conn_lane, road) <= STRAIGHT_NO_TURN_SPEED_CAP_DEG ||
+                wide_lane_count_change_continuation_ecs(lane, floor_conn_lane, road));
+        bool far_from_end_for_floor = (L_for_stale - s_curr) > fmaxf(35.0f, min_floor_v * 2.25f) || straight_connector_floor;
+        bool no_lateral_hold_for_floor = ecs.lane_change_active[i] == 0;
+        bool physically_free_cruise = min_floor_v > 0.1f && v_next < min_floor_v && target_acc_cmd >= -0.02f &&
+                free_front_for_floor && far_from_end_for_floor && no_lateral_hold_for_floor;
+        if (physically_free_cruise) {
+            float corrected_v = fmaxf(v_next, floor_target_v);
+            v_next = corrected_v;
+            s_next = s_curr + 0.5f * (v + v_next) * dt;
+            acc_cmd = fmaxf(acc_cmd, (v_next - v) / fmaxf(dt, 0.001f));
+        }
+    }
+#endif
+    if (s_next + NO_BACKWARD_EPS < s_curr) {
+        s_next = s_curr;
+        v_next = 0.0f;
+        acc_cmd = 0.0f;
+    }
+    float L = fmaxf(road.lane_length[lane], 0.1f);
+    bool force_lc_finish_now = false;
+    if (ecs.lane_change_active[i] != 0) {
+        float lc_stop_s = fmaxf(0.0f, L - lane_change_finish_distance_ecs(lane, road));
+        int from_ln = ecs.lane_change_from_lane[i];
+        int to_ln = ecs.lane_change_to_lane[i];
+        float dur = fmaxf(ecs.lane_change_duration[i], 0.1f);
+        float t_prog = clampf_cuda(ecs.lane_change_t[i] / dur, 0.0f, 1.0f);
+        float freeze_front = fmaxf(LC_ACTIVE_FREEZE_FRONT_MIN, ecs.length[i] + MIN_BUMPER_GAP + fmaxf(0.0f, v_next) * 0.35f);
+        float freeze_rear = fmaxf(LC_ACTIVE_FREEZE_REAR_MIN, ecs.length[i] + MIN_BUMPER_GAP + fmaxf(0.0f,
+                perception.target_rear_speed[i]) * 0.45f);
+        bool active_lc_gap_unsafe_pre = perception.target_front_gap[i] < freeze_front ||
+                perception.target_rear_gap[i] < freeze_rear;
+        bool at_lc_barrier = s_next > lc_stop_s + LANE_DROP_ACTIVE_LC_BARRIER_EXTRA ||
+                (s_curr >= lc_stop_s - LANE_DROP_ACTIVE_LC_BARRIER_EXTRA && v_next < 0.75f);
+        if (at_lc_barrier && active_lc_gap_unsafe_pre && valid_lane_ecs(from_ln, road) && valid_lane_ecs(to_ln, road)) {
+#if LANE_DROP_ACTIVE_LC_ABORT_ON_UNSAFE
+            ecs.lane_change_active[i] = 0;
+            ecs.lane_change_from_lane[i] = from_ln;
+            ecs.lane_change_to_lane[i] = from_ln;
+            ecs.lane_change_t[i] = 0.0f;
+            ecs.lane_id[i] = from_ln;
+            lane = from_ln;
+            L = fmaxf(road.lane_length[lane], 0.1f);
+            s_next = fminf(s_next, L - 0.05f);
+            v_next = fminf(v_next, fmaxf(0.55f, v));
+            acc_cmd = fmaxf(acc_cmd, 0.0f);
+            if (ecs.turn_signal != nullptr) {
+                ecs.turn_signal[i] = INDICATOR_NONE;
+                if (ecs.turn_signal_time != nullptr) ecs.turn_signal_time[i] = 0.0f;
+            }
+            if (perception.front_gap[i] > fmaxf(MISSION_ABANDON_FRONT_GAP, ecs.length[i] + MIN_BUMPER_GAP + 8.0f) &&
+                    v_next <= MISSION_ABANDON_SPEED_EPS) {
+                ecs.connector_length[i] = fmaxf(ecs.connector_length[i], MISSION_ABANDON_WAIT + MISSION_ABANDON_ACTIVE_LC_WAIT);
+                AVABM_METRIC_ADD(metrics, METRIC_DEADLOCK_RELEASE, 1.0f);
+            }
+            AVABM_METRIC_ADD(metrics, METRIC_LC_REJECT, 1.0f);
+#else
+            if (t_prog < 0.50f || t_prog <= LANE_DROP_ACTIVE_LC_ABORT_T) {
+                ecs.lane_change_active[i] = 0;
+                ecs.lane_change_from_lane[i] = from_ln;
+                ecs.lane_change_to_lane[i] = from_ln;
+                ecs.lane_change_t[i] = 0.0f;
+                ecs.lane_id[i] = from_ln;
+                lane = from_ln;
+                L = fmaxf(road.lane_length[lane], 0.1f);
+                s_next = fminf(s_next, L - 0.05f);
+                acc_cmd = fmaxf(acc_cmd, 0.0f);
+                if (ecs.turn_signal != nullptr) {
+                    ecs.turn_signal[i] = INDICATOR_NONE;
+                    if (ecs.turn_signal_time != nullptr) ecs.turn_signal_time[i] = 0.0f;
+                }
+                AVABM_METRIC_ADD(metrics, METRIC_LC_REJECT, 1.0f);
+            } else {
+                force_lc_finish_now = true;
+                ecs.lane_change_t[i] = dur;
+            }
+#endif
+        }
+        if (ecs.lane_change_active[i] != 0 && s_next > lc_stop_s && !force_lc_finish_now) {
+            if (!active_lc_gap_unsafe_pre && t_prog >= 0.35f) {
+                force_lc_finish_now = true;
+                ecs.lane_change_t[i] = dur;
+            } else {
+                s_next = fmaxf(s_curr, lc_stop_s);
+                v_next = fminf(v_next, fmaxf(1.20f, v * 0.72f));
+                acc_cmd = fmaxf(acc_cmd, -LC_ACTIVE_UNSAFE_BRAKE);
+            }
+        }
+    }
+    if (decision.wants_connector[i] != 0) {
+        if (s_next >= L - CONNECTOR_ENTER_EPS) {
+            s_next = fmaxf(s_next, L - CONNECTOR_ENTER_EPS);
+            s_next = fminf(s_next, L + 0.35f);
+        }
+    } else {
+        if (s_next > L - 0.05f) {
+            s_next = L - 0.05f;
+            v_next = fminf(v_next, 0.4f);
+        }
+    }
+    ecs.s[i] = s_next;
+    ecs.speed[i] = v_next;
+    ecs.accel[i] = acc_cmd;
+    float px, py, ph;
+    lane_xy_heading_from_s(lane, s_next, road, px, py, ph);
+    if (ecs.lane_change_active[i] != 0) {
+        int from_ln = ecs.lane_change_from_lane[i];
+        int to_ln = ecs.lane_change_to_lane[i];
+        if (from_ln >= 0 && from_ln < road.num_lanes && to_ln >= 0 && to_ln < road.num_lanes) {
+            float dur = fmaxf(ecs.lane_change_duration[i], 0.1f);
+            float t_prev = clampf_cuda(ecs.lane_change_t[i] / dur, 0.0f, 1.0f);
+            float t = clampf_cuda((ecs.lane_change_t[i] + dt) / dur, 0.0f, 1.0f);
+            float freeze_front = fmaxf(LC_ACTIVE_FREEZE_FRONT_MIN, ecs.length[i] + MIN_BUMPER_GAP + fmaxf(0.0f, v_next) * 0.35f);
+            float freeze_rear = fmaxf(LC_ACTIVE_FREEZE_REAR_MIN, ecs.length[i] + MIN_BUMPER_GAP + fmaxf(0.0f,
+                    perception.target_rear_speed[i]) * 0.45f);
+            bool active_lc_gap_unsafe = perception.target_front_gap[i] < freeze_front ||
+                    perception.target_rear_gap[i] < freeze_rear;
+            bool midline_stuck = active_lc_gap_unsafe && t_prev >= LC_ACTIVE_MIDLINE_ABORT_T_MIN &&
+                    t_prev <= LC_ACTIVE_MIDLINE_ABORT_T_MAX && v_next <= LC_ACTIVE_MIDLINE_STUCK_SPEED;
+            bool snap_back_to_source = false;
+            if (force_lc_finish_now) {
+                t = 1.0f;
+            } else if (midline_stuck && t_prev < LC_ACTIVE_MIDLINE_COMMIT_T) {
+                snap_back_to_source = true;
+            } else if (midline_stuck) {
+                t = 1.0f;
+                force_lc_finish_now = true;
+                AVABM_METRIC_ADD(metrics, METRIC_DEADLOCK_RELEASE, 1.0f);
+            } else if (active_lc_gap_unsafe && t_prev < LC_ACTIVE_FREEZE_T_MAX) {
+                t = t_prev;
+                v_next = fminf(v_next, fmaxf(0.0f, v - LC_ACTIVE_UNSAFE_BRAKE * dt));
+                acc_cmd = fminf(acc_cmd, -LC_ACTIVE_UNSAFE_BRAKE);
+                AVABM_METRIC_ADD(metrics, METRIC_LC_REJECT, 1.0f);
+            }
+            if (snap_back_to_source) {
+                float s_from = clampf_cuda(s_next, 0.0f, road.lane_length[from_ln]);
+                s_next = s_from;
+                ecs.s[i] = s_from;
+                ecs.lane_id[i] = from_ln;
+                ecs.lane_change_active[i] = 0;
+                ecs.lane_change_from_lane[i] = from_ln;
+                ecs.lane_change_to_lane[i] = from_ln;
+                ecs.lane_change_t[i] = 0.0f;
+                ecs.lc_cooldown[i] = fmaxf(ecs.lc_cooldown[i], LC_ACTIVE_MIDLINE_ABORT_COOLDOWN);
+                lane = from_ln;
+                L = fmaxf(road.lane_length[lane], 0.1f);
+                v_next = fminf(v_next, fmaxf(0.35f, v));
+                acc_cmd = fmaxf(acc_cmd, 0.0f);
+                lane_xy_heading_from_s(from_ln, s_from, road, px, py, ph);
+                if (ecs.turn_signal != nullptr) {
+                    ecs.turn_signal[i] = INDICATOR_NONE;
+                    if (ecs.turn_signal_time != nullptr) ecs.turn_signal_time[i] = 0.0f;
+                }
+                if (perception.front_gap[i] > fmaxf(MISSION_ABANDON_FRONT_GAP, ecs.length[i] + MIN_BUMPER_GAP + 8.0f) &&
+                        v_next <= MISSION_ABANDON_SPEED_EPS) {
+                    ecs.connector_length[i] = fmaxf(ecs.connector_length[i], MISSION_ABANDON_WAIT + MISSION_ABANDON_ACTIVE_LC_WAIT);
+                }
+                AVABM_METRIC_ADD(metrics, METRIC_LC_REJECT, 1.0f);
+                AVABM_METRIC_ADD(metrics, METRIC_DEADLOCK_RELEASE, 1.0f);
+            } else {
+                float ax, ay, ah;
+                float bx, by, bh;
+                float s_from = clampf_cuda(s_next, 0.0f, road.lane_length[from_ln]);
+                float s_to = clampf_cuda(s_next, 0.0f, road.lane_length[to_ln]);
+                lane_xy_heading_from_s(from_ln, s_from, road, ax, ay, ah);
+                lane_xy_heading_from_s(to_ln, s_to, road, bx, by, bh);
+                float u = smoothstep01(t);
+                px = ax + (bx - ax) * u;
+                py = ay + (by - ay) * u;
+                ph = wrap_pi(ah + wrap_pi(bh - ah) * u);
+                ecs.lane_change_t[i] = t * dur;
+                if (t >= 1.0f) {
+                    AVABM_METRIC_ADD(metrics, METRIC_LANE_CHANGE_TIME_SUM, dur);
+                    AVABM_METRIC_ADD(metrics, METRIC_LANE_CHANGE_TIME_COUNT, 1.0f);
+                    ecs.lane_id[i] = to_ln;
+                    int repaired_after_lc = repair_route_pos_unless_missed_exit_tail_ecs(to_ln, ecs.route_id[i], ecs.route_pos[i],
+                            road);
+                    if (repaired_after_lc >= 0) {
+                        ecs.route_pos[i] = repaired_after_lc;
+                    }
+                    ecs.lane_change_active[i] = 0;
+                    ecs.lane_change_from_lane[i] = to_ln;
+                    ecs.lane_change_to_lane[i] = to_ln;
+                    ecs.lane_change_t[i] = 0.0f;
+                }
+            }
+        } else {
+            ecs.lane_change_active[i] = 0;
+        }
+    }
+    ecs.speed[i] = v_next;
+    ecs.accel[i] = acc_cmd;
+    ecs.x[i] = px;
+    ecs.y[i] = py;
+    float steer = 0.0f;
+    float yaw_rate = 0.0f;
+    float new_h = advance_heading_bicycle_ecs(i, ecs, ph, v_next, dt, steer, yaw_rate);
+    ecs.steer_angle[i] = steer;
+    ecs.heading[i] = new_h;
+    AVABM_METRIC_ADD(metrics, METRIC_STEER_ABS_SUM, fabsf(steer));
+    AVABM_METRIC_ADD(metrics, METRIC_STEER_COUNT, 1.0f);
+    AVABM_METRIC_ADD(metrics, METRIC_YAW_RATE_ABS_SUM, fabsf(yaw_rate));
+    AVABM_METRIC_ADD(metrics, METRIC_YAW_RATE_COUNT, 1.0f);
+}
+__global__ void motion_system_kernel(ECSArrays ecs, DecisionSoA decision, RoadNetwork road, PerceptionSoA perception,
+        float* metrics, float current_time, float dt, int max_entities, const int* active_ids, const int* active_count) {
+    AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) avabm_lane_motion_one(i, ecs, decision, road, perception,
+            metrics, current_time, dt, max_entities, active_ids, active_count);
+    AVABM_ACTIVE_LOOP_END()
+}
+AVABM_DINLINE void avabm_connector_enter_one(int i, ECSArrays ecs, DecisionSoA decision, RoadNetwork road, SpatialGrid grid,
+        float* metrics, float current_time, float dt, int max_entities, const int* active_ids, const int* active_count) {
+    if (ecs.alive[i] != ENTITY_ALIVE) return;
+    if (ecs.vehicle_state[i] != VEH_ON_LANE) return;
+    if (decision.wants_connector[i] == 0) return;
+    int lane = ecs.lane_id[i];
+    int next_lane = decision.connector_target_lane[i];
+    if (lane < 0 || lane >= road.num_lanes || next_lane < 0 || next_lane >= road.num_lanes ||
+            !lane_connected(lane, next_lane, road)) {
+        return;
+    }
+    int turn = turn_code_from_lanes_ecs(lane, next_lane, road);
+    bool missed_exit_straight_target = missed_exit_straight_target_ecs(i, lane, next_lane, ecs, road);
+    int rid = ecs.route_id[i];
+    int rpos = ecs.route_pos[i];
+    if (missed_exit_straight_target) {
+        turn = TURN_STRAIGHT;
+    } else if (rid >= 0 && rid < road.num_routes && rpos >= 0) {
+        int ro0 = road.route_offsets[rid];
+        int ro1 = road.route_offsets[rid + 1];
+        if (ro1 > ro0 && ro0 + rpos < ro1) {
+            int route_turn = road.route_turns[ro0 + rpos];
+            turn = effective_turn_code_ecs(lane, next_lane, route_turn, road);
+        } else {
+            turn = effective_turn_code_ecs(lane, next_lane, TURN_STRAIGHT, road);
+        }
+    } else {
+        turn = effective_turn_code_ecs(lane, next_lane, TURN_STRAIGHT, road);
+    }
+    if (!missed_exit_straight_target) {
+        int adjusted_next = interchange_receiving_outer_lane_ecs(lane, next_lane, road);
+        adjusted_next = receiving_lane_for_turn_ecs(adjusted_next, turn, road);
+        adjusted_next = interchange_receiving_outer_lane_ecs(lane, adjusted_next, road);
+        if (valid_lane_ecs(adjusted_next, road) && lane_connected(lane, adjusted_next, road)) {
+            next_lane = adjusted_next;
+            decision.connector_target_lane[i] = adjusted_next;
+        }
+    }
+    int interchange_source_lane = missed_exit_straight_target ? -1 : interchange_source_outer_lane_ecs(lane, next_lane, road);
+#if MISSION_ABANDON_ENABLED
+    if (!missed_exit_straight_target) {
+        bool wrong_source_for_exit = valid_lane_ecs(interchange_source_lane, road) && lane != interchange_source_lane;
+        bool wrong_dedicated_for_turn = turn_requires_dedicated_lane_ecs(turn) && !lane_legal_for_turn_ecs(lane, turn, road);
+        if (wrong_source_for_exit || wrong_dedicated_for_turn) {
+            int escape_next = -1;
+            bool escape_has_next = false;
+            bool escape_missed = false;
+            if (abandon_destination_to_straight_or_tail_ecs(i, lane, next_lane, ecs, road, escape_next, escape_has_next,
+                    escape_missed)) {
+                if (!escape_has_next || !escape_missed || !valid_lane_ecs(escape_next, road) ||
+                        !lane_connected(lane, escape_next, road)) {
+                    AVABM_METRIC_ADD(metrics, METRIC_DEADLOCK_ESCAPE_GO, 1.0f);
+                    return;
+                }
+                next_lane = escape_next;
+                decision.connector_target_lane[i] = escape_next;
+                missed_exit_straight_target = true;
+                turn = TURN_STRAIGHT;
+                interchange_source_lane = -1;
+                AVABM_METRIC_ADD(metrics, METRIC_DEADLOCK_ESCAPE_GO, 1.0f);
+            }
+        }
+    }
+#endif
+    if (valid_lane_ecs(interchange_source_lane, road) && lane != interchange_source_lane) {
+        AVABM_METRIC_ADD(metrics, METRIC_TURN_LANE_ILLEGAL, 1.0f);
+        bool late_escape = ecs.connector_length[i] >= fmaxf(MISSED_TURN_ESCAPE_WAIT, WRONG_LANE_STALL_FORCE_WAIT);
+        if (!late_escape) {
+            AVABM_METRIC_ADD(metrics, METRIC_TURN_LANE_BLOCK, 1.0f);
+            return;
+        }
+        AVABM_METRIC_ADD(metrics, METRIC_TURN_LANE_BLOCK, 1.0f);
+    }
+    if (!lane_legal_for_turn_ecs(lane, turn, road)) {
+        AVABM_METRIC_ADD(metrics, METRIC_TURN_LANE_ILLEGAL, 1.0f);
+        bool late_escape = ecs.connector_length[i] >= MISSED_TURN_ESCAPE_WAIT;
+        if (!late_escape) {
+            return;
+        }
+        AVABM_METRIC_ADD(metrics, METRIC_TURN_LANE_BLOCK, 1.0f);
+    }
+    if ((turn_requires_dedicated_lane_ecs(turn) || valid_lane_ecs(interchange_source_lane, road)) &&
+            ecs.lane_change_active[i] != 0) {
+        AVABM_METRIC_ADD(metrics, METRIC_TURN_LANE_BLOCK, 1.0f);
+        return;
+    }
+    if (!connector_entry_clear_ecs(i, lane, next_lane, ecs, decision, road, grid, current_time, max_entities)) {
+#if CONNECTOR_ENTRY_WAIT_RELEASE_ENABLED
+        float wait_time = ecs.connector_length[i];
+        if (!isfinite(wait_time) || wait_time < 0.0f || ecs.vehicle_state[i] != VEH_ON_LANE) wait_time = 0.0f;
+        wait_time = fminf(wait_time + fmaxf(dt, 0.0f), CONNECTOR_ENTRY_WAIT_RELEASE_MAX);
+        ecs.connector_length[i] = wait_time;
+#else
+        float wait_time = ecs.connector_length[i];
+        if (!isfinite(wait_time) || wait_time < 0.0f || ecs.vehicle_state[i] != VEH_ON_LANE) wait_time = 0.0f;
+#endif
+#if MISSION_ABANDON_ENABLED
+        bool exit_like_blocked_connector = turn_requires_dedicated_lane_ecs(turn) || valid_lane_ecs(interchange_source_lane, road);
+        bool slow_clear_abandon_connector = exit_like_blocked_connector && wait_time >= MISSION_ABANDON_WAIT &&
+                ecs.speed[i] <= fmaxf(MISSION_ABANDON_SPEED_EPS, 0.35f);
+        if (slow_clear_abandon_connector) {
+            int escape_next = -1;
+            bool escape_has_next = false;
+            bool escape_missed = false;
+            if (abandon_destination_to_straight_or_tail_ecs(i, lane, next_lane, ecs, road, escape_next, escape_has_next,
+                    escape_missed)) {
+                if (!escape_has_next || !escape_missed || !valid_lane_ecs(escape_next, road) ||
+                        !lane_connected(lane, escape_next, road)) {
+                    AVABM_METRIC_ADD(metrics, METRIC_DEADLOCK_ESCAPE_GO, 1.0f);
+                    return;
+                }
+                next_lane = escape_next;
+                decision.connector_target_lane[i] = escape_next;
+                missed_exit_straight_target = true;
+                turn = TURN_STRAIGHT;
+                interchange_source_lane = -1;
+                if (connector_entry_clear_ecs(i, lane, next_lane, ecs, decision, road, grid, current_time, max_entities)) {
+                    AVABM_METRIC_ADD(metrics, METRIC_DEADLOCK_ESCAPE_GO, 1.0f);
+                } else {
+                    ecs.connector_length[i] = fmaxf(ecs.connector_length[i], MISSION_ABANDON_WAIT + dt);
+                    AVABM_METRIC_ADD(metrics, METRIC_CONNECTOR_SAFE_YIELD, 1.0f);
+                    AVABM_METRIC_ADD(metrics, METRIC_PRIORITY_ENTRY_BLOCK, 1.0f);
+                    return;
+                }
+            } else {
+                AVABM_METRIC_ADD(metrics, METRIC_CONNECTOR_SAFE_YIELD, 1.0f);
+                AVABM_METRIC_ADD(metrics, METRIC_PRIORITY_ENTRY_BLOCK, 1.0f);
+                return;
+            }
+        } else
+#endif
+        {
+            AVABM_METRIC_ADD(metrics, METRIC_CONNECTOR_SAFE_YIELD, 1.0f);
+            AVABM_METRIC_ADD(metrics, METRIC_PRIORITY_ENTRY_BLOCK, 1.0f);
+            return;
+        }
+    }
+    float lane_L = fmaxf(road.lane_length[lane], 0.1f);
+    float entry_backoff = connector_entry_backoff_ecs(lane, next_lane, road);
+    float connector_start_s = fmaxf(0.0f, lane_L - entry_backoff);
+    if (ecs.s[i] < connector_start_s - CONNECTOR_ENTER_EPS) {
+        return;
+    }
+    float clen = connector_length_between_lanes(lane, next_lane, road);
+    float overflow = fmaxf(0.0f, ecs.s[i] - connector_start_s);
+    if (missed_exit_straight_target) {
+        prepare_missed_exit_route_tail_ecs(i, lane, next_lane, ecs, road);
+    }
+    ecs.vehicle_state[i] = VEH_IN_CONNECTOR;
+    ecs.connector_from_lane[i] = lane;
+    ecs.connector_to_lane[i] = next_lane;
+    ecs.connector_length[i] = clen;
+    ecs.connector_s[i] = clampf_cuda(CONNECTOR_ENTER_EPS + overflow, CONNECTOR_ENTER_EPS, fmaxf(CONNECTOR_ENTER_EPS,
+            clen - CONNECTOR_EXIT_EPS));
+    ecs.s[i] = connector_start_s;
+    ecs.lane_change_active[i] = 0;
+    ecs.lane_change_from_lane[i] = lane;
+    ecs.lane_change_to_lane[i] = lane;
+    ecs.lane_change_t[i] = 0.0f;
+    AVABM_METRIC_ADD(metrics, METRIC_CONNECTOR_IN, 1.0f);
+}
+__global__ void connector_enter_system_kernel(ECSArrays ecs, DecisionSoA decision, RoadNetwork road, SpatialGrid grid,
+        float* metrics, float current_time, float dt, int max_entities, const int* active_ids, const int* active_count) {
+    AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) avabm_connector_enter_one(i, ecs, decision, road, grid,
+            metrics, current_time, dt, max_entities, active_ids, active_count);
+    AVABM_ACTIVE_LOOP_END()
+}
+AVABM_DINLINE void avabm_connector_motion_one(int i, ECSArrays ecs, RoadNetwork road, SpatialGrid grid, float* metrics,
+        float current_time, float dt, int max_entities, const int* active_ids, const int* active_count) {
+    if (ecs.alive[i] != ENTITY_ALIVE) return;
+    if (ecs.vehicle_state[i] != VEH_IN_CONNECTOR) return;
+    int from_ln = ecs.connector_from_lane[i];
+    int to_ln = ecs.connector_to_lane[i];
+    if (from_ln < 0 || from_ln >= road.num_lanes || to_ln < 0 || to_ln >= road.num_lanes) {
+        ecs.alive[i] = ENTITY_FREE;
+        return;
+    }
+    bool missed_exit_connector = missed_exit_straight_target_ecs(i, from_ln, to_ln, ecs, road);
+    bool human = ecs.driver_type[i] == HUMAN;
+    float max_accel = human ? MAX_ACCEL_HUMAN : MAX_ACCEL_AV;
+    float max_decel = human ? MAX_DECEL_HUMAN : MAX_DECEL_AV;
+    float clen = fmaxf(ecs.connector_length[i], CONNECTOR_MIN_LEN);
+    ecs.connector_length[i] = clen;
+    int raw_route_turn = TURN_STRAIGHT;
+    {
+        int rid0 = ecs.route_id[i];
+        int rpos0 = ecs.route_pos[i];
+        if (rid0 >= 0 && rid0 < road.num_routes && rpos0 >= 0) {
+            int ro0_raw = road.route_offsets[rid0];
+            int ro1_raw = road.route_offsets[rid0 + 1];
+            if (ro1_raw > ro0_raw && ro0_raw + rpos0 < ro1_raw) {
+                raw_route_turn = road.route_turns[ro0_raw + rpos0];
+            }
+        }
+    }
+    float target_v = human ? CONNECTOR_SPEED_HUMAN : CONNECTOR_SPEED_AV;
+    float turn_angle = turn_angle_deg(from_ln, to_ln, road);
+    float signed_turn = lane_signed_turn_deg(from_ln, to_ln, road);
+    bool route_straight_bend_connector = raw_route_turn == TURN_STRAIGHT && turn_angle <= 38.0f;
+    if (turn_angle <= STRAIGHT_NO_TURN_SPEED_CAP_DEG || wide_lane_count_change_continuation_ecs(from_ln, to_ln, road) ||
+            route_straight_bend_connector) {
+        target_v = desired_speed_ecs(i, to_ln, ecs, road);
+    } else {
+        target_v = fminf(target_v, turn_speed_cap(turn_angle, ecs.driver_type[i]));
+        target_v = fmaxf(target_v, human ? 2.4f : 3.0f);
+    }
+    if (signed_turn < -25.0f && metrics != nullptr) {
+        AVABM_METRIC_ADD(metrics, METRIC_RIGHT_TURN_SYMMETRIC_PATH, 1.0f);
+    }
+    float v = ecs.speed[i];
+    float front_gap, front_speed;
+    find_front_in_connector_ecs(i, ecs, road, grid, max_entities, 55.0f, front_gap, front_speed);
+    float acc_cmd = max_accel * (1.0f - avabm_fourth_power_ecs(v / fmaxf(target_v, 0.1f)));
+    if (metrics != nullptr) AVABM_METRIC_ADD(metrics, METRIC_FORCE_PASS_THROUGH, 1.0f);
+    if (front_gap < 1.0e8f) {
+        float safe = (human ? SAFE_GAP_HUMAN : SAFE_GAP_AV) + v * (human ? SAFE_TIME_HEADWAY_HUMAN : SAFE_TIME_HEADWAY_AV);
+        float follow_a = estimate_follow_accel_ecs(v, target_v, front_gap, front_speed, ecs.driver_type[i], ecs.min_gap[i],
+                ecs.reaction_time[i], ecs.comfort_decel[i], ecs.aggressiveness[i], ecs.risk_tolerance[i]);
+        acc_cmd = fminf(acc_cmd, follow_a);
+        if (front_gap < safe) {
+            float ratio = safe / fmaxf(front_gap, 0.5f);
+            acc_cmd = fminf(acc_cmd, -max_decel * ratio * ratio);
+        }
+        if (front_gap < MIN_BUMPER_GAP) {
+            acc_cmd = -EMERGENCY_DECEL;
+        }
+    }
+    if (front_gap > fmaxf(CONNECTOR_EXIT_SPACE_MIN * 0.55f, ecs.length[i] + MIN_BUMPER_GAP + 4.0f) && v < SMART_STALL_SPEED &&
+            acc_cmd <= 0.03f) {
+        float clear_v = human ? SMART_STALL_RELEASE_SPEED_HUMAN : SMART_STALL_RELEASE_SPEED_AV;
+        float clear_a = (clear_v - v) / fmaxf(dt, 0.01f);
+        clear_a = clampf_cuda(clear_a, 0.0f, max_accel * SMART_STALL_RELEASE_ACCEL_SCALE);
+        acc_cmd = fmaxf(acc_cmd, clear_a);
+        if (metrics != nullptr) AVABM_METRIC_ADD(metrics, METRIC_FORCE_PASS_THROUGH, 1.0f);
+    }
+#if CONNECTOR_NAV_AVOIDANCE_ENABLED
+    float cross_limit = connector_cross_conflict_accel_limit_ecs(i, ecs, road, grid, max_entities, dt, metrics);
+    if (cross_limit < 999.0f) {
+        acc_cmd = fminf(acc_cmd, cross_limit);
+    }
+#endif
+    if (v < SMART_STALL_SPEED_EPS && front_gap > SMART_STALL_FRONT_GAP) {
+        float clear_v = human ? CONNECTOR_INBOX_MIN_CLEAR_SPEED_HUMAN : CONNECTOR_INBOX_MIN_CLEAR_SPEED_AV;
+        float clear_a = (clear_v - v) / fmaxf(dt, 0.01f);
+        clear_a = clampf_cuda(clear_a, 0.0f, max_accel * SMART_STALL_CLEAR_ACCEL_SCALE);
+        acc_cmd = fmaxf(acc_cmd, clear_a);
+        if (metrics != nullptr) AVABM_METRIC_ADD(metrics, METRIC_DEADLOCK_CREEP, 1.0f);
+    }
+    float target_acc_cmd = clampf_cuda(acc_cmd, -EMERGENCY_DECEL, max_accel);
+    float prev_accel_for_delay = ecs.accel[i];
+    if (prev_accel_for_delay < -1.5f && target_acc_cmd > 0.05f && v < SMART_STALL_SPEED_EPS &&
+            front_gap > fmaxf(STALE_BRAKE_CLEAR_FRONT_GAP, ecs.length[i] + MIN_BUMPER_GAP + 6.0f)) {
+        prev_accel_for_delay = 0.0f;
+        float clear_a = (human ? STALE_BRAKE_CLEAR_ACCEL_HUMAN : STALE_BRAKE_CLEAR_ACCEL_AV) * max_accel;
+        target_acc_cmd = fmaxf(target_acc_cmd, clear_a);
+        if (metrics != nullptr) AVABM_METRIC_ADD(metrics, METRIC_DEADLOCK_CREEP, 1.0f);
+    }
+    acc_cmd = apply_reaction_delay_accel(prev_accel_for_delay, target_acc_cmd, ecs.reaction_time[i], ecs.driver_type[i], dt,
+            metrics);
+    acc_cmd = clampf_cuda(acc_cmd, -EMERGENCY_DECEL, max_accel);
+    if (acc_cmd < -2.0f) {
+        AVABM_METRIC_ADD(metrics, METRIC_COMFORT_BRAKE, 1.0f);
+    }
+    float v_next = fmaxf(0.0f, v + acc_cmd * dt);
+    float cs_next = ecs.connector_s[i] + 0.5f * (v + v_next) * dt;
+    if (front_gap < 1.0e8f) {
+        float max_advance = fmaxf(0.0f, front_gap - MIN_BUMPER_GAP);
+        float attempted = cs_next - ecs.connector_s[i];
+        if (attempted > max_advance) {
+            cs_next = ecs.connector_s[i] + max_advance;
+            v_next = fminf(v_next, max_advance / fmaxf(dt, 0.001f));
+            acc_cmd = (v_next - v) / fmaxf(dt, 0.001f);
+            acc_cmd = clampf_cuda(acc_cmd, -EMERGENCY_DECEL, max_accel);
+        }
+    }
+#if AVABM_MIN_CRUISE_HARD_FREEFLOW
+    {
+        bool straight_connector_floor = turn_angle <= STRAIGHT_NO_TURN_SPEED_CAP_DEG ||
+                wide_lane_count_change_continuation_ecs(from_ln, to_ln, road);
+        float min_floor_v = avabm_min_cruise_speed_mps_ecs();
+        bool free_front_for_floor = front_gap > fmaxf(28.0f, ecs.length[i] + MIN_BUMPER_GAP + fmaxf(min_floor_v, v_next) * 1.35f);
+        if (straight_connector_floor && min_floor_v > 0.1f && v_next < min_floor_v && target_acc_cmd >= -0.02f &&
+                free_front_for_floor) {
+            v_next = min_floor_v;
+            cs_next = ecs.connector_s[i] + 0.5f * (v + v_next) * dt;
+            acc_cmd = fmaxf(acc_cmd, (v_next - v) / fmaxf(dt, 0.001f));
+        }
+    }
+#endif
+    AVABM_METRIC_ADD(metrics, METRIC_CONNECTOR_RUN, 1.0f);
+    if (v_next < target_v * 0.65f) {
+        AVABM_METRIC_ADD(metrics, METRIC_CONNECTOR_DELAY_SUM, dt);
+        AVABM_METRIC_ADD(metrics, METRIC_CONNECTOR_DELAY_COUNT, 1.0f);
+    }
+    int rid = ecs.route_id[i];
+    int rpos = ecs.route_pos[i];
+    if (rid < 0 || rid >= road.num_routes) {
+        ecs.alive[i] = ENTITY_FREE;
+        return;
+    }
+    if (!missed_exit_connector) {
+        int repaired_pos = repair_route_pos_unless_missed_exit_tail_ecs(from_ln, rid, rpos, road);
+        if (repaired_pos >= 0) {
+            rpos = repaired_pos;
+            ecs.route_pos[i] = repaired_pos;
+        }
+    }
+    int ro0 = road.route_offsets[rid];
+    int ro1 = road.route_offsets[rid + 1];
+    int route_len = ro1 - ro0;
+    if (route_len <= 0 || rpos < 0 || rpos >= route_len) {
+        ecs.alive[i] = ENTITY_FREE;
+        return;
+    }
+    int next_pos = rpos + 1;
+    if (next_pos >= route_len) {
+        if (missed_exit_connector) {
+            next_pos = max(0, route_len - 1);
+        } else {
+            ecs.alive[i] = ENTITY_FREE;
+            AVABM_METRIC_ADD(metrics, METRIC_EXITED, 1.0f);
+            AVABM_METRIC_ADD(metrics, METRIC_TRAVEL_TIME, fmaxf(0.0f, current_time - ecs.entry_time[i]));
+            return;
+        }
+    }
+    if (cs_next >= clen - CONNECTOR_EXIT_EPS) {
+        float overflow = cs_next - clen;
+        bool exit_gap_blocked = front_gap < MIN_BUMPER_GAP + 1.0f;
+        bool exit_deadlock_force = false;
+#if GRIDLOCK_NODE_DRAIN_ENABLED
+        exit_deadlock_force = (exit_gap_blocked && front_gap > -GRIDLOCK_CONNECTOR_EXIT_FORCE_GAP &&
+                v <= GRIDLOCK_STALLED_CONNECTOR_SPEED && cs_next >= clen - CONNECTOR_EXIT_EPS - 0.15f);
+#endif
+        if (exit_gap_blocked && !exit_deadlock_force) {
+            cs_next = fmaxf(0.0f, clen - CONNECTOR_EXIT_EPS - 0.05f);
+            v_next = 0.0f;
+            acc_cmd = -EMERGENCY_DECEL;
+            if (signed_turn < -25.0f && metrics != nullptr) {
+                AVABM_METRIC_ADD(metrics, METRIC_RIGHT_TURN_EXIT_GAP_HOLD, 1.0f);
+            }
+        } else {
+            if (exit_deadlock_force && metrics != nullptr) {
+                AVABM_METRIC_ADD(metrics, METRIC_DEADLOCK_RELEASE, 1.0f);
+                AVABM_METRIC_ADD(metrics, METRIC_FRONT_SPACE_RELEASE, 1.0f);
+            }
+            ecs.vehicle_state[i] = VEH_ON_LANE;
+            ecs.connector_from_lane[i] = -1;
+            ecs.connector_to_lane[i] = -1;
+            ecs.connector_s[i] = 0.0f;
+            ecs.connector_length[i] = 0.0f;
+            ecs.lane_id[i] = to_ln;
+            ecs.route_pos[i] = next_pos;
+            if (!missed_exit_connector) {
+                int repaired_after_connector = repair_route_pos_unless_missed_exit_tail_ecs(to_ln, rid, ecs.route_pos[i], road);
+                if (repaired_after_connector >= 0) {
+                    ecs.route_pos[i] = repaired_after_connector;
+                }
+            }
+            float handoff_s = connector_exit_handoff_s(from_ln, to_ln, road);
+            float lane_s = handoff_s + fmaxf(0.0f, overflow);
+            ecs.s[i] = clampf_cuda(lane_s, 0.0f, fmaxf(0.0f, road.lane_length[to_ln] - 0.05f));
+            float min_exit_speed = human ? 1.2f : 1.8f;
+#if GRIDLOCK_NODE_DRAIN_ENABLED
+            if (exit_deadlock_force) {
+                min_exit_speed = fmaxf(min_exit_speed,
+                        human ? GRIDLOCK_CONNECTOR_EXIT_FORCE_SPEED_HUMAN : GRIDLOCK_CONNECTOR_EXIT_FORCE_SPEED_AV);
+                acc_cmd = fmaxf(acc_cmd, 0.0f);
+            }
+#endif
+            ecs.speed[i] = fmaxf(v_next, min_exit_speed);
+            ecs.accel[i] = acc_cmd;
+            float px, py, ph;
+            lane_xy_heading_from_s(to_ln, ecs.s[i], road, px, py, ph);
+            ecs.x[i] = px;
+            ecs.y[i] = py;
+            float steer = 0.0f;
+            float yaw_rate = 0.0f;
+            float new_h = advance_heading_bicycle_ecs(i, ecs, ph, ecs.speed[i], dt, steer, yaw_rate);
+            new_h = enforce_path_heading_error_limit_ecs(i, ecs, new_h, ph, ecs.speed[i], dt,
+                    human ? CONNECTOR_HEADING_LOCK_HUMAN : CONNECTOR_HEADING_LOCK_AV, steer, yaw_rate);
+            ecs.steer_angle[i] = steer;
+            ecs.heading[i] = new_h;
+            AVABM_METRIC_ADD(metrics, METRIC_STEER_ABS_SUM, fabsf(steer));
+            AVABM_METRIC_ADD(metrics, METRIC_STEER_COUNT, 1.0f);
+            AVABM_METRIC_ADD(metrics, METRIC_YAW_RATE_ABS_SUM, fabsf(yaw_rate));
+            AVABM_METRIC_ADD(metrics, METRIC_YAW_RATE_COUNT, 1.0f);
+            return;
+        }
+    }
+    ecs.connector_s[i] = clampf_cuda(cs_next, 0.0f, clen);
+    ecs.speed[i] = v_next;
+    ecs.accel[i] = acc_cmd;
+    ecs.lane_id[i] = from_ln;
+    {
+        float entry_backoff = connector_entry_backoff_ecs(from_ln, to_ln, road);
+        ecs.s[i] = fmaxf(0.0f, road.lane_length[from_ln] - entry_backoff);
+    }
+    float px, py, ph;
+    connector_xy_heading_from_s(from_ln, to_ln, ecs.connector_s[i], clen, road, px, py, ph);
+    ecs.x[i] = px;
+    ecs.y[i] = py;
+    float steer = 0.0f;
+    float yaw_rate = 0.0f;
+    float new_h = advance_heading_bicycle_ecs(i, ecs, ph, v_next, dt, steer, yaw_rate);
+    new_h = enforce_path_heading_error_limit_ecs(i, ecs, new_h, ph, v_next, dt,
+            human ? CONNECTOR_HEADING_LOCK_HUMAN : CONNECTOR_HEADING_LOCK_AV, steer, yaw_rate);
+    ecs.steer_angle[i] = steer;
+    ecs.heading[i] = new_h;
+    AVABM_METRIC_ADD(metrics, METRIC_STEER_ABS_SUM, fabsf(steer));
+    AVABM_METRIC_ADD(metrics, METRIC_STEER_COUNT, 1.0f);
+    AVABM_METRIC_ADD(metrics, METRIC_YAW_RATE_ABS_SUM, fabsf(yaw_rate));
+    AVABM_METRIC_ADD(metrics, METRIC_YAW_RATE_COUNT, 1.0f);
+}
+__global__ void connector_motion_system_kernel(ECSArrays ecs, RoadNetwork road, SpatialGrid grid, float* metrics,
+        float current_time, float dt, int max_entities, const int* active_ids, const int* active_count) {
+    AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) avabm_connector_motion_one(i, ecs, road, grid, metrics,
+            current_time, dt, max_entities, active_ids, active_count);
+    AVABM_ACTIVE_LOOP_END()
+}
+__global__ void route_lane_repair_system_kernel(ECSArrays ecs, RoadNetwork road, float* metrics, float dt, int max_entities,
+        const int* active_ids, const int* active_count) {
+#if ROUTE_LANE_RUNTIME_REPAIR_ENABLED
+    AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) if (ecs.alive[i] != ENTITY_ALIVE) continue;
+    int state = ecs.vehicle_state[i];
+    if (state == VEH_ON_LANE) {
+        int lane = ecs.lane_id[i];
+        if (!valid_lane_ecs(lane, road)) {
+            ecs.alive[i] = ENTITY_FREE;
+            continue;
+        }
+        float L = fmaxf(road.lane_length[lane], 0.1f);
+        ecs.s[i] = clampf_cuda(ecs.s[i], 0.0f, fmaxf(0.0f, L - 0.05f));
+        int rid = ecs.route_id[i];
+        int rpos = ecs.route_pos[i];
+        if (rid < 0 || rid >= road.num_routes) {
+            ecs.alive[i] = ENTITY_FREE;
+            continue;
+        }
+        bool missed_exit_tail = false;
+#if MISSED_EXIT_OFFROUTE_TAIL_ENABLED
+        {
+            int ro0_tail = road.route_offsets[rid];
+            int ro1_tail = road.route_offsets[rid + 1];
+            int len_tail = ro1_tail - ro0_tail;
+            if (len_tail > 0 && rpos >= len_tail - 1 && rpos < len_tail) {
+                int route_tail_lane = road.route_lanes[ro0_tail + rpos];
+                missed_exit_tail = !route_lane_current_compatible_ecs(route_tail_lane, lane, road);
+            }
+        }
+#endif
+        int repaired = missed_exit_tail ? -1 : repair_route_pos_unless_missed_exit_tail_ecs(lane, rid, rpos, road);
+        if (repaired >= 0 && repaired != rpos) {
+            ecs.route_pos[i] = repaired;
+            if (ecs.speed[i] < ROUTE_LANE_REPAIR_SPEED_CAP) {
+                ecs.speed[i] = fmaxf(ecs.speed[i], 0.6f);
+            }
+            if (ecs.accel[i] < 0.0f) ecs.accel[i] = 0.0f;
+            if (metrics != nullptr) AVABM_METRIC_ADD(metrics, METRIC_DEADLOCK_CREEP, 1.0f);
+        }
+        if (ecs.lane_change_active[i] != 0) {
+            int from_ln = ecs.lane_change_from_lane[i];
+            int to_ln = ecs.lane_change_to_lane[i];
+            if (!valid_lane_ecs(from_ln, road) || !valid_lane_ecs(to_ln, road) ||
+                    !same_approach_same_direction_lanes_ecs(from_ln, to_ln, road)) {
+                ecs.lane_change_active[i] = 0;
+                ecs.lane_change_from_lane[i] = lane;
+                ecs.lane_change_to_lane[i] = lane;
+                ecs.lane_change_t[i] = 0.0f;
+            }
+        }
+        sync_vehicle_to_path_ecs(i, ecs, road);
+        continue;
+    }
+    if (state == VEH_IN_CONNECTOR) {
+        int from_ln = ecs.connector_from_lane[i];
+        int to_ln = ecs.connector_to_lane[i];
+        if (!valid_lane_ecs(from_ln, road) || !valid_lane_ecs(to_ln, road) || !lane_connected(from_ln, to_ln, road)) {
+            ecs.alive[i] = ENTITY_FREE;
+            continue;
+        }
+        float clen = fmaxf(ecs.connector_length[i], CONNECTOR_MIN_LEN);
+        ecs.connector_length[i] = clen;
+        ecs.connector_s[i] = clampf_cuda(ecs.connector_s[i], 0.0f, clen);
+        int rid = ecs.route_id[i];
+        if (rid < 0 || rid >= road.num_routes) {
+            ecs.alive[i] = ENTITY_FREE;
+            continue;
+        }
+        sync_vehicle_to_path_ecs(i, ecs, road);
+    }
+    AVABM_ACTIVE_LOOP_END()
+#else
+    (void)ecs;
+    (void)road;
+    (void)metrics;
+    (void)dt;
+    (void)max_entities;
+    (void)active_ids;
+    (void)active_count;
+#endif
+}
+__global__ void contact_resolve_system_kernel(ECSArrays ecs, RoadNetwork road, SpatialGrid grid, float* metrics,
+        float current_time, float dt, int max_entities, const int* active_ids, const int* active_count) {
+    AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) if (ecs.alive[i] != ENTITY_ALIVE) continue;
+    int base = world_cell_index(ecs.x[i], ecs.y[i], grid.min_x, grid.min_y, grid.cell_size, grid.width, grid.height);
+    if (base < 0) continue;
+    int bc_x = base % grid.width;
+    int bc_y = base / grid.width;
+    int cr = clampi_cuda(CONTACT_CELL_RADIUS, 1, WORLD_MAX_CELL_RADIUS);
+    for (int dy = -cr; dy <= cr; ++dy) {
+        for (int dx = -cr; dx <= cr; ++dx) {
+            int cx = bc_x + dx;
+            int cy = bc_y + dy;
+            if (cx < 0 || cx >= grid.width || cy < 0 || cy >= grid.height) continue;
+            int j = grid_head_ecs(grid, cy * grid.width + cx);
+            int guard = 0;
+            while (j >= 0 && guard < avabm_world_scan_limit_ecs(max_entities)) {
+                if (j > i && ecs.alive[j] == ENTITY_ALIVE) {
+                    float ddx = ecs.x[j] - ecs.x[i];
+                    float ddy = ecs.y[j] - ecs.y[i];
+                    float broad_r = 0.5f * sqrtf(ecs.length[i] * ecs.length[i] + ecs.width[i] * ecs.width[i]) +
+                            0.5f * sqrtf(ecs.length[j] * ecs.length[j] + ecs.width[j] * ecs.width[j]) + CONTACT_RESOLVE_MAX_PUSH +
+                            1.5f;
+                    if (ddx * ddx + ddy * ddy <= broad_r * broad_r) {
+                        bool hit = obb_overlap_sat(ecs.x[i], ecs.y[i], ecs.heading[i], ecs.length[i], ecs.width[i], ecs.x[j],
+                                ecs.y[j], ecs.heading[j], ecs.length[j], ecs.width[j], CONTACT_RESOLVE_INFLATE);
+                        if (hit) {
+                            bool complete_overlap = false;
+#if COMPLETE_OVERLAP_RELEASE_ENABLED
+                            complete_overlap = ddx * ddx +
+                                    ddy * ddy <= COMPLETE_OVERLAP_RELEASE_DIST * COMPLETE_OVERLAP_RELEASE_DIST &&
+                                    ecs.speed[i] <= COMPLETE_OVERLAP_RELEASE_MAX_SPEED &&
+                                    ecs.speed[j] <= COMPLETE_OVERLAP_RELEASE_MAX_SPEED &&
+                                    obb_overlap_sat(ecs.x[i], ecs.y[i], ecs.heading[i], ecs.length[i], ecs.width[i], ecs.x[j],
+                                    ecs.y[j], ecs.heading[j], ecs.length[j], ecs.width[j], 0.0f);
+#endif
+                            bool route_repaired = repair_lane_change_overlap_ecs(i, j, ecs, road);
+                            if (!route_repaired) {
+                                if (complete_overlap) {
+                                    bool i_wins = timed_pair_random_self_wins_ecs(i, j, current_time,
+                                            COMPLETE_OVERLAP_RELEASE_PERIOD);
+                                    int winner = i_wins ? i : j;
+                                    int loser = i_wins ? j : i;
+                                    float back = CONTACT_CROSS_BACKOFF_MIN + COMPLETE_OVERLAP_CONTACT_BACKOFF_EXTRA +
+                                            fmaxf(ecs.speed[loser], 0.0f) * CONTACT_CROSS_BACKOFF_SPEED_TIME;
+                                    back = fminf(CONTACT_RESOLVE_MAX_PUSH, fmaxf(back, CONTACT_RESOLVE_BACKOFF));
+                                    move_vehicle_back_on_path_ecs(loser, back, ecs, road);
+                                    overlap_release_boost_vehicle_ecs(winner, ecs, road, dt);
+                                    route_repaired = true;
+                                    if (metrics != nullptr) {
+                                        AVABM_METRIC_ADD(metrics, METRIC_DEADLOCK_RELEASE, 1.0f);
+                                        AVABM_METRIC_ADD(metrics, METRIC_DEADLOCK_ESCAPE_GO, 1.0f);
+                                    }
+                                } else {
+                                    route_repaired = repair_route_overlap_ecs(i, j, ecs, road);
+                                }
+                            }
+                            if (!route_repaired) {
+                                int si = contact_priority_score_ecs(i, ecs, road);
+                                int sj = contact_priority_score_ecs(j, ecs, road);
+                                int loser = j;
+                                if (si < sj) loser = i;
+                                else if (sj < si) loser = j;
+                                else {
+                                    loser = (ecs.entry_time[i] > ecs.entry_time[j] + 0.001f) ? i : j;
+                                    if (fabsf(ecs.entry_time[i] - ecs.entry_time[j]) <= 0.001f) loser = i > j ? i : j;
+                                }
+                                int winner = loser == i ? j : i;
+                                float back = CONTACT_CROSS_BACKOFF_MIN + fmaxf(ecs.speed[loser],
+                                        0.0f) * CONTACT_CROSS_BACKOFF_SPEED_TIME;
+                                back = fminf(CONTACT_RESOLVE_MAX_PUSH, fmaxf(back, CONTACT_RESOLVE_BACKOFF));
+                                move_vehicle_back_on_path_ecs(loser, back, ecs, road);
+#if OVERLAP_CONTACT_PRIORITY_NUDGE_ENABLED
+                                move_vehicle_forward_on_path_ecs(winner, OVERLAP_CONTACT_WINNER_NUDGE, ecs, road);
+                                ecs.speed[winner] = fmaxf(ecs.speed[winner], OVERLAP_CONTACT_WINNER_MIN_SPEED);
+                                ecs.accel[winner] = fmaxf(ecs.accel[winner], 0.0f);
+#endif
+                            }
+                            bool still_hit = obb_overlap_sat(ecs.x[i], ecs.y[i], ecs.heading[i], ecs.length[i], ecs.width[i],
+                                    ecs.x[j], ecs.y[j], ecs.heading[j], ecs.length[j], ecs.width[j], CONTACT_HARD_VERIFY_INFLATE);
+                            if (still_hit) {
+                                hard_separate_overlap_pair_ecs(i, j, ecs, road, current_time);
+                                if (metrics != nullptr) {
+                                    AVABM_METRIC_ADD(metrics, METRIC_DEADLOCK_RELEASE, 1.0f);
+                                    AVABM_METRIC_ADD(metrics, METRIC_DEADLOCK_ESCAPE_GO, 1.0f);
+                                }
+                            }
+                            if (metrics != nullptr) {
+                                AVABM_METRIC_ADD(metrics, METRIC_PENETRATION_PREVENTED, 1.0f);
+                                AVABM_METRIC_ADD(metrics, METRIC_ANTI_COLLISION_BRAKE, 1.0f);
+                            }
+                        }
+                    }
+                }
+                j = grid.cell_next[j];
+                guard++;
+            }
+        }
+    }
+    AVABM_ACTIVE_LOOP_END()
+}
+__global__ void collision_system_kernel(ECSArrays ecs, SpatialGrid grid, float* metrics, float dt, int max_entities,
+        const int* active_ids, const int* active_count) {
+    AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) if (ecs.alive[i] != ENTITY_ALIVE) continue;
+    int base = world_cell_index(ecs.x[i], ecs.y[i], grid.min_x, grid.min_y, grid.cell_size, grid.width, grid.height);
+    if (base < 0) continue;
+    int bc_x = base % grid.width;
+    int bc_y = base / grid.width;
+    int cr = clampi_cuda(COLLISION_CELL_RADIUS, 1, WORLD_MAX_CELL_RADIUS);
+    for (int dy = -cr; dy <= cr; ++dy) {
+        for (int dx = -cr; dx <= cr; ++dx) {
+            int cx = bc_x + dx;
+            int cy = bc_y + dy;
+            if (cx < 0 || cx >= grid.width || cy < 0 || cy >= grid.height) continue;
+            int j = grid_head_ecs(grid, cy * grid.width + cx);
+            int guard = 0;
+            while (j >= 0 && guard < avabm_world_scan_limit_ecs(max_entities)) {
+                if (j > i && ecs.alive[j] == ENTITY_ALIVE) {
+                    float ddx = ecs.x[j] - ecs.x[i];
+                    float ddy = ecs.y[j] - ecs.y[i];
+                    float broad_r = 0.5f * sqrtf(ecs.length[i] * ecs.length[i] + ecs.width[i] * ecs.width[i]) +
+                            0.5f * sqrtf(ecs.length[j] * ecs.length[j] + ecs.width[j] * ecs.width[j]) + fmaxf(ecs.speed[i],
+                            ecs.speed[j]) * dt + 3.0f;
+                    if (ddx * ddx + ddy * ddy <= broad_r * broad_r) {
+                        bool hit = swept_overlap_ecs(ecs.x[i], ecs.y[i], ecs.heading[i], ecs.speed[i], ecs.length[i], ecs.width[i],
+                                ecs.x[j], ecs.y[j], ecs.heading[j], ecs.speed[j], ecs.length[j], ecs.width[j], dt, 0.35f, 0.20f);
+                        if (hit) {
+                            AVABM_METRIC_ADD(metrics, METRIC_COLLISION, 1.0f);
+                        }
+                    }
+                }
+                j = grid.cell_next[j];
+                guard++;
+            }
+        }
+    }
+    AVABM_ACTIVE_LOOP_END()
+}
+__global__ void local_obstacle_avoidance_system_kernel(ECSArrays ecs, RoadNetwork road, SpatialGrid grid, PerceptionSoA perception,
+        DecisionSoA decision, float* metrics, float current_time, float dt, int max_entities, const int* active_ids,
+        const int* active_count) {
+    AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) if (ecs.alive[i] != ENTITY_ALIVE) continue;
+    if (ecs.vehicle_state[i] != VEH_ON_LANE) continue;
+    int base = world_cell_index(ecs.x[i], ecs.y[i], grid.min_x, grid.min_y, grid.cell_size, grid.width, grid.height);
+    if (base < 0) continue;
+    int lane = ecs.lane_id[i];
+    int next_lane = route_next_lane_for_vehicle_ecs(i, ecs, road);
+    bool self_inside_box = false;
+    if (valid_lane_ecs(lane, road) && valid_lane_ecs(next_lane, road)) {
+        float dist_to_end = fmaxf(0.0f, road.lane_length[lane] - ecs.s[i]);
+        self_inside_box = inside_intersection_box_ecs(dist_to_end, lane, next_lane, road);
+    }
+    int bc_x = base % grid.width;
+    int bc_y = base / grid.width;
+    int cr = clampi_cuda((int)ceilf(LOCAL_AVOID_RANGE / fmaxf(grid.cell_size, 0.1f)), 1, WORLD_MAX_CELL_RADIUS);
+    int self_score = local_avoid_priority_score_ecs(i, ecs, road, perception);
+    bool self_front_clear = priority_front_clear_ecs(i, perception, ecs);
+#if LOCAL_AVOID_GRANTED_CONNECTOR_GRACE
+    if (self_front_clear && (decision.wants_connector[i] != 0 || self_inside_box)) {
+        continue;
+    }
+#endif
+#if AVABM_TURBO_LOCAL_AVOID_CULL
+    if (valid_lane_ecs(lane, road) && !self_inside_box && ecs.lane_change_active[i] == 0 && decision.wants_connector[i] == 0 &&
+            (fmaxf(0.0f, road.lane_length[lane] - ecs.s[i]) > LOCAL_AVOID_CULL_APPROACH_DIST) &&
+            (perception.front_gap == nullptr || perception.front_gap[i] > LOCAL_AVOID_CULL_FRONT_GAP)) {
+        continue;
+    }
+#endif
+    float best_req = 1000.0f;
+    bool blocked = false;
+    bool overlap_release_go = false;
+    float self_v = fmaxf(0.0f, ecs.speed[i] + fmaxf(0.0f, decision.target_accel[i]) * dt * 0.35f);
+    for (int dy = -cr; dy <= cr; ++dy) {
+        for (int dx = -cr; dx <= cr; ++dx) {
+            int cx = bc_x + dx;
+            int cy = bc_y + dy;
+            if (cx < 0 || cx >= grid.width || cy < 0 || cy >= grid.height) continue;
+            int j = grid_head_ecs(grid, cy * grid.width + cx);
+            int guard = 0;
+            while (j >= 0 && guard < avabm_world_scan_limit_ecs(max_entities)) {
+                if (j != i && ecs.alive[j] == ENTITY_ALIVE) {
+                    if (local_avoid_same_stream_skip_ecs(i, j, ecs, road)) {
+                        j = grid.cell_next[j];
+                        guard++;
+                        continue;
+                    }
+                    if (!local_avoid_pair_relevant_ecs(i, j, ecs, road)) {
+                        j = grid.cell_next[j];
+                        guard++;
+                        continue;
+                    }
+                    float ddx = ecs.x[j] - ecs.x[i];
+                    float ddy = ecs.y[j] - ecs.y[i];
+                    float d2 = ddx * ddx + ddy * ddy;
+                    float broad_r = LOCAL_AVOID_RANGE + 0.5f * sqrtf(ecs.length[i] * ecs.length[i] + ecs.width[i] * ecs.width[i]) +
+                            0.5f * sqrtf(ecs.length[j] * ecs.length[j] + ecs.width[j] * ecs.width[j]);
+                    if (d2 <= broad_r * broad_r) {
+                        float horizon = fmaxf(LOCAL_AVOID_HORIZON, 0.40f + 0.045f * fmaxf(self_v, ecs.speed[j]));
+                        bool hit = swept_overlap_ecs(ecs.x[i], ecs.y[i], ecs.heading[i], self_v, ecs.length[i], ecs.width[i],
+                                ecs.x[j], ecs.y[j], ecs.heading[j], fmaxf(0.0f, ecs.speed[j]), ecs.length[j], ecs.width[j], dt,
+                                horizon, LOCAL_AVOID_COLLISION_MARGIN);
+                        if (hit) {
+                            bool complete_overlap = false;
+#if COMPLETE_OVERLAP_RELEASE_ENABLED
+                            complete_overlap = d2 <= COMPLETE_OVERLAP_RELEASE_DIST * COMPLETE_OVERLAP_RELEASE_DIST &&
+                                    ecs.speed[i] <= COMPLETE_OVERLAP_RELEASE_MAX_SPEED &&
+                                    ecs.speed[j] <= COMPLETE_OVERLAP_RELEASE_MAX_SPEED &&
+                                    obb_overlap_sat(ecs.x[i], ecs.y[i], ecs.heading[i], ecs.length[i], ecs.width[i], ecs.x[j],
+                                    ecs.y[j], ecs.heading[j], ecs.length[j], ecs.width[j], 0.0f);
+#endif
+                            bool other_front_clear = priority_front_clear_ecs(j, perception, ecs);
+                            int other_score = local_avoid_priority_score_ecs(j, ecs, road, perception);
+                            int other_from_lane = ecs.vehicle_state[j] == VEH_IN_CONNECTOR ? ecs.connector_from_lane[j] :
+                                    ecs.lane_id[j];
+                            int other_next_lane = ecs.vehicle_state[j] == VEH_IN_CONNECTOR ? ecs.connector_to_lane[j] :
+                                    route_next_lane_for_vehicle_ecs(j, ecs, road);
+                            bool merge_pair_priority = lane_count_merge_pair_conflict_ecs(lane, next_lane, other_from_lane,
+                                    other_next_lane, road);
+                            bool self_goes_first = false;
+                            bool pair_priority_decided = false;
+                            if (!complete_overlap && merge_pair_priority) {
+                                bool self_yields = zipper_merge_self_yields_ecs(i, lane, next_lane, j, other_from_lane,
+                                        other_next_lane, ecs, road, current_time);
+                                bool other_yields = zipper_merge_self_yields_ecs(j, other_from_lane, other_next_lane, i, lane,
+                                        next_lane, ecs, road, current_time);
+                                if (self_yields != other_yields) {
+                                    self_goes_first = !self_yields;
+                                    pair_priority_decided = true;
+                                }
+                            }
+                            if (!pair_priority_decided && complete_overlap) {
+                                self_goes_first = timed_pair_random_self_wins_ecs(i, j, current_time,
+                                        COMPLETE_OVERLAP_RELEASE_PERIOD);
+                                if (self_goes_first) overlap_release_go = true;
+                            } else if (!pair_priority_decided && self_front_clear && !other_front_clear) {
+                                self_goes_first = true;
+                            } else if (!pair_priority_decided && !self_front_clear && other_front_clear) {
+                                self_goes_first = false;
+                            } else if (!pair_priority_decided && self_inside_box && ecs.vehicle_state[j] != VEH_IN_CONNECTOR) {
+                                self_goes_first = true;
+                            } else if (!pair_priority_decided && ecs.vehicle_state[j] == VEH_IN_CONNECTOR && !self_inside_box) {
+                                self_goes_first = false;
+                            } else if (!pair_priority_decided && self_score != other_score) {
+                                self_goes_first = self_score > other_score;
+                            } else if (!pair_priority_decided) {
+                                self_goes_first = i < j;
+                            }
+                            if (!self_goes_first) {
+                                float center_dist = sqrtf(fmaxf(d2, 0.01f));
+                                float stop_dist = center_dist - 0.5f * ecs.length[i] - 0.5f * ecs.length[j] - LOCAL_AVOID_STOP_BUFFER;
+                                stop_dist = fmaxf(stop_dist, 0.55f);
+                                float req = -(ecs.speed[i] * ecs.speed[i]) / fmaxf(2.0f * stop_dist, 0.5f);
+                                req = clampf_cuda(req, -EMERGENCY_DECEL, -0.04f);
+                                best_req = fminf(best_req, req);
+                                blocked = true;
+                            }
+                        }
+                    }
+                }
+                j = grid.cell_next[j];
+                guard++;
+            }
+        }
+    }
+    if (overlap_release_go && !blocked) {
+        bool human = ecs.driver_type[i] == HUMAN;
+        float max_accel = human ? MAX_ACCEL_HUMAN : MAX_ACCEL_AV;
+        float release_v = human ? COMPLETE_OVERLAP_RELEASE_SPEED_HUMAN : COMPLETE_OVERLAP_RELEASE_SPEED_AV;
+        float release_a = (release_v - ecs.speed[i]) / fmaxf(dt, 0.01f);
+        release_a = clampf_cuda(release_a, 0.0f, max_accel * COMPLETE_OVERLAP_RELEASE_ACCEL_SCALE);
+        decision.target_accel[i] = fmaxf(decision.target_accel[i], release_a);
+        if (metrics != nullptr) {
+            AVABM_METRIC_ADD(metrics, METRIC_DEADLOCK_RELEASE, 1.0f);
+            AVABM_METRIC_ADD(metrics, METRIC_DEADLOCK_ESCAPE_GO, 1.0f);
+        }
+    }
+    if (blocked) {
+        decision.target_accel[i] = fminf(decision.target_accel[i], best_req);
+        if (!self_inside_box) {
+            decision.wants_connector[i] = 0;
+            decision.connector_target_lane[i] = -1;
+        }
+        if (metrics != nullptr) {
+            AVABM_METRIC_ADD(metrics, METRIC_ANTI_COLLISION_BRAKE, 1.0f);
+            AVABM_METRIC_ADD(metrics, METRIC_PRIORITY_PATH_BLOCK, 1.0f);
+        }
+    }
+    AVABM_ACTIVE_LOOP_END()
+}
+__global__ void front_clear_must_go_system_kernel(ECSArrays ecs, RoadNetwork road, Signals signals, SpatialGrid grid,
+        PerceptionSoA perception, DecisionSoA decision, float* metrics, float current_time, float dt, int max_entities,
+        const int* active_ids, const int* active_count) {
+#if FRONT_CLEAR_MUST_GO_ENABLED
+    AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) if (ecs.alive[i] != ENTITY_ALIVE) continue;
+    if (ecs.vehicle_state[i] != VEH_ON_LANE) continue;
+    if (decision.should_exit[i] != 0) continue;
+    int lane = ecs.lane_id[i];
+    if (!valid_lane_ecs(lane, road)) continue;
+    float v = fmaxf(0.0f, ecs.speed[i]);
+    bool human = ecs.driver_type[i] == HUMAN;
+    float max_accel = human ? MAX_ACCEL_HUMAN : MAX_ACCEL_AV;
+    float lane_L = fmaxf(road.lane_length[lane], 0.1f);
+    float dist_to_end = fmaxf(0.0f, lane_L - ecs.s[i]);
+    float front_gap = perception.front_gap != nullptr ? perception.front_gap[i] : 1.0e9f;
+    if (!isfinite(front_gap)) front_gap = 0.0f;
+    float clear_gap = fmaxf(FRONT_CLEAR_MUST_GO_GAP, ecs.length[i] + MIN_BUMPER_GAP + fmaxf(v,
+            FRONT_CLEAR_MUST_GO_SPEED) * FRONT_CLEAR_MUST_GO_TIME_GAP);
+    bool front_clear = front_gap > clear_gap;
+    if (!front_clear) continue;
+    int next_lane = route_next_lane_for_vehicle_ecs(i, ecs, road);
+    bool has_next = valid_lane_ecs(next_lane, road) && lane_connected(lane, next_lane, road);
+    if (!has_next) {
+        if (dist_to_end <= DEFAULT_STOP_OFFSET + 1.0f) {
+            decision.should_exit[i] = 1;
+        }
+        continue;
+    }
+    int turn = TURN_STRAIGHT;
+    int rid = ecs.route_id[i];
+    int rpos = ecs.route_pos[i];
+    if (rid >= 0 && rid < road.num_routes) {
+        int ro0 = road.route_offsets[rid];
+        int ro1 = road.route_offsets[rid + 1];
+        if (ro1 > ro0 && rpos >= 0 && ro0 + rpos < ro1) {
+            turn = road.route_turns[ro0 + rpos];
+        }
+    }
+    bool missed_straight = missed_exit_straight_target_ecs(i, lane, next_lane, ecs, road);
+    if (missed_straight) {
+        turn = TURN_STRAIGHT;
+    } else {
+        turn = effective_turn_code_ecs(lane, next_lane, turn, road);
+        int adjusted_next = interchange_receiving_outer_lane_ecs(lane, next_lane, road);
+        adjusted_next = receiving_lane_for_turn_ecs(adjusted_next, turn, road);
+        adjusted_next = interchange_receiving_outer_lane_ecs(lane, adjusted_next, road);
+        if (valid_lane_ecs(adjusted_next, road) && lane_connected(lane, adjusted_next, road)) {
+            next_lane = adjusted_next;
+        }
+    }
+    int source_outer = missed_straight ? -1 : interchange_source_outer_lane_ecs(lane, next_lane, road);
+    bool turn_ok = true;
+    if (valid_lane_ecs(source_outer, road) && lane != source_outer) {
+        turn_ok = false;
+    } else if (turn_requires_dedicated_lane_ecs(turn)) {
+        turn_ok = lane_legal_for_turn_ecs(lane, turn, road);
+    }
+    if (!turn_ok) {
+        int straight_escape = missed_exit_straight_fallback_lane_ecs(i, lane, next_lane, road);
+        if (valid_lane_ecs(straight_escape, road) && lane_connected(lane, straight_escape, road)) {
+            next_lane = straight_escape;
+            turn = TURN_STRAIGHT;
+            missed_straight = true;
+            source_outer = -1;
+            turn_ok = true;
+            if (metrics != nullptr) AVABM_METRIC_ADD(metrics, METRIC_DEADLOCK_ESCAPE_GO, 1.0f);
+        } else if (ecs.connector_length[i] >= fmaxf(MISSED_TURN_ESCAPE_WAIT, WRONG_LANE_STALL_FORCE_WAIT)) {
+            turn_ok = true;
+        }
+    }
+    if (!turn_ok) continue;
+    bool inside_box = inside_intersection_box_ecs(dist_to_end, lane, next_lane, road);
+    int sig = get_signal_for_lane_turn(lane, turn, current_time, road, signals);
+    float stop_line_gap = lane_L - DEFAULT_STOP_OFFSET - ecs.s[i];
+    bool red_creep_only = sig == LIGHT_RED && !inside_box;
+    bool hard_red_stop = red_creep_only && stop_line_gap <= FRONT_CLEAR_MUST_GO_RED_HOLD_DIST;
+    if (hard_red_stop) continue;
+    bool active_lc = ecs.lane_change_active[i] != 0;
+    bool active_lc_target_unsafe = false;
+    if (active_lc) {
+        float tf = perception.target_front_gap != nullptr ? perception.target_front_gap[i] : 1.0e9f;
+        float tr = perception.target_rear_gap != nullptr ? perception.target_rear_gap[i] : 1.0e9f;
+        float rear_v = perception.target_rear_speed != nullptr ? perception.target_rear_speed[i] : 0.0f;
+        if (!isfinite(tf)) tf = 0.0f;
+        if (!isfinite(tr)) tr = 0.0f;
+        float front_need = fmaxf(LC_ACTIVE_FREEZE_FRONT_MIN, ecs.length[i] + MIN_BUMPER_GAP + v * 0.22f);
+        float rear_need = fmaxf(LC_ACTIVE_FREEZE_REAR_MIN, ecs.length[i] + MIN_BUMPER_GAP + fmaxf(0.0f, rear_v) * 0.25f);
+        active_lc_target_unsafe = tf < front_need || tr < rear_need;
+    }
+    float release_v = inside_box ? (human ? CONNECTOR_INBOX_MIN_CLEAR_SPEED_HUMAN : CONNECTOR_INBOX_MIN_CLEAR_SPEED_AV) :
+            fmaxf(human ? SMART_STALL_RELEASE_SPEED_HUMAN : SMART_STALL_RELEASE_SPEED_AV, FRONT_CLEAR_MUST_GO_SPEED);
+#if AVABM_MIN_CRUISE_SPEED_ENABLED
+    if (red_creep_only) {
+        release_v = fminf(release_v, human ? SIGNAL_CREEP_SPEED_HUMAN : SIGNAL_CREEP_SPEED_AV);
+    } else if (!active_lc && dist_to_end > fmaxf(25.0f, v * 1.5f)) {
+        release_v = fmaxf(release_v, avabm_min_cruise_speed_mps_ecs());
+    }
+#else
+    if (red_creep_only) {
+        release_v = fminf(release_v, human ? SIGNAL_CREEP_SPEED_HUMAN : SIGNAL_CREEP_SPEED_AV);
+    }
+#endif
+    float accel_scale = FRONT_CLEAR_MUST_GO_ACCEL_SCALE;
+    if (active_lc) {
+        accel_scale = active_lc_target_unsafe ? FRONT_CLEAR_MUST_GO_LC_UNSAFE_ACCEL_SCALE : FRONT_CLEAR_MUST_GO_LC_ACCEL_SCALE;
+    }
+    if (v < FRONT_CLEAR_MUST_GO_SPEED || decision.target_accel[i] <= 0.05f) {
+        float release_a = (release_v - v) / fmaxf(dt, 0.01f);
+        release_a = clampf_cuda(release_a, 0.0f, max_accel * accel_scale);
+        if (release_a > 0.0f) {
+            decision.target_accel[i] = fmaxf(decision.target_accel[i], release_a);
+            if (ecs.accel[i] < 0.0f) ecs.accel[i] = 0.0f;
+            if (metrics != nullptr) AVABM_METRIC_ADD(metrics, METRIC_DEADLOCK_CREEP, 1.0f);
+        }
+    }
+    bool signal_allows_connector = inside_box || sig == LIGHT_GREEN || sig == LIGHT_YELLOW;
+    float v_after = fmaxf(0.0f, v + fmaxf(0.0f, decision.target_accel[i]) * dt);
+    float box_depth = intersection_box_depth_ecs(lane, next_lane, road);
+    float trigger = fmaxf(fmaxf(CONNECTOR_EXIT_EPS, box_depth), v_after * dt + CONNECTOR_TRIGGER_MARGIN);
+    if (signal_allows_connector && dist_to_end <= trigger + FRONT_CLEAR_MUST_GO_NODE_EXTRA && !active_lc_target_unsafe) {
+        decision.wants_connector[i] = 1;
+        decision.connector_target_lane[i] = next_lane;
+        if (metrics != nullptr) AVABM_METRIC_ADD(metrics, METRIC_FRONT_SPACE_RELEASE, 1.0f);
+    }
+    AVABM_ACTIVE_LOOP_END()
+#endif
+}
+__global__ void safety_metrics_system_kernel(ECSArrays ecs, SpatialGrid grid, float* metrics, int max_entities,
+        const int* active_ids, const int* active_count) {
+    AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) if (ecs.alive[i] != ENTITY_ALIVE) continue;
+    int base = world_cell_index(ecs.x[i], ecs.y[i], grid.min_x, grid.min_y, grid.cell_size, grid.width, grid.height);
+    if (base < 0) continue;
+    int bc_x = base % grid.width;
+    int bc_y = base / grid.width;
+    for (int dy = -2; dy <= 2; ++dy) {
+        for (int dx = -2; dx <= 2; ++dx) {
+            int cx = bc_x + dx;
+            int cy = bc_y + dy;
+            if (cx < 0 || cx >= grid.width || cy < 0 || cy >= grid.height) continue;
+            int j = grid_head_ecs(grid, cy * grid.width + cx);
+            int guard = 0;
+            while (j >= 0 && guard < avabm_world_scan_limit_ecs(max_entities)) {
+                if (j > i && ecs.alive[j] == ENTITY_ALIVE) {
+                    float rx = ecs.x[j] - ecs.x[i];
+                    float ry = ecs.y[j] - ecs.y[i];
+                    float dist = sqrtf(fmaxf(rx * rx + ry * ry, 0.001f));
+                    float vix = cosf(ecs.heading[i]) * ecs.speed[i];
+                    float viy = sinf(ecs.heading[i]) * ecs.speed[i];
+                    float vjx = cosf(ecs.heading[j]) * ecs.speed[j];
+                    float vjy = sinf(ecs.heading[j]) * ecs.speed[j];
+                    float rvx = vjx - vix;
+                    float rvy = vjy - viy;
+                    float closing = -((rx * rvx + ry * rvy) / fmaxf(dist, 0.1f));
+                    float combined = 0.5f * ecs.length[i] + 0.5f * ecs.length[j] + MIN_BUMPER_GAP;
+                    float gap = dist - combined;
+                    if (gap < 1.0f) {
+                        AVABM_METRIC_ADD(metrics, METRIC_NEAR_MISS, 1.0f);
+                    }
+                    if (closing > 0.1f && gap > 0.0f) {
+                        float ttc = gap / closing;
+                        if (ttc < TTC_CRITICAL) {
+                            AVABM_METRIC_ADD(metrics, METRIC_TTC_CRITICAL, 1.0f);
+                        } else if (ttc < TTC_WARNING) {
+                            AVABM_METRIC_ADD(metrics, METRIC_TTC_WARNING, 1.0f);
+                        }
+                    }
+                }
+                j = grid.cell_next[j];
+                guard++;
+            }
+        }
+    }
+    AVABM_ACTIVE_LOOP_END()
+}
+__global__ void stats_system_kernel(ECSArrays ecs, RoadNetwork road, PerceptionSoA perception, DecisionSoA decision,
+        float* metrics, float dt, int max_entities, const int* active_ids, const int* active_count) {
+    constexpr int ST_ACTIVE = 0;
+    constexpr int ST_SPEED_SUM = 1;
+    constexpr int ST_SPEED_COUNT = 2;
+    constexpr int ST_SLOW_COUNT = 3;
+    constexpr int ST_STOP_COUNT = 4;
+    constexpr int ST_STANDSTILL_TIME = 5;
+    constexpr int ST_ACCEL_COUNT = 6;
+    constexpr int ST_ACCEL_SUM = 7;
+    constexpr int ST_ACCEL_SQ_SUM = 8;
+    constexpr int ST_DECEL_COUNT = 9;
+    constexpr int ST_DECEL_SUM = 10;
+    constexpr int ST_DECEL_SQ_SUM = 11;
+    constexpr int ST_HARD_BRAKE = 12;
+    constexpr int ST_MIN_GAP_SUM = 13;
+    constexpr int ST_MIN_GAP_COUNT = 14;
+    constexpr int ST_HEADWAY_SUM = 15;
+    constexpr int ST_HEADWAY_COUNT = 16;
+    constexpr int ST_TIME_LOSS_SUM = 17;
+    constexpr int ST_TIME_LOSS_COUNT = 18;
+    constexpr int ST_QUEUE_DELAY_SUM = 19;
+    constexpr int ST_QUEUE_DELAY_COUNT = 20;
+    constexpr int STATS_LOCAL_SLOTS = 21;
+    constexpr int STATS_BLOCK_THREADS = 256;
+    float local[STATS_LOCAL_SLOTS];
+#pragma unroll
+    for (int k = 0; k < STATS_LOCAL_SLOTS; ++k) local[k] = 0.0f;
+    AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) if (ecs.alive[i] != ENTITY_ALIVE) continue;
+    float v = ecs.speed[i];
+    float a = ecs.accel[i];
+    local[ST_ACTIVE] += 1.0f;
+    local[ST_SPEED_SUM] += v;
+    local[ST_SPEED_COUNT] += 1.0f;
+    if (v < 2.0f) local[ST_SLOW_COUNT] += 1.0f;
+    if (v < 0.2f) {
+        local[ST_STOP_COUNT] += 1.0f;
+        local[ST_STANDSTILL_TIME] += dt;
+    }
+    if (a > 0.05f) {
+        local[ST_ACCEL_COUNT] += 1.0f;
+        local[ST_ACCEL_SUM] += a;
+        local[ST_ACCEL_SQ_SUM] += a * a;
+    } else if (a < -0.05f) {
+        float d = -a;
+        local[ST_DECEL_COUNT] += 1.0f;
+        local[ST_DECEL_SUM] += d;
+        local[ST_DECEL_SQ_SUM] += d * d;
+    }
+    if (a < -3.5f) {
+        local[ST_HARD_BRAKE] += 1.0f;
+    }
+    if (perception.front_gap[i] < 1.0e8f) {
+        local[ST_MIN_GAP_SUM] += perception.front_gap[i];
+        local[ST_MIN_GAP_COUNT] += 1.0f;
+        if (v > 0.5f) {
+            local[ST_HEADWAY_SUM] += perception.front_gap[i] / fmaxf(v, 0.5f);
+            local[ST_HEADWAY_COUNT] += 1.0f;
+        }
+    }
+    float desired = decision.desired_speed[i];
+    if (!isfinite(desired) || desired < 0.1f) {
+        int lane = ecs.lane_id[i];
+        if (lane >= 0 && lane < road.num_lanes) {
+            desired = desired_speed_ecs(i, lane, ecs, road);
+        } else {
+            desired = MAX_SPEED_FALLBACK;
+        }
+    }
+    if (desired > 0.5f) {
+        float loss_ratio = clampf_cuda((desired - v) / desired, 0.0f, 1.0f);
+        local[ST_TIME_LOSS_SUM] += loss_ratio * dt;
+        local[ST_TIME_LOSS_COUNT] += 1.0f;
+        if (loss_ratio > 0.65f && v < 1.0f) {
+            local[ST_QUEUE_DELAY_SUM] += dt;
+            local[ST_QUEUE_DELAY_COUNT] += 1.0f;
+        }
+    }
+    AVABM_ACTIVE_LOOP_END() __shared__ float block_sums[STATS_LOCAL_SLOTS][STATS_BLOCK_THREADS];
+    int tid = threadIdx.x;
+    if (tid < STATS_BLOCK_THREADS) {
+#pragma unroll
+        for (int k = 0; k < STATS_LOCAL_SLOTS; ++k) {
+            block_sums[k][tid] = local[k];
+        }
+    }
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride && tid + stride < STATS_BLOCK_THREADS) {
+#pragma unroll
+            for (int k = 0; k < STATS_LOCAL_SLOTS; ++k) {
+                block_sums[k][tid] += block_sums[k][tid + stride];
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0 && metrics != nullptr) {
+        if (block_sums[ST_ACTIVE][0] != 0.0f) AVABM_METRIC_ADD(metrics, METRIC_ACTIVE, block_sums[ST_ACTIVE][0]);
+        if (block_sums[ST_SPEED_SUM][0] != 0.0f) AVABM_METRIC_ADD(metrics, METRIC_SPEED_SUM, block_sums[ST_SPEED_SUM][0]);
+        if (block_sums[ST_SPEED_COUNT][0] != 0.0f) AVABM_METRIC_ADD(metrics, METRIC_SPEED_COUNT, block_sums[ST_SPEED_COUNT][0]);
+        if (block_sums[ST_SLOW_COUNT][0] != 0.0f) AVABM_METRIC_ADD(metrics, METRIC_SLOW_COUNT, block_sums[ST_SLOW_COUNT][0]);
+        if (block_sums[ST_STOP_COUNT][0] != 0.0f) AVABM_METRIC_ADD(metrics, METRIC_STOP_COUNT, block_sums[ST_STOP_COUNT][0]);
+        if (block_sums[ST_STANDSTILL_TIME][0] != 0.0f) AVABM_METRIC_ADD(metrics, METRIC_STANDSTILL_TIME,
+                block_sums[ST_STANDSTILL_TIME][0]);
+        if (block_sums[ST_ACCEL_COUNT][0] != 0.0f) AVABM_METRIC_ADD(metrics, METRIC_ACCEL_COUNT, block_sums[ST_ACCEL_COUNT][0]);
+        if (block_sums[ST_ACCEL_SUM][0] != 0.0f) AVABM_METRIC_ADD(metrics, METRIC_ACCEL_SUM, block_sums[ST_ACCEL_SUM][0]);
+        if (block_sums[ST_ACCEL_SQ_SUM][0] != 0.0f) AVABM_METRIC_ADD(metrics, METRIC_ACCEL_SQ_SUM, block_sums[ST_ACCEL_SQ_SUM][0]);
+        if (block_sums[ST_DECEL_COUNT][0] != 0.0f) AVABM_METRIC_ADD(metrics, METRIC_DECEL_COUNT, block_sums[ST_DECEL_COUNT][0]);
+        if (block_sums[ST_DECEL_SUM][0] != 0.0f) AVABM_METRIC_ADD(metrics, METRIC_DECEL_SUM, block_sums[ST_DECEL_SUM][0]);
+        if (block_sums[ST_DECEL_SQ_SUM][0] != 0.0f) AVABM_METRIC_ADD(metrics, METRIC_DECEL_SQ_SUM, block_sums[ST_DECEL_SQ_SUM][0]);
+        if (block_sums[ST_HARD_BRAKE][0] != 0.0f) AVABM_METRIC_ADD(metrics, METRIC_HARD_BRAKE, block_sums[ST_HARD_BRAKE][0]);
+        if (block_sums[ST_MIN_GAP_SUM][0] != 0.0f) AVABM_METRIC_ADD(metrics, METRIC_MIN_GAP_SUM, block_sums[ST_MIN_GAP_SUM][0]);
+        if (block_sums[ST_MIN_GAP_COUNT][0] != 0.0f) AVABM_METRIC_ADD(metrics, METRIC_MIN_GAP_COUNT,
+                block_sums[ST_MIN_GAP_COUNT][0]);
+        if (block_sums[ST_HEADWAY_SUM][0] != 0.0f) AVABM_METRIC_ADD(metrics, METRIC_HEADWAY_SUM, block_sums[ST_HEADWAY_SUM][0]);
+        if (block_sums[ST_HEADWAY_COUNT][0] != 0.0f) AVABM_METRIC_ADD(metrics, METRIC_HEADWAY_COUNT,
+                block_sums[ST_HEADWAY_COUNT][0]);
+        if (block_sums[ST_TIME_LOSS_SUM][0] != 0.0f) AVABM_METRIC_ADD(metrics, METRIC_TIME_LOSS_SUM,
+                block_sums[ST_TIME_LOSS_SUM][0]);
+        if (block_sums[ST_TIME_LOSS_COUNT][0] != 0.0f) AVABM_METRIC_ADD(metrics, METRIC_TIME_LOSS_COUNT,
+                block_sums[ST_TIME_LOSS_COUNT][0]);
+        if (block_sums[ST_QUEUE_DELAY_SUM][0] != 0.0f) AVABM_METRIC_ADD(metrics, METRIC_QUEUE_DELAY_SUM,
+                block_sums[ST_QUEUE_DELAY_SUM][0]);
+        if (block_sums[ST_QUEUE_DELAY_COUNT][0] != 0.0f) AVABM_METRIC_ADD(metrics, METRIC_QUEUE_DELAY_COUNT,
+                block_sums[ST_QUEUE_DELAY_COUNT][0]);
+    }
+}

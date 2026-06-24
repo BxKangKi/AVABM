@@ -40,8 +40,6 @@ avabm_cuda\build.bat hardclean
 
 `hardclean` removes the project build outputs plus conservative user-local `torch_extensions` and NVIDIA `ComputeCache` folders before rebuilding. It does not enable runtime JIT builds.
 
-The build scripts now default to a conservative ptxas-safe profile for Windows systems where large CUDA builds can crash with `ptxas` `ACCESS_VIOLATION`, especially on sm_86/Ampere targets. The old monolithic CUDA `main.cu` has also been split into smaller CUDA translation units (`*.cu`) so each nvcc/ptxas invocation handles less device code. The build fingerprint includes the resolved GPU architecture, CUDA Toolkit path, nvcc version, and all split CUDA sources/headers, so binaries built for one GPU/toolkit are not silently reused on another. See `AVABM_BUILD_STABILITY_NOTES_KO.md` and `avabm_cuda/CUDA_SPLIT_MAP.md` for details. The split CUDA files use short names such as `common.cuh`, `priority.cu`, and `render.cu`; the Python extension remains named `avabm_cuda`.
-
 
 **Requirements**
 
@@ -55,16 +53,6 @@ The build scripts now default to a conservative ptxas-safe profile for Windows s
 
 Run `avabm_cuda/build.bat`. A compiled `.pyd` file will be generated in the CUDA directory, and the script will automatically copy it to the project root. The script removes stale `.pyd` files before building and stops on compile errors instead of copying an old binary.
 
-
-## Current Fix Notes (v26 / route cache v40)
-
-This package includes source-level fixes for node-transition gridlock, connector-exit stalls, and bumper-overlap recovery. Rebuild the CUDA extension after extracting the project:
-
-```
-avabm_cuda\build.bat
-```
-
-The route cache version was bumped, so old ready-route caches are not reused. The v26 CUDA traffic logic adds a deterministic node-drain rule: when conflicting vehicles have queued at the same node, a clear-front vehicle that has waited longer is released instead of allowing an A-waits-B / B-waits-C cycle to persist. Connector vehicles that are already at the exit can perform a tiny-gap handoff so they do not occupy the intersection box forever. Contact repair was strengthened with larger longitudinal separation, five repair passes, and bounded front-vehicle nudges when a rear vehicle is clamped at the lane or connector origin. `run.bat` still stops if the compiled `.pyd` is missing or older than the CUDA source so stale binaries are not used by accident.
 
 ## Run
 
@@ -85,5 +73,3 @@ CUDA_PTXAS_SAFE_MODE=0
 CUDA_DEVICE_NOINLINE=0
 CUDA_FAST_MATH=0
 ```
-
-If RTX A4000/sm_86 ptxas crashes again, see `AVABM_CUDA_PERFORMANCE_TUNING_KO.md` and temporarily switch back to the ultra-safe profile.

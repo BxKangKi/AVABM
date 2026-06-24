@@ -132,6 +132,11 @@ for key in (
     "CUDA_BUILD_MODE",
     "CUDA_NVCC_THREADS",
     "CUDA_SPLIT_COMPILE",
+    "CUDA_PTXAS_PARTITION_BUILD",
+    "CUDA_SINGLE_TU_BUILD",
+    "CUDA_PTXAS_MAXRREGCOUNT",
+    "CUDA_PTXAS_VERBOSE",
+    "CUDA_PTXAS_KEEP_FILES",
     "CUDA_ARCH_KEEP_PTX",
     "CUDA_PTXAS_SAFE_MODE",
     "CUDA_PTXAS_OPT_LEVEL",
@@ -260,6 +265,13 @@ fast_math = _truthy(_cfg("CUDA_FAST_MATH"), default=False)
 nvcc_threads = max(0, _int_value(_cfg("CUDA_NVCC_THREADS"), default=0))
 split_compile = max(0, _int_value(_cfg("CUDA_SPLIT_COMPILE"), default=0))
 ptxas_safe_mode = _truthy(_cfg("CUDA_PTXAS_SAFE_MODE"), default=False)
+ptxas_partition_build = _truthy(_cfg("CUDA_PTXAS_PARTITION_BUILD"), default=True)
+single_tu_build = _truthy(_cfg("CUDA_SINGLE_TU_BUILD"), default=False)
+if single_tu_build:
+    ptxas_partition_build = False
+ptxas_maxrregcount = max(0, _int_value(_cfg("CUDA_PTXAS_MAXRREGCOUNT"), default=0))
+ptxas_verbose = _truthy(_cfg("CUDA_PTXAS_VERBOSE"), default=False)
+ptxas_keep_files = _truthy(_cfg("CUDA_PTXAS_KEEP_FILES"), default=False)
 disable_msvc_gl = _truthy(_cfg("CUDA_DISABLE_MSVC_GL"), default=True)
 use_full_torch_header = _truthy(_cfg("CUDA_USE_FULL_TORCH_EXTENSION_HEADER"), default=False)
 fast_equiv_math = _truthy(_cfg("CUDA_FAST_EQUIV_MATH"), default=True)
@@ -306,7 +318,7 @@ device_noinline = _truthy(_cfg("CUDA_DEVICE_NOINLINE"), default=False)
 binding_opt_level = str(_cfg("CUDA_BINDING_OPT_LEVEL", "1")).strip().upper().lstrip("O")
 if binding_opt_level not in {"0", "1", "2"}:
     binding_opt_level = "0"
-ptxas_default_opt = "0" if ptxas_safe_mode else ("1" if build_mode == "fastdev" else ("3" if build_mode == "benchmark" else "2"))
+ptxas_default_opt = "0" if (ptxas_safe_mode or build_mode == "debug") else ("3" if build_mode == "benchmark" else "1")
 ptxas_opt_level = str(_cfg("CUDA_PTXAS_OPT_LEVEL", ptxas_default_opt)).strip().upper().lstrip("O")
 if ptxas_opt_level not in {"0", "1", "2", "3"}:
     ptxas_opt_level = ptxas_default_opt
@@ -332,6 +344,14 @@ if add_nvcc_std_flag:
     nvcc_flags.append(f"-std=c++{cxx_standard}")
 nvcc_flags.extend(["-Xptxas", f"-O{ptxas_opt_level}"])
 nvcc_flags.extend(["-Xptxas", f"-allow-expensive-optimizations={'true' if ptxas_allow_expensive else 'false'}"])
+if ptxas_maxrregcount > 0:
+    nvcc_flags.append(f"--maxrregcount={ptxas_maxrregcount}")
+if ptxas_verbose:
+    nvcc_flags.extend(["-Xptxas", "-v"])
+if ptxas_keep_files:
+    keep_dir = ROOT_DIR / "avabm_cuda" / "build_logs" / "nvcc_keep"
+    keep_dir.mkdir(parents=True, exist_ok=True)
+    nvcc_flags.extend(["--keep", "--keep-dir", str(keep_dir)])
 if nvcc_time_log:
     nvcc_time_path = ROOT_DIR / "avabm_cuda" / "build_logs" / "nvcc_time.csv"
     nvcc_time_path.parent.mkdir(exist_ok=True)
@@ -375,10 +395,13 @@ for flag in _split_flags(_cfg("CUDA_EXTRA_CXX_FLAGS")):
 print(
     "[Info] AVABM CUDA compile profile: "
     f"mode={build_mode}, nvcc_O{opt_level}, ptxas_O{ptxas_opt_level}, "
-    f"ptxas_safe={int(ptxas_safe_mode)}, split_compile={split_compile}, nvcc_threads={nvcc_threads}, "
+    f"ptxas_safe={int(ptxas_safe_mode)}, partition={int(ptxas_partition_build)}, single_tu={int(single_tu_build)}, "
+    f"split_compile={split_compile}, nvcc_threads={nvcc_threads}, maxrreg={ptxas_maxrregcount}, "
     f"fast_math={int(fast_math)}, contact_passes={contact_resolve_passes}, "
     f"ecs_cursor_alloc={int(ecs_cursor_allocator)}, incremental_active={int(incremental_active_list)}/{active_full_compact_interval}, "
-    f"persistent_grid={int(persistent_start_grid)}, perception_grid_reuse={int(persistent_perception_grid_reuse)}, fast_physics={int(fast_physics_mode)}, lane_hash={int(lane_hash_grid_enabled)}, "
+    f"persistent_grid={int(persistent_start_grid)}, "
+    f"perception_grid_reuse={int(persistent_perception_grid_reuse)}, "
+    f"fast_physics={int(fast_physics_mode)}, lane_hash={int(lane_hash_grid_enabled)}, "
     f"skip_prespawn_active={int(skip_prespawn_active_rebuild)}, route_repair_interval={route_repair_interval}, "
     f"priority_interval={priority_interval}, "
     f"contact_interval={contact_interval}, collision_interval={collision_interval}, stats_interval={stats_interval}, "
@@ -471,12 +494,22 @@ class AVABMBuildExtension(_BaseBuildExtension):
                 self.compiler.initialize()
             self._strip_msvc_slow_defaults()
         super().build_extensions()
+cuda_sources = ["binding.cpp", "main.cu"]
+if ptxas_partition_build:
+    cuda_sources = [
+        "binding.cpp",
+        "main_core_grid_spawn.cu",
+        "main_core_decision.cu",
+        "main_core_motion.cu",
+        "main_render_launch.cu",
+    ]
+print(f"[Info] AVABM CUDA sources: {', '.join(cuda_sources)}")
 setup(
     name="avabm_cuda",
     ext_modules=[
         CUDAExtension(
             name="avabm_cuda",
-            sources=["binding.cpp", "main.cu"],
+            sources=cuda_sources,
             define_macros=common_defines,
             extra_compile_args={
                 "cxx": cxx_flags,

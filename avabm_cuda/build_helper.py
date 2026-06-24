@@ -21,7 +21,17 @@ CUDA_DIR = Path(__file__).resolve().parent
 ROOT_DIR = CUDA_DIR.parent
 STAMP_PATH = CUDA_DIR / ".avabm_cuda_build_fingerprint.json"
 LAST_BUILD_ENV_PATH = CUDA_DIR / ".avabm_cuda_last_build_env.json"
-SOURCE_FILES = [CUDA_DIR / "binding.cpp", CUDA_DIR / "setup.py", CUDA_DIR / "pyproject.toml", CUDA_DIR / "main.cu"]
+SOURCE_FILES = [
+    CUDA_DIR / "binding.cpp",
+    CUDA_DIR / "setup.py",
+    CUDA_DIR / "pyproject.toml",
+    CUDA_DIR / "main.cu",
+    CUDA_DIR / "main_common.cuh",
+    CUDA_DIR / "main_core_grid_spawn.cu",
+    CUDA_DIR / "main_core_decision.cu",
+    CUDA_DIR / "main_core_motion.cu",
+    CUDA_DIR / "main_render_launch.cu",
+]
 BUILD_CONFIG_KEYS = [
     "CUDA_HOME",
     "TORCH_CUDA_ARCH_LIST",
@@ -44,6 +54,11 @@ BUILD_CONFIG_KEYS = [
     "CUDA_OPT_LEVEL",
     "CUDA_NVCC_TIME_LOG",
     "CUDA_PTXAS_SAFE_MODE",
+    "CUDA_PTXAS_PARTITION_BUILD",
+    "CUDA_SINGLE_TU_BUILD",
+    "CUDA_PTXAS_MAXRREGCOUNT",
+    "CUDA_PTXAS_VERBOSE",
+    "CUDA_PTXAS_KEEP_FILES",
     "CUDA_PTXAS_ALLOW_EXPENSIVE_OPT",
     "CUDA_PTXAS_OPT_LEVEL",
     "CUDA_FAST_MATH",
@@ -108,6 +123,11 @@ ACTUAL_ENV_OVERRIDE_KEYS = {
     "CUDA_FAST_MATH",
     "CUDA_DEVICE_FORCEINLINE",
     "CUDA_DEVICE_NOINLINE",
+    "CUDA_PTXAS_PARTITION_BUILD",
+    "CUDA_SINGLE_TU_BUILD",
+    "CUDA_PTXAS_MAXRREGCOUNT",
+    "CUDA_PTXAS_VERBOSE",
+    "CUDA_PTXAS_KEEP_FILES",
     "CUDA_NVCC_THREADS",
     "CUDA_SPLIT_COMPILE",
     "CUDA_NVCC_ADD_STD_FLAG",
@@ -497,6 +517,11 @@ def _write_stream_header(f_last, f_dated, label: str, cmd: list[str], env: Dict[
         f"[Info] CUDA_PTXAS_SAFE_MODE={env.get('CUDA_PTXAS_SAFE_MODE', '')}\n"
         f"[Info] CUDA_NVCC_THREADS={env.get('CUDA_NVCC_THREADS', '')}\n"
         f"[Info] CUDA_SPLIT_COMPILE={env.get('CUDA_SPLIT_COMPILE', '')}\n"
+        f"[Info] CUDA_PTXAS_PARTITION_BUILD={env.get('CUDA_PTXAS_PARTITION_BUILD', '')}\n"
+        f"[Info] CUDA_SINGLE_TU_BUILD={env.get('CUDA_SINGLE_TU_BUILD', '')}\n"
+        f"[Info] CUDA_OPT_LEVEL={env.get('CUDA_OPT_LEVEL', '')}\n"
+        f"[Info] CUDA_PTXAS_OPT_LEVEL={env.get('CUDA_PTXAS_OPT_LEVEL', '')}\n"
+        f"[Info] CUDA_DEVICE_NOINLINE={env.get('CUDA_DEVICE_NOINLINE', '')}\n"
     )
     f_last.write(header)
     f_dated.write(header)
@@ -542,18 +567,50 @@ def _log_indicates_ptxas_crash(path: Path) -> bool:
     except FileNotFoundError:
         return False
     low = text.lower()
-    return (
-        "ptxas" in low
-        and (
-            "access_violation" in low
-            or "0xc0000005" in low
-            or "died with status" in low
-            or "internal error" in low
-        )
+    if "ptxas" not in low:
+        return False
+    crash_tokens = (
+        "access_violation",
+        "0xc0000005",
+        "died with status",
+        "internal error",
+        "segmentation fault",
+        "segfault",
+        "ptxas fatal",
+        "ptxas error",
+        "ptxas returned",
+        "ptxas.exe",
+        "nvcc fatal",
     )
+    return any(token in low for token in crash_tokens)
+
+def _stable_retry_env(env: Dict[str, str]) -> Dict[str, str]:
+    retry = env.copy()
+    retry["CUDA_PTXAS_SAFE_MODE"] = "0"
+    retry["CUDA_PTXAS_PARTITION_BUILD"] = "1"
+    retry["CUDA_SINGLE_TU_BUILD"] = "0"
+    retry["CUDA_NVCC_THREADS"] = "0"
+    retry["CUDA_SPLIT_COMPILE"] = "0"
+    retry["CUDA_OPT_LEVEL"] = "2"
+    retry["CUDA_PTXAS_OPT_LEVEL"] = "1"
+    retry["CUDA_PTXAS_ALLOW_EXPENSIVE_OPT"] = "0"
+    retry["CUDA_FAST_MATH"] = "0"
+    retry["CUDA_BUILD_MODE"] = "release"
+    retry["CUDA_NVCC_ADD_STD_FLAG"] = "0"
+    retry["CUDA_DEVICE_FORCEINLINE"] = "0"
+    retry["CUDA_DEVICE_NOINLINE"] = "1"
+    retry["CUDA_PTXAS_MAXRREGCOUNT"] = retry.get("CUDA_PTXAS_MAXRREGCOUNT") or "0"
+    retry["MAX_JOBS"] = "1"
+    retry["CMAKE_BUILD_PARALLEL_LEVEL"] = "1"
+    retry["CUDA_BUILD_MAX_JOBS"] = "1"
+    retry.pop("NVCC_PREPEND_FLAGS", None)
+    retry.pop("NVCC_APPEND_FLAGS", None)
+    return retry
 def _safe_retry_env(env: Dict[str, str]) -> Dict[str, str]:
     retry = env.copy()
     retry["CUDA_PTXAS_SAFE_MODE"] = "1"
+    retry["CUDA_PTXAS_PARTITION_BUILD"] = "1"
+    retry["CUDA_SINGLE_TU_BUILD"] = "0"
     retry["CUDA_NVCC_THREADS"] = "0"
     retry["CUDA_SPLIT_COMPILE"] = "0"
     retry["CUDA_OPT_LEVEL"] = "0"
@@ -564,6 +621,7 @@ def _safe_retry_env(env: Dict[str, str]) -> Dict[str, str]:
     retry["CUDA_NVCC_ADD_STD_FLAG"] = "0"
     retry["CUDA_DEVICE_FORCEINLINE"] = "0"
     retry["CUDA_DEVICE_NOINLINE"] = "1"
+    retry["CUDA_PTXAS_MAXRREGCOUNT"] = retry.get("CUDA_PTXAS_MAXRREGCOUNT") or "0"
     retry["MAX_JOBS"] = "1"
     retry["CMAKE_BUILD_PARALLEL_LEVEL"] = "1"
     retry["CUDA_BUILD_MAX_JOBS"] = "1"
@@ -606,9 +664,25 @@ def command_runbuild() -> int:
         if rc == 0:
             actual_env = _actual_build_env_from(base_env, cfg, "primary")
         if rc != 0 and auto_retry and _log_indicates_ptxas_crash(last_log):
-            print("[Warning] ptxas crash signature detected. Retrying once with serial safe ptxas settings.")
-            f_last.write("[Warning] ptxas crash signature detected. Retrying once with serial safe ptxas settings.\n")
-            f_dated.write("[Warning] ptxas crash signature detected. Retrying once with serial safe ptxas settings.\n")
+            print("[Warning] ptxas crash signature detected. Retrying with partitioned O1/noinline stability settings.")
+            f_last.write("[Warning] ptxas crash signature detected. Retrying with partitioned O1/noinline stability settings.\n")
+            f_dated.write("[Warning] ptxas crash signature detected. Retrying with partitioned O1/noinline stability settings.\n")
+            if safe_retry_clean:
+                build_dir = CUDA_DIR / "build"
+                if build_dir.exists():
+                    shutil.rmtree(build_dir)
+                    msg = f"[Info] Stability retry removed build cache: {build_dir}\n"
+                    f_last.write(msg)
+                    f_dated.write(msg)
+                    print(msg.strip())
+            retry_env = _stable_retry_env(base_env)
+            rc = _run_build_once(cmd, retry_env, "stable_retry", f_last, f_dated, verbose)
+            if rc == 0:
+                actual_env = _actual_build_env_from(retry_env, cfg, "stable_retry")
+        if rc != 0 and auto_retry and _log_indicates_ptxas_crash(last_log):
+            print("[Warning] ptxas still failed. Retrying once more with O0 safe ptxas settings.")
+            f_last.write("[Warning] ptxas still failed. Retrying once more with O0 safe ptxas settings.\n")
+            f_dated.write("[Warning] ptxas still failed. Retrying once more with O0 safe ptxas settings.\n")
             if safe_retry_clean:
                 build_dir = CUDA_DIR / "build"
                 if build_dir.exists():
@@ -626,8 +700,8 @@ def command_runbuild() -> int:
             _write_last_build_env(actual_env)
             phase = actual_env.get("_build_phase", "primary")
             if phase != "primary":
-                print("[Warning] Build succeeded via safe_retry; config.txt still requests the faster primary profile.")
-                print("[Warning] The stamp will record the actual safe profile, so the next normal build will try the faster profile again.")
+                print(f"[Warning] Build succeeded via {phase}; config.txt may still request the faster primary profile.")
+                print("[Warning] This patch defaults to partitioned ptxas input; keep CUDA_PTXAS_PARTITION_BUILD=1 if ptxas was unstable.")
         print(f"[Info] Build command succeeded. Log saved: {last_log}")
     else:
         if LAST_BUILD_ENV_PATH.exists():

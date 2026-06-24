@@ -316,7 +316,8 @@ RENDER_INTERP_SECONDS = max(0.0, cfg_float("RENDER_INTERP_SECONDS", max(float(DT
 RENDER_WHILE_PHYSICS_PENDING = cfg_bool("RENDER_WHILE_PHYSICS_PENDING", False)
 METRICS_INTERVAL = cfg_float("METRICS_INTERVAL", 2.0)
 HEADLESS_MODE = cfg_bool("HEADLESS_MODE", cfg_bool("SIM_HEADLESS", False))
-TURBO_BATCH_STEPS = max(1, cfg_int("TURBO_BATCH_STEPS", max(PHYSICS_MAX_BATCH_STEPS, 2048 if HEADLESS_MODE else PHYSICS_MAX_BATCH_STEPS)))
+TURBO_BATCH_STEPS = max(1, cfg_int("TURBO_BATCH_STEPS", max(PHYSICS_MAX_BATCH_STEPS,
+        2048 if HEADLESS_MODE else PHYSICS_MAX_BATCH_STEPS)))
 TURBO_STATUS_INTERVAL_WALL = max(0.0, cfg_float("TURBO_STATUS_INTERVAL_WALL", 2.0))
 TURBO_METRICS_INTERVAL_SIM = max(0.0, cfg_float("TURBO_METRICS_INTERVAL_SIM", 3600.0))
 TURBO_SYNC_EVERY_BATCH = cfg_bool("TURBO_SYNC_EVERY_BATCH", False)
@@ -335,9 +336,12 @@ SECTION_LENGTH_M = cfg_float("SECTION_LENGTH_M", 250.0)
 SECTION_STATS_INTERVAL = max(1.0e-6, cfg_float("SECTION_STATS_INTERVAL", cfg_float("SECTION_METRICS_INTERVAL", 60.0)))
 SECTION_OUTPUT_DIR = Path(cfg("SECTION_OUTPUT_DIR", "data"))
 SECTION_STATS_CSV = cfg("SECTION_STATS_CSV", cfg("SECTION_TIME_BINS_CSV_PATH", "data/section_time_bins_{section_length_label}.csv"))
-SECTION_SUMMARY_CSV = cfg("SECTION_SUMMARY_CSV", cfg("SECTION_SCENARIO_CSV_PATH", "data/scenario_summary_{section_length_label}.csv"))
-SECTION_BASE_GPKG_PATH = cfg("SECTION_BASE_GPKG_PATH", cfg("SECTION_ROAD_GPKG_PATH", "data/road_sections_{section_length_label}.gpkg"))
-SECTION_FINAL_GPKG_PATH = cfg("SECTION_FINAL_GPKG_PATH", cfg("SECTION_RESULTS_GPKG_PATH", "data/section_results_{section_length_label}.gpkg"))
+SECTION_SUMMARY_CSV = cfg("SECTION_SUMMARY_CSV", cfg("SECTION_SCENARIO_CSV_PATH",
+        "data/scenario_summary_{section_length_label}.csv"))
+SECTION_BASE_GPKG_PATH = cfg("SECTION_BASE_GPKG_PATH", cfg("SECTION_ROAD_GPKG_PATH",
+        "data/road_sections_{section_length_label}.gpkg"))
+SECTION_FINAL_GPKG_PATH = cfg("SECTION_FINAL_GPKG_PATH", cfg("SECTION_RESULTS_GPKG_PATH",
+        "data/section_results_{section_length_label}.gpkg"))
 SECTION_BASE_LAYER = cfg("SECTION_BASE_LAYER", "road_sections")
 SECTION_RESULTS_LAYER = cfg("SECTION_RESULTS_LAYER", "section_summary")
 SECTION_TIME_LAYER = cfg("SECTION_TIME_LAYER", "section_time_bins")
@@ -561,11 +565,14 @@ def parse_spawn_type(v) -> int:
     s = s.replace("-", "_").replace(" ", "_")
     if s in ["", "none", "null", "nan"]:
         return SPWNTYPE_BOTH
-    if s in ["o", "origin", "orig", "start", "source", "src", "from", "departure", "depart", "spawn", "only_origin", "origin_only", "출발", "출발지", "시작", "시작점"]:
+    if s in ["o", "origin", "orig", "start", "source", "src", "from", "departure", "depart", "spawn", "only_origin", "origin_only",
+            "출발", "출발지", "시작", "시작점"]:
         return SPWNTYPE_ORIGIN
-    if s in ["d", "dest", "destination", "arrival", "arrive", "sink", "to", "end", "target", "only_dest", "dest_only", "destination_only", "도착", "도착지", "종점", "목적지"]:
+    if s in ["d", "dest", "destination", "arrival", "arrive", "sink", "to", "end", "target", "only_dest", "dest_only",
+            "destination_only", "도착", "도착지", "종점", "목적지"]:
         return SPWNTYPE_DESTINATION
-    if s in ["b", "both", "all", "any", "od", "origin_dest", "origin_destination", "bi", "bidirectional", "양쪽", "양방향", "둘다", "모두", "출발도착"]:
+    if s in ["b", "both", "all", "any", "od", "origin_dest", "origin_destination", "bi", "bidirectional", "양쪽", "양방향", "둘다", "모두",
+            "출발도착"]:
         return SPWNTYPE_BOTH
     return SPWNTYPE_BOTH
 def spawn_type_label(bits: int) -> str:
@@ -763,11 +770,17 @@ def section_length_label_value(section_length_m=None):
 def expand_output_path(path_like, section_length_m=None):
     label = section_length_label_value(section_length_m)
     try:
+        raw_section_length_m = section_length_m if section_length_m is not None else SECTION_LENGTH_M
+        section_length_text = (
+            "network"
+            if float(raw_section_length_m) < 0.0
+            else f"{float(raw_section_length_m):.3f}".rstrip("0").rstrip(".")
+        )
         value = str(path_like).format(
             section_length_label=label,
             section_length=label,
             section_len=label,
-            section_length_m=("network" if float(section_length_m if section_length_m is not None else SECTION_LENGTH_M) < 0.0 else f"{float(section_length_m if section_length_m is not None else SECTION_LENGTH_M):.3f}".rstrip("0").rstrip(".")),
+            section_length_m=section_length_text,
             scenario_id=str(SCENARIO_ID),
         )
     except Exception:
@@ -1222,20 +1235,25 @@ class SectionStatsRecorder:
             row = {
                 "scenario_id": str(SCENARIO_ID), "seed": int(SCENARIO_SEED), "step": int(step),
                 "time_bin_start": round(float(t0), 6), "time_bin_end": round(float(current_time), 6),
-                "section_id": int(sid), "link_id": int(self.info["section_link_id"][sid]), "link_seg": int(self.info["section_link_seg"][sid]),
-                "start_m": clean_number(self.info["section_start_m"][sid], 3), "end_m": clean_number(self.info["section_end_m"][sid], 3),
+                "section_id": int(sid), "link_id": int(self.info["section_link_id"][sid]),
+                        "link_seg": int(self.info["section_link_seg"][sid]),
+                "start_m": clean_number(self.info["section_start_m"][sid],
+                        3), "end_m": clean_number(self.info["section_end_m"][sid], 3),
                 "length_m": clean_number(length_m[sid], 3), "lane_count": clean_number(lane_count_arr[sid], 3),
                 "vehicle_count": int(count[sid]), "flow_count": int(flow_count[sid]), "flow_vph": clean_number(flow_vph[sid]),
                 "density_veh_per_km": clean_number(density[sid]), "density_veh_per_lane_km": clean_number(density_lane[sid]),
-                "mean_speed_kmh": clean_number(mean_speed[sid] * 3.6), "harmonic_speed_kmh": clean_number(harmonic_speed[sid] * 3.6),
+                "mean_speed_kmh": clean_number(mean_speed[sid] * 3.6),
+                        "harmonic_speed_kmh": clean_number(harmonic_speed[sid] * 3.6),
                 "speed_std_kmh": clean_number(speed_std[sid] * 3.6), "mean_accel_mps2": clean_number(mean_accel[sid]),
                 "accel_std_mps2": clean_number(accel_std[sid]), "occupancy": clean_number(occupancy[sid]),
                 "queue_vehicle_count": int(queue_count[sid]), "queue_length_m": clean_number(queue_length[sid]),
                 "delay_vehicle_seconds": clean_number(delay[sid]), "av_count": int(av_count[sid]), "hdv_count": int(hdv_count[sid]),
                 "local_av_penetration": clean_number(av_pen[sid]), "mean_speed_av_kmh": clean_number(mean_speed_av[sid] * 3.6),
-                "mean_speed_hdv_kmh": clean_number(mean_speed_hdv[sid] * 3.6), "delta_speed_av_hdv_kmh": clean_number(delta_av_hdv[sid] * 3.6),
+                "mean_speed_hdv_kmh": clean_number(mean_speed_hdv[sid] * 3.6),
+                        "delta_speed_av_hdv_kmh": clean_number(delta_av_hdv[sid] * 3.6),
                 "congestion": int(congestion[sid]), "congestion_intensity": clean_number(intensity[sid]),
-                "congestion_area_m_s": clean_number(congestion_area[sid]), "congestion_duration_s": clean_number(congestion_duration[sid]),
+                "congestion_area_m_s": clean_number(congestion_area[sid]),
+                        "congestion_duration_s": clean_number(congestion_duration[sid]),
                 "hard_brake_count": int(hard_brake_count[sid]), "stop_count": int(stop_count[sid]),
                 "stop_go_events": int(stop_go_events[sid]), "go_stop_events": int(go_stop_events[sid]),
             }
@@ -1336,7 +1354,8 @@ class SectionStatsRecorder:
         if denom <= 1.0e-9:
             width_metric = self.queue_max.copy()
             denom = float(np.nanmax(width_metric)) if len(width_metric) else 0.0
-        result["vis_width"] = float(SECTION_VIS_WIDTH_BASE) * (1.0 + float(SECTION_VIS_WIDTH_ALPHA) * width_metric / max(denom, 1.0e-9))
+        result["vis_width"] = float(SECTION_VIS_WIDTH_BASE) * (1.0 + float(SECTION_VIS_WIDTH_ALPHA) * width_metric / max(denom,
+                1.0e-9))
         result["vis_color"] = result["cong_int"]
         final_path = replace_output_file(self.final_gpkg_path, label="SectionResultGPKG", backup=SECTION_BACKUP_OUTPUTS)
         try:
@@ -1535,10 +1554,12 @@ def load_spawn_records(path, layer=None, label="Spawn"):
         "both": sum(1 for r in records if int(r.get("spwn_type", SPWNTYPE_BOTH)) == SPWNTYPE_BOTH),
     }
     print(f"[{label}] loaded:", len(records), "layer:", used)
-    print(f"[{label}] SPWNTYPE counts:", role_counts, "profile_rows:", prof_count, "profile_fields:", [str(c) for c, _ in profile_cols])
+    print(f"[{label}] SPWNTYPE counts:", role_counts, "profile_rows:", prof_count, "profile_fields:", [str(c) for c,
+            _ in profile_cols])
     return records, gdf.crs
 def build_graph_and_lanes(gpkg_path, layer=None, tol=1.0):
-    gdf, used_layer = read_layer(gpkg_path, layer=layer, required=True, prefer_geometry=["LineString", "MultiLineString"], label="Road")
+    gdf, used_layer = read_layer(gpkg_path, layer=layer, required=True, prefer_geometry=["LineString", "MultiLineString"],
+            label="Road")
     print("[Road] using layer:", used_layer)
     print("[Road] oneway mode:", _oneway_mode_value(), "parse_osm_other_tags:", ROAD_PARSE_OSM_OTHER_TAGS)
     node_map = {}
@@ -2060,7 +2081,8 @@ def apply_lane_drop_taper_geometry(nodes, links, lanes, link_to_lanes):
             changed_links.add(int(link_id))
     for link_id, (_, x, y) in incoming_render_candidates.items():
         _set_link_render_endpoint(links[int(link_id)], x, y, at_end=True)
-        _set_link_render_width(links[int(link_id)], incoming_width_candidates.get(int(link_id), links[int(link_id)].get("width", 1.0)), at_end=True)
+        _set_link_render_width(links[int(link_id)], incoming_width_candidates.get(int(link_id), links[int(link_id)].get("width",
+                1.0)), at_end=True)
         changed_links.add(int(link_id))
     for link_id in sorted(changed_links):
         group = link_to_lanes.get(int(link_id), [])
@@ -2235,7 +2257,8 @@ def build_static_network(nodes, links, lanes):
             old = G[u][v]
             replace = edge_data["weight"] < float(old.get("weight", 1.0e30))
             if abs(edge_data["weight"] - float(old.get("weight", 1.0e30))) <= 1.0e-6:
-                replace = edge_data["lane_count"] > int(old.get("lane_count", 1)) or edge_data["width"] > float(old.get("width", 0.0))
+                replace = edge_data["lane_count"] > int(old.get("lane_count", 1)) or edge_data["width"] > float(old.get("width",
+                        0.0))
             if replace:
                 G[u][v].update(edge_data)
         else:
@@ -2751,7 +2774,8 @@ def receiving_lane_after_turn(group, previous_turn, fallback_turn=TURN_STRAIGHT,
         if fallback_turn == TURN_RIGHT:
             return int(group[0]["lane_id"])
     return lane_choice_for_turn(group, TURN_STRAIGHT, key=key)
-def receiving_lane_after_turn_balanced(group, previous_turn, previous_group=None, previous_lane_id=-1, fallback_turn=TURN_STRAIGHT, key=0):
+def receiving_lane_after_turn_balanced(group, previous_turn, previous_group=None, previous_lane_id=-1, fallback_turn=TURN_STRAIGHT,
+        key=0):
     """Preserve relative lane on straight arterials; use edge lanes for upcoming exits; randomize through lanes."""
     if not group:
         return -1
@@ -2822,7 +2846,8 @@ def lane_choices_for_spawn_start(group, turn, link_length):
     elif int(fallback) >= 0 and int(fallback) not in candidates:
         candidates.append(int(fallback))
     return [int(x) for x in candidates]
-def _make_routes_worker(worker_id, target_routes, max_tries, seed, G, nodes, links, link_to_lanes, origin_nodes, destination_nodes, min_trip_distance):
+def _make_routes_worker(worker_id, target_routes, max_tries, seed, G, nodes, links, link_to_lanes, origin_nodes, destination_nodes,
+        min_trip_distance):
     rng = np.random.default_rng(int(seed) + int(worker_id) * 100003)
     origin_nodes = np.array(sorted(int(n) for n in origin_nodes if int(n) in G.nodes), dtype=np.int32)
     destination_nodes = np.array(sorted(int(n) for n in destination_nodes if int(n) in G.nodes), dtype=np.int32)
@@ -3360,7 +3385,8 @@ def expand_routes_for_multilane_spawn(route_offsets, route_lanes, route_turns, l
             print("[Routes] multi-lane spawn expansion parallel failed; fallback serial:", e)
             results = []
     if not results:
-        results = [_expand_multilane_spawn_chunk(0, route_count, route_offsets, route_lanes, route_turns, link_to_lanes, lanes, links)]
+        results = [_expand_multilane_spawn_chunk(0, route_count, route_offsets, route_lanes, route_turns, link_to_lanes, lanes,
+                links)]
     expanded_lane_lists = []
     expanded_turn_lists = []
     clone_count = 0
@@ -3433,7 +3459,8 @@ def make_routes_parallel(G, nodes, links, link_to_lanes, origin_nodes, destinati
         remaining = int(num_routes) - int(total_made)
         print("[Routes] fallback single remaining:", remaining)
         try:
-            extra_offsets, extra_lanes, extra_turns = make_routes_single(G, nodes, links, link_to_lanes, origin_nodes, destination_nodes, remaining)
+            extra_offsets, extra_lanes, extra_turns = make_routes_single(G, nodes, links, link_to_lanes, origin_nodes,
+                    destination_nodes, remaining)
             for rid in range(len(extra_offsets) - 1):
                 off0 = int(extra_offsets[rid])
                 off1 = int(extra_offsets[rid + 1])
@@ -3450,7 +3477,8 @@ def make_routes_parallel(G, nodes, links, link_to_lanes, origin_nodes, destinati
     print("[Routes] final count:", len(route_offsets) - 1)
     print("[Routes] lane elements:", len(route_lanes))
     return route_offsets, route_lanes, route_turns
-def make_route_cache_key(gpkg_path, network_crs, num_routes, min_trip_distance, nodes, links, lanes, origin_nodes=None, destination_nodes=None):
+def make_route_cache_key(gpkg_path, network_crs, num_routes, min_trip_distance, nodes, links, lanes, origin_nodes=None,
+        destination_nodes=None):
     import hashlib
     h = hashlib.sha1()
     h.update(str(ROUTE_CACHE_VERSION).encode("utf-8"))
@@ -3562,8 +3590,10 @@ def make_route_cache_key(gpkg_path, network_crs, num_routes, min_trip_distance, 
     }
     h.update(json.dumps(route_identity, sort_keys=True, ensure_ascii=True).encode("utf-8"))
     return h.hexdigest()[:20]
-def get_route_cache_path(gpkg_path, network_crs, num_routes, min_trip_distance, nodes, links, lanes, origin_nodes=None, destination_nodes=None):
-    key = make_route_cache_key(gpkg_path, network_crs, num_routes, min_trip_distance, nodes, links, lanes, origin_nodes=origin_nodes, destination_nodes=destination_nodes)
+def get_route_cache_path(gpkg_path, network_crs, num_routes, min_trip_distance, nodes, links, lanes, origin_nodes=None,
+        destination_nodes=None):
+    key = make_route_cache_key(gpkg_path, network_crs, num_routes, min_trip_distance, nodes, links, lanes,
+            origin_nodes=origin_nodes, destination_nodes=destination_nodes)
     os.makedirs(ROUTE_CACHE_DIR, exist_ok=True)
     return os.path.join(ROUTE_CACHE_DIR, f"routes_{key}.npz")
 def load_route_cache(cache_path):
@@ -3600,13 +3630,15 @@ def save_route_cache(cache_path, route_offsets, route_lanes, route_turns, meta=N
     except Exception as e:
         print("[RouteCache] save failed:", e)
 def make_routes_cached(G, nodes, links, lanes, link_to_lanes, origin_nodes, destination_nodes, gpkg_path, network_crs, num_routes):
-    cache_path = get_route_cache_path(gpkg_path, network_crs, num_routes, MIN_TRIP_DISTANCE, nodes, links, lanes, origin_nodes=origin_nodes, destination_nodes=destination_nodes)
+    cache_path = get_route_cache_path(gpkg_path, network_crs, num_routes, MIN_TRIP_DISTANCE, nodes, links, lanes,
+            origin_nodes=origin_nodes, destination_nodes=destination_nodes)
     if not REFRESH_ROUTE_CACHE:
         cached = load_route_cache(cache_path)
         if cached is not None:
             return cached
     print("[RouteCache] base route cache miss or refresh requested.")
-    route_offsets, route_lanes, route_turns = make_routes_parallel(G, nodes, links, link_to_lanes, origin_nodes, destination_nodes, num_routes)
+    route_offsets, route_lanes, route_turns = make_routes_parallel(G, nodes, links, link_to_lanes, origin_nodes, destination_nodes,
+            num_routes)
     save_route_cache(cache_path, route_offsets, route_lanes, route_turns, meta={
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "version": ROUTE_CACHE_VERSION,
@@ -3622,14 +3654,16 @@ def make_routes_cached(G, nodes, links, lanes, link_to_lanes, origin_nodes, dest
         "destination_nodes": len(destination_nodes),
     })
     return route_offsets, route_lanes, route_turns
-def get_ready_route_cache_path(gpkg_path, network_crs, num_routes, min_trip_distance, nodes, links, lanes, origin_nodes=None, destination_nodes=None):
+def get_ready_route_cache_path(gpkg_path, network_crs, num_routes, min_trip_distance, nodes, links, lanes, origin_nodes=None,
+        destination_nodes=None):
     key = make_route_cache_key(
         gpkg_path, network_crs, num_routes, min_trip_distance, nodes, links, lanes,
         origin_nodes=origin_nodes, destination_nodes=destination_nodes,
     )
     os.makedirs(ROUTE_CACHE_DIR, exist_ok=True)
     return os.path.join(ROUTE_CACHE_DIR, f"routes_ready_{key}.npz")
-def make_routes_ready_cached(G, nodes, links, lanes, link_to_lanes, origin_nodes, destination_nodes, gpkg_path, network_crs, num_routes):
+def make_routes_ready_cached(G, nodes, links, lanes, link_to_lanes, origin_nodes, destination_nodes, gpkg_path, network_crs,
+        num_routes):
     """Return CUDA-ready route arrays, caching expansion and lane-safety repair.
     EN: The base route cache stores only the requested NUM_ROUTES paths.  With
     multi-lane spawn balancing, those paths are then expanded into additional
@@ -4875,7 +4909,8 @@ def same_lane_group_py(lanes, a, b):
     la = lanes[int(a)]
     lb = lanes[int(b)]
     return int(la.get("from_node", -1)) == int(lb.get("from_node", -2)) and int(la.get("to_node", -3)) == int(lb.get("to_node", -4))
-def route_lane_repair_candidate(current_lane, desired_next_lane, link_to_lanes, lanes, previous_turn=TURN_STRAIGHT, fallback_turn=TURN_STRAIGHT, key=0):
+def route_lane_repair_candidate(current_lane, desired_next_lane, link_to_lanes, lanes, previous_turn=TURN_STRAIGHT,
+        fallback_turn=TURN_STRAIGHT, key=0):
     """Return a connected receiving lane for a route step, or -1 if impossible.
     EN: This is a CPU-side guard against a corrupt/stale route cache assigning a
     lane that does not physically begin at the current lane's end node.  It first
@@ -5351,7 +5386,8 @@ def main():
     num_signals_render = len(signal_records)
     print("[Signals] cuda:", num_signals_cuda, "render:", num_signals_render)
     min_x, min_y, max_x, max_y, scale, padding = compute_map_transform(links, SCREEN_W, SCREEN_H)
-    world_min_x, world_min_y, world_cell_size, world_grid_w, world_grid_h = compute_world_grid(min_x, min_y, max_x, max_y, WORLD_CELL_SIZE)
+    world_min_x, world_min_y, world_cell_size, world_grid_w, world_grid_h = compute_world_grid(min_x, min_y, max_x, max_y,
+            WORLD_CELL_SIZE)
     print("[WorldGrid] min:", world_min_x, world_min_y)
     print("[WorldGrid] cell:", world_cell_size)
     print("[WorldGrid] size:", world_grid_w, world_grid_h)
@@ -5372,13 +5408,30 @@ def main():
         print("[Accel] mode=hybrid | CUDA: per-tick vehicles/perception/decision/motion/collision | CPU parallel: routes/static repair/metrics")
     else:
         print("[Accel] mode=cuda | CUDA-focused per-tick simulation; CPU preprocessing follows ROUTE_PARALLEL settings")
-    print("[Render] vehicle vertices:", RENDER_VERTS_PER_VEHICLE, "wheels:", bool(RENDER_WHEELS), "interval:", RENDER_INTERVAL, "textured:", bool(USE_TEXTURED_CARS), "interpolation:", bool(RENDER_INTERPOLATION), "interp_seconds:", float(RENDER_INTERP_SECONDS))
-    print("[Scheduler] physics_async:", bool(PHYSICS_ASYNC_SCHEDULER), "physics_steps_per_frame:", int(PHYSICS_STEPS_PER_FRAME), "max_batch_steps:", int(PHYSICS_MAX_BATCH_STEPS), "frame_budget_ms:", float(PHYSICS_FRAME_BUDGET_MS))
+    print("[Render] vehicle vertices:", RENDER_VERTS_PER_VEHICLE, "wheels:", bool(RENDER_WHEELS), "interval:", RENDER_INTERVAL,
+            "textured:", bool(USE_TEXTURED_CARS), "interpolation:", bool(RENDER_INTERPOLATION), "interp_seconds:",
+                    float(RENDER_INTERP_SECONDS))
+    print("[Scheduler] physics_async:", bool(PHYSICS_ASYNC_SCHEDULER), "physics_steps_per_frame:", int(PHYSICS_STEPS_PER_FRAME),
+            "max_batch_steps:", int(PHYSICS_MAX_BATCH_STEPS), "frame_budget_ms:", float(PHYSICS_FRAME_BUDGET_MS))
     print("[Metrics] size:", METRICS_SIZE)
-    print("[PriorityGate/Clearance] world_cell_size:", WORLD_CELL_SIZE, "fps_limit:", FPS_LIMIT, "metrics_interval:", METRICS_INTERVAL, "lane_markings:", DRAW_LANE_MARKINGS, "centerlines:", DRAW_LANE_CENTERLINES, "edges:", DRAW_LANE_EDGES, "line_width:", LANE_MARKING_WIDTH, "group_by_source:", LANE_MARKING_GROUP_BY_SOURCE, "vehicle_hover:", SHOW_VEHICLE_HOVER)
-    print("[RuntimeOpt] active_list:", bool(CUDA_ACTIVE_LIST_ENABLED), "active_blocks:", int(CUDA_ACTIVE_KERNEL_BLOCKS), "lazy_grid:", bool(CUDA_LAZY_GRID_ENABLED), "lane_hash_grid:", bool(CUDA_LANE_HASH_GRID_ENABLED), "lane_cells_per_lane:", int(CELL_COUNT_PER_LANE))
-    print("[PhysicsOpt] fast_physics:", bool(CUDA_FAST_PHYSICS_MODE), "persistent_start_grid:", bool(CUDA_PERSISTENT_START_GRID), "contact_passes:", int(CUDA_CONTACT_RESOLVE_PASSES), "world_cell_radius:", int(CUDA_WORLD_MAX_CELL_RADIUS), "route_repair_interval:", int(CUDA_ROUTE_REPAIR_INTERVAL), "spawn_overlap_interval:", int(CUDA_SPAWN_OVERLAP_INTERVAL), "priority_interval:", int(CUDA_PRIORITY_INTERVAL), "local_avoidance_interval:", int(CUDA_LOCAL_AVOIDANCE_INTERVAL), "front_clear_interval:", int(CUDA_FRONT_CLEAR_INTERVAL), "contact_interval:", int(CUDA_CONTACT_INTERVAL), "collision_interval:", int(CUDA_COLLISION_INTERVAL), "stats_interval:", int(CUDA_STATS_INTERVAL), "expensive_safety_metrics:", bool(CUDA_EXPENSIVE_SAFETY_METRICS_ENABLED), "safety_metric_interval:", int(CUDA_SAFETY_METRICS_INTERVAL), "metrics_mode:", int(CUDA_METRICS_MODE))
-    print("[SpeedFloor] desired_cruise_enabled:", bool(SPEED_MIN_CRUISE_ENABLED), "min_cruise_kmh:", float(SPEED_MIN_CRUISE_KMH), "hard_freeflow:", bool(SPEED_MIN_CRUISE_HARD_FREEFLOW), "safety_limited:", True)
+    print("[PriorityGate/Clearance] world_cell_size:", WORLD_CELL_SIZE, "fps_limit:", FPS_LIMIT, "metrics_interval:",
+            METRICS_INTERVAL, "lane_markings:", DRAW_LANE_MARKINGS, "centerlines:", DRAW_LANE_CENTERLINES, "edges:",
+                    DRAW_LANE_EDGES, "line_width:", LANE_MARKING_WIDTH, "group_by_source:", LANE_MARKING_GROUP_BY_SOURCE,
+                    "vehicle_hover:", SHOW_VEHICLE_HOVER)
+    print("[RuntimeOpt] active_list:", bool(CUDA_ACTIVE_LIST_ENABLED), "active_blocks:", int(CUDA_ACTIVE_KERNEL_BLOCKS),
+            "lazy_grid:", bool(CUDA_LAZY_GRID_ENABLED), "lane_hash_grid:", bool(CUDA_LANE_HASH_GRID_ENABLED),
+                    "lane_cells_per_lane:", int(CELL_COUNT_PER_LANE))
+    print("[PhysicsOpt] fast_physics:", bool(CUDA_FAST_PHYSICS_MODE), "persistent_start_grid:", bool(CUDA_PERSISTENT_START_GRID),
+            "contact_passes:", int(CUDA_CONTACT_RESOLVE_PASSES), "world_cell_radius:", int(CUDA_WORLD_MAX_CELL_RADIUS),
+                    "route_repair_interval:", int(CUDA_ROUTE_REPAIR_INTERVAL), "spawn_overlap_interval:",
+                    int(CUDA_SPAWN_OVERLAP_INTERVAL), "priority_interval:", int(CUDA_PRIORITY_INTERVAL),
+                    "local_avoidance_interval:", int(CUDA_LOCAL_AVOIDANCE_INTERVAL), "front_clear_interval:",
+                    int(CUDA_FRONT_CLEAR_INTERVAL), "contact_interval:", int(CUDA_CONTACT_INTERVAL), "collision_interval:",
+                    int(CUDA_COLLISION_INTERVAL), "stats_interval:", int(CUDA_STATS_INTERVAL), "expensive_safety_metrics:",
+                    bool(CUDA_EXPENSIVE_SAFETY_METRICS_ENABLED), "safety_metric_interval:", int(CUDA_SAFETY_METRICS_INTERVAL),
+                    "metrics_mode:", int(CUDA_METRICS_MODE))
+    print("[SpeedFloor] desired_cruise_enabled:", bool(SPEED_MIN_CRUISE_ENABLED), "min_cruise_kmh:", float(SPEED_MIN_CRUISE_KMH),
+            "hard_freeflow:", bool(SPEED_MIN_CRUISE_HARD_FREEFLOW), "safety_limited:", True)
     if not HEADLESS_MODE:
         import pygame
         from OpenGL.GL import (
@@ -5506,14 +5559,17 @@ def main():
     else:
         clock = None
     writer = AsyncMetricsWriter(METRICS_PATH)
-    section_collector = SectionStatsRecorder(section_info, MAX_AGENTS, enabled=SECTION_STATS_ENABLED) if section_info is not None else None
+    section_collector = SectionStatsRecorder(section_info, MAX_AGENTS,
+            enabled=SECTION_STATS_ENABLED) if section_info is not None else None
     running = True
     exit_reason = "running"
     step = 0
     render_frame = 0
     vehicle_draw_count = 0
     last_metrics_time = time.perf_counter()
-    print("[Runtime] simulation_duration_seconds:", SIMULATION_DURATION_SECONDS, "section_stats:", bool(SECTION_STATS_ENABLED), "section_length_m:", SECTION_LENGTH_M, "section_interval:", SECTION_STATS_INTERVAL, "physics_steps_per_frame:", PHYSICS_STEPS_PER_FRAME)
+    print("[Runtime] simulation_duration_seconds:", SIMULATION_DURATION_SECONDS, "section_stats:", bool(SECTION_STATS_ENABLED),
+            "section_length_m:", SECTION_LENGTH_M, "section_interval:", SECTION_STATS_INTERVAL, "physics_steps_per_frame:",
+                    PHYSICS_STEPS_PER_FRAME)
     sim_step_batch = getattr(sim, "step_batch", None)
     if sim_step_batch is not None:
         print("[RuntimeOpt] batched_step: enabled | Python/C++ validation once per chunk")
@@ -5556,11 +5612,15 @@ def main():
                 veh["s"], veh["x"], veh["y"], veh["speed"], veh["accel"], veh["heading"], veh["steer_angle"],
                 veh["vehicle_length"], veh["vehicle_width"], veh["reaction_time"], veh["min_gap"],
                 veh["lane_id"], veh["active"], veh["driver_type"], veh["route_id"], veh["route_pos"],
-                veh["vehicle_state"], veh["connector_from_lane"], veh["connector_to_lane"], veh["connector_s"], veh["connector_length"],
-                veh["lane_change_active"], veh["lane_change_from_lane"], veh["lane_change_to_lane"], veh["lane_change_t"], veh["lane_change_duration"],
-                veh["aggressiveness"], veh["politeness"], veh["risk_tolerance"], veh["comfort_decel"], veh["desired_speed_factor"], veh["lc_cooldown"],
+                veh["vehicle_state"], veh["connector_from_lane"], veh["connector_to_lane"], veh["connector_s"],
+                        veh["connector_length"],
+                veh["lane_change_active"], veh["lane_change_from_lane"], veh["lane_change_to_lane"], veh["lane_change_t"],
+                        veh["lane_change_duration"],
+                veh["aggressiveness"], veh["politeness"], veh["risk_tolerance"], veh["comfort_decel"], veh["desired_speed_factor"],
+                        veh["lc_cooldown"],
                 veh["turn_signal"], veh["turn_signal_time"],
-                road["lane_length"], road["lane_start_x"], road["lane_start_y"], road["lane_end_x"], road["lane_end_y"], road["lane_speed_limit"],
+                road["lane_length"], road["lane_start_x"], road["lane_start_y"], road["lane_end_x"], road["lane_end_y"],
+                        road["lane_speed_limit"],
                 road["lane_start_node"], road["lane_end_node"], road["left_lane"], road["right_lane"], road["conflict_lanes"],
                 routes["offsets"], routes["lanes"], routes["turns"],
                 spawn_accumulator, demand_vps, demand_profile_vps, demand_profile_has,
@@ -5570,9 +5630,11 @@ def main():
                 lane_cell_head, lane_cell_next,
                 world_cell_head, world_cell_next,
                 float(world_min_x), float(world_min_y), float(world_cell_size), int(world_grid_w), int(world_grid_h),
-                signals["node"], signals["turn"], signals["cycle"], signals["green_start"], signals["green_end"], signals["yellow_start"], signals["yellow_end"],
+                signals["node"], signals["turn"], signals["cycle"], signals["green_start"], signals["green_end"],
+                        signals["yellow_start"], signals["yellow_end"],
                 rng_state, metrics,
-                start_time, float(DT), float(AV_PENETRATION), int(MAX_AGENTS), int(num_spawn_points), int(num_lanes), int(num_signals_cuda), int(start_step),
+                start_time, float(DT), float(AV_PENETRATION), int(MAX_AGENTS), int(num_spawn_points), int(num_lanes),
+                        int(num_signals_cuda), int(start_step),
                 intersection_lock, reservation_table, int(num_nodes),
                 int(batch_count),
             )
@@ -5584,11 +5646,15 @@ def main():
                 veh["s"], veh["x"], veh["y"], veh["speed"], veh["accel"], veh["heading"], veh["steer_angle"],
                 veh["vehicle_length"], veh["vehicle_width"], veh["reaction_time"], veh["min_gap"],
                 veh["lane_id"], veh["active"], veh["driver_type"], veh["route_id"], veh["route_pos"],
-                veh["vehicle_state"], veh["connector_from_lane"], veh["connector_to_lane"], veh["connector_s"], veh["connector_length"],
-                veh["lane_change_active"], veh["lane_change_from_lane"], veh["lane_change_to_lane"], veh["lane_change_t"], veh["lane_change_duration"],
-                veh["aggressiveness"], veh["politeness"], veh["risk_tolerance"], veh["comfort_decel"], veh["desired_speed_factor"], veh["lc_cooldown"],
+                veh["vehicle_state"], veh["connector_from_lane"], veh["connector_to_lane"], veh["connector_s"],
+                        veh["connector_length"],
+                veh["lane_change_active"], veh["lane_change_from_lane"], veh["lane_change_to_lane"], veh["lane_change_t"],
+                        veh["lane_change_duration"],
+                veh["aggressiveness"], veh["politeness"], veh["risk_tolerance"], veh["comfort_decel"], veh["desired_speed_factor"],
+                        veh["lc_cooldown"],
                 veh["turn_signal"], veh["turn_signal_time"],
-                road["lane_length"], road["lane_start_x"], road["lane_start_y"], road["lane_end_x"], road["lane_end_y"], road["lane_speed_limit"],
+                road["lane_length"], road["lane_start_x"], road["lane_start_y"], road["lane_end_x"], road["lane_end_y"],
+                        road["lane_speed_limit"],
                 road["lane_start_node"], road["lane_end_node"], road["left_lane"], road["right_lane"], road["conflict_lanes"],
                 routes["offsets"], routes["lanes"], routes["turns"],
                 spawn_accumulator, demand_vps, demand_profile_vps, demand_profile_has,
@@ -5598,9 +5664,11 @@ def main():
                 lane_cell_head, lane_cell_next,
                 world_cell_head, world_cell_next,
                 float(world_min_x), float(world_min_y), float(world_cell_size), int(world_grid_w), int(world_grid_h),
-                signals["node"], signals["turn"], signals["cycle"], signals["green_start"], signals["green_end"], signals["yellow_start"], signals["yellow_end"],
+                signals["node"], signals["turn"], signals["cycle"], signals["green_start"], signals["green_end"],
+                        signals["yellow_start"], signals["yellow_end"],
                 rng_state, metrics,
-                tick_time, float(DT), float(AV_PENETRATION), int(MAX_AGENTS), int(num_spawn_points), int(num_lanes), int(num_signals_cuda), int(tick_step),
+                tick_time, float(DT), float(AV_PENETRATION), int(MAX_AGENTS), int(num_spawn_points), int(num_lanes),
+                        int(num_signals_cuda), int(tick_step),
                 intersection_lock, reservation_table, int(num_nodes),
             )
             if DEBUG_SYNC:
@@ -5692,7 +5760,8 @@ def main():
                 final_metrics = {}
             try:
                 if section_collector is not None:
-                    section_collector.finalize(final_sim_time, final_step, veh, metrics_snapshot=final_metrics, exit_reason=exit_reason)
+                    section_collector.finalize(final_sim_time, final_step, veh, metrics_snapshot=final_metrics,
+                            exit_reason=exit_reason)
             except Exception as e:
                 print("[SectionStats] finalize failed:", e)
             try:
@@ -5896,8 +5965,10 @@ def main():
                         render_alpha = 1.0
                     render_alpha = max(0.0, min(1.0, float(render_alpha)))
                     sim_update_render_vbo_interpolated_full_draw(
-                        render_prev["x"], render_prev["y"], render_prev["heading"], render_prev["steer_angle"], render_prev["active"],
-                        render_curr["x"], render_curr["y"], render_curr["heading"], render_curr["steer_angle"], render_curr["active"],
+                        render_prev["x"], render_prev["y"], render_prev["heading"], render_prev["steer_angle"],
+                                render_prev["active"],
+                        render_curr["x"], render_curr["y"], render_curr["heading"], render_curr["steer_angle"],
+                                render_curr["active"],
                         render_curr["driver_type"], render_curr["vehicle_length"], render_curr["vehicle_width"],
                         render_curr["turn_signal"], render_curr["turn_signal_time"],
                         int(MAX_AGENTS), float(render_alpha),
@@ -5937,7 +6008,8 @@ def main():
                     f"freeGo={snap['priority_conflict_free_go']} pathBlk={snap['priority_path_block']} fsRel={snap['front_space_release']} "
                     f"occ={snap['intersection_occupied_hold']} pass={snap['force_pass_through']} qhold={snap['entry_queue_hold']:.1f} "
                     f"sigL/R={snap['indicator_left_on']}/{snap['indicator_right_on']} hAI={snap['human_ai_assertive_go']}/{snap['human_ai_courtesy_yield']} "
-                    f"rt={snap['right_turn_symmetric_path']}/{snap['right_turn_exit_gap_hold']} anti={snap['anti_collision_brake']} pen={snap['penetration_prevented']} "
+                    f"rt={snap['right_turn_symmetric_path']}/{snap['right_turn_exit_gap_hold']} "
+                    f"anti={snap['anti_collision_brake']} pen={snap['penetration_prevented']} "
                     f"near={snap['near_miss']} ttc={snap['ttc_critical']}/{snap['ttc_warning']} "
                     f"hb={snap['hard_brake']} col={snap['collision']} rej_sp={snap['rejected_spawn']} vps={total_vps_live:.1f}"
                 )
@@ -6035,7 +6107,8 @@ def main():
             final_metrics = {}
         try:
             if "section_collector" in locals() and section_collector is not None:
-                section_collector.finalize(final_sim_time, final_step, veh, metrics_snapshot=final_metrics, exit_reason=final_reason)
+                section_collector.finalize(final_sim_time, final_step, veh, metrics_snapshot=final_metrics,
+                        exit_reason=final_reason)
         except Exception as e:
             print("[SectionStats] finalize failed:", e)
         try:
