@@ -1,7 +1,7 @@
 """Build helper for the AVABM CUDA extension.
-The helper keeps normal runs free of runtime JIT builds: run.bat only verifies
-that a matching prebuilt .pyd exists.  Compiling remains an explicit build.bat
-step, with a safe retry path for ptxas crashes on large Ampere builds.
+The helper keeps normal runs free of runtime JIT builds: launch scripts verify
+that a matching prebuilt extension binary exists. Compiling remains an explicit
+launcher action, with a safe retry path for ptxas crashes on large builds.
 """
 from __future__ import annotations
 import hashlib
@@ -421,9 +421,18 @@ def build_fingerprint(cfg_override: Dict[str, str] | None = None) -> Dict[str, o
     }
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
     return {"digest": digest, "payload": payload}
+def _extension_globs(directory: Path) -> List[Path]:
+    patterns = ("avabm_cuda*.pyd", "avabm_cuda*.so")
+    paths: list[Path] = []
+    for pattern in patterns:
+        paths.extend(directory.glob(pattern))
+    return sorted(paths, key=lambda p: p.stat().st_mtime, reverse=True)
+
 def find_pyds() -> Tuple[List[Path], List[Path]]:
-    local = sorted(CUDA_DIR.glob("avabm_cuda*.pyd"), key=lambda p: p.stat().st_mtime, reverse=True)
-    root = sorted(ROOT_DIR.glob("avabm_cuda*.pyd"), key=lambda p: p.stat().st_mtime, reverse=True)
+    # Historical name kept for compatibility with the rest of this helper.
+    # Windows builds produce .pyd; Linux builds produce .so.
+    local = _extension_globs(CUDA_DIR)
+    root = _extension_globs(ROOT_DIR)
     return local, root
 def newest(paths: Iterable[Path]) -> Path | None:
     existing = [p for p in paths if p.exists()]
@@ -435,7 +444,7 @@ def remove_pyds() -> None:
         for path in group:
             try:
                 path.unlink()
-                print(f"[Info] Removed stale binary: {path}")
+                print(f"[Info] Removed stale extension binary: {path}")
             except FileNotFoundError:
                 pass
 def copy_latest_pyd() -> Path | None:
@@ -478,7 +487,7 @@ def command_check(run_mode: bool = False) -> int:
         print("[Info] CUDA extension is not up to date. Build is required." if run_mode else "[Info] CUDA build required.")
         print(f"[Info] Resolved arch: {fp['payload']['resolved_build_inputs']['torch_cuda_arch_list']}")
         if run_mode:
-            print("[Info] Runtime JIT build is disabled. Run avabm_cuda\\build.bat before run.bat.")
+            print("[Info] Runtime JIT build is disabled. Use run.bat build or ./run.sh build before starting the simulator.")
         return 2
     except Exception as exc:
         print(f"[Error] Build fingerprint check failed: {exc}")
@@ -830,7 +839,7 @@ def command_mark() -> int:
     try:
         pyd = copy_latest_pyd()
         if pyd is None:
-            print("[Error] Build finished, but no avabm_cuda*.pyd was found.")
+            print("[Error] Build finished, but no avabm_cuda extension binary (.pyd/.so) was found.")
             return 1
         actual_env = _read_last_build_env()
         phase = actual_env.get("_build_phase", "primary") if actual_env else "primary"
@@ -855,8 +864,8 @@ def command_status() -> int:
     local, root = find_pyds()
     print(f"[Info] Fingerprint: {fp['digest']}")
     print(f"[Info] Resolved inputs: {json.dumps(fp['payload']['resolved_build_inputs'], ensure_ascii=False)}")
-    print(f"[Info] Local pyds: {[p.name for p in local]}")
-    print(f"[Info] Root pyds: {[p.name for p in root]}")
+    print(f"[Info] Local extension binaries: {[p.name for p in local]}")
+    print(f"[Info] Root extension binaries: {[p.name for p in root]}")
     print(f"[Info] Stamp exists: {STAMP_PATH.exists()}")
     return 0
 def main(argv: List[str]) -> int:

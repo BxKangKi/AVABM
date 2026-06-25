@@ -76,6 +76,8 @@ if "--mega" in _cli_args or "--super-turbo" in _cli_args:
     _CLI_CONFIG_OVERRIDES["SIM_ENGINE"] = "ecs_abm_cuda"
     _CLI_CONFIG_OVERRIDES["HEADLESS_MODE"] = "1"
     _CLI_CONFIG_OVERRIDES["SIM_HEADLESS"] = "1"
+# "exact" is a legacy/config alias only: it still selects the ECS ABM CUDA engine.
+# There is no separate non-ECS exact simulation path in this build.
 if "--micro" in _cli_args or "--exact" in _cli_args or "--abm" in _cli_args or "--ecs" in _cli_args:
     _CLI_CONFIG_OVERRIDES["SIM_ENGINE"] = "ecs_abm_cuda"
 def cfg(name, default=None):
@@ -5166,8 +5168,8 @@ def main():
     except ImportError as exc:
         raise RuntimeError(
             "avabm_cuda compiled module is missing or incompatible. "
-            "Runtime JIT compilation is disabled; run avabm_cuda\\build.bat once, "
-            "then start the simulator with run.bat."
+            "Runtime JIT compilation is disabled; use run.bat build or ./run.sh build once, "
+            "then start the simulator with run.bat or ./run.sh."
         ) from exc
     if DT <= 0.0 or DT > 0.5:
         raise ValueError("DT must be in (0, 0.5] for ecs_abm_cuda")

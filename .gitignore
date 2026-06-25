@@ -6,6 +6,7 @@
 *.fatbin
 [Dd]ata
 *.pyd
+*.so
 *.qgz
 *.ipynb
 *.json
