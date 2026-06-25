@@ -5184,44 +5184,43 @@ class VehicleECSWorld:
             f"component_arrays={component_count} layout=SoA {layout}"
         )
 def _build_cpu_extension_inplace():
-    setup_path = PROJECT_DIR / "avabm_cpu" / "setup.py"
+    setup_path = PROJECT_DIR / "avabm" / "cpu" / "setup.py"
     if not setup_path.exists():
         raise RuntimeError(f"CPU backend setup.py not found: {setup_path}")
-    print("[CPU] avabm_cpu extension is missing; building C++ CPU backend in place...")
+    print("[CPU] avabm CPU extension is missing; building C++ CPU backend in place...")
     subprocess.check_call([sys.executable, str(setup_path), "build_ext", "--inplace"], cwd=str(setup_path.parent))
 
 def _import_cpu_backend():
+    import avabm
     try:
-        import avabm_cpu as sim
-        return sim
+        return avabm.import_cpu()
     except ImportError as first_exc:
         if not CPU_AUTO_BUILD:
             raise RuntimeError(
-                "avabm_cpu extension is missing. Build it with `(cd avabm_cpu && python setup.py build_ext --inplace)` "
+                "avabm CPU extension is missing. Build it with `(cd avabm/cpu && python setup.py build_ext --inplace)` "
                 "or set CPU_AUTO_BUILD=1."
             ) from first_exc
         _build_cpu_extension_inplace()
         try:
-            import importlib
-            return importlib.import_module("avabm_cpu")
+            return avabm.import_cpu()
         except ImportError as second_exc:
-            raise RuntimeError("Failed to import avabm_cpu after building the CPU extension.") from second_exc
+            raise RuntimeError("Failed to import avabm CPU extension after building it.") from second_exc
 
 def _resolve_sim_backend():
+    import avabm
     requested = str(SIM_BACKEND or "auto").strip().lower()
     strict_cuda = requested == "cuda_strict"
     if requested in {"cuda", "cuda_strict", "auto"}:
         if torch.cuda.is_available():
             try:
-                import avabm_cuda as sim
-                return sim, "cuda"
+                return avabm.import_cuda(), "cuda"
             except ImportError as exc:
                 if strict_cuda:
                     raise RuntimeError(
-                        "SIM_BACKEND=cuda_strict was requested, but avabm_cuda is missing or incompatible. "
-                        "Build it with run.bat build or ./run.sh build."
+                        "SIM_BACKEND=cuda_strict was requested, but the avabm CUDA extension is missing or incompatible. "
+                        "Build it with run.bat build-cuda / ./run.sh build-cuda, or run build to build both backends."
                     ) from exc
-                print("[Backend Warning] CUDA is available, but avabm_cuda could not be imported; falling back to CPU backend.")
+                print("[Backend Warning] CUDA is available, but avabm CUDA extension could not be imported; falling back to CPU backend.")
         else:
             if strict_cuda:
                 raise RuntimeError("SIM_BACKEND=cuda_strict was requested, but torch.cuda.is_available() is False.")

@@ -2,16 +2,17 @@
 
 GPU/CPU Autonomous Vehicle Agent-Based Model.
 
-This build exposes one ECS ABM simulation interface with two selectable runtime
-backends:
+This build exposes one Python package, `avabm`, with two selectable runtime
+backends built as internal extension modules:
 
 - `cuda`: the original CUDA/PyTorch extension backend.
 - `cpu`: a C++ `std::thread` parallel backend that reuses the CUDA ECS core
   kernels through a source-level CPU compatibility layer for CPU fallback and
   CPU-vs-GPU analysis runs.
 
-The legacy engine names `exact`, `micro`, `abm`, `vehicle`, and `cuda` remain
-compatibility aliases. Runtime backend selection is controlled by
+External code should import `avabm`, not separate `avabm_cpu` or `avabm_cuda`
+packages. The legacy engine names `exact`, `micro`, `abm`, `vehicle`, and
+`cuda` remain compatibility aliases. Runtime backend selection is controlled by
 `SIM_BACKEND`, not by a separate non-ECS engine path.
 
 ## Environment
@@ -89,12 +90,13 @@ The menu lets you choose:
 
 1. Turbo, a headless selected-backend batch run.
 2. Visual, an OpenGL/Pygame selected-backend window run.
-3. Build the selected backend from `SIM_BACKEND`.
-4. Build CUDA only, skipping when the extension is already up to date.
-5. Build CPU only.
-6. Clean rebuild CUDA.
-7. Hard clean plus rebuild CUDA.
-8. CUDA build status.
+3. Build the full `avabm` package, meaning CPU and CUDA extensions.
+4. Build only the backend selected by `SIM_BACKEND`.
+5. Build CUDA only, skipping when the extension is already up to date.
+6. Build CPU only.
+7. Clean rebuild CUDA.
+8. Hard clean plus rebuild CUDA.
+9. CUDA build status.
 
 Direct commands are also supported:
 
@@ -102,6 +104,7 @@ Direct commands are also supported:
 run.bat turbo
 run.bat visual
 run.bat build
+run.bat build-selected
 run.bat build-cuda
 run.bat build-cpu
 run.bat rebuild
@@ -127,6 +130,7 @@ Then use the same style of launcher commands:
 ./run.sh turbo
 ./run.sh visual
 ./run.sh build
+./run.sh build-selected
 ./run.sh build-cuda
 ./run.sh build-cpu
 ./run.sh rebuild
@@ -135,8 +139,8 @@ Then use the same style of launcher commands:
 ```
 
 `run.sh` activates the `CONDA_ENV` from `config.txt` when conda is available, but
-it can also run with the current shell Python. It supports Linux CUDA extension
-outputs (`avabm_cuda*.so`) as well as Windows outputs (`avabm_cuda*.pyd`).
+it can also run with the current shell Python. CUDA extension outputs are placed
+inside the single `avabm/` package directory on both Linux and Windows.
 
 ## Manual CPU backend build
 
@@ -144,13 +148,14 @@ The CPU extension is a source-level C++ port of the CUDA ECS core. It does not i
 builds quickly with the standard Python extension toolchain:
 
 ```bash
-cd avabm_cpu
+cd avabm/cpu
 python setup.py build_ext --inplace
 ```
 
-The extension exports the same simulation calls used by `main.py`:
-`step`, `step_batch`, `set_num_threads`, `get_num_threads`, and CUDA-compatible
-render no-op/count helpers.
+The extension is installed as `avabm.avabm_cpu_ext` inside the unified package.
+It exports the same simulation calls used by `main.py`: `step`, `step_batch`,
+`set_num_threads`, `get_num_threads`, and CUDA-compatible render no-op/count
+helpers.
 
 ## Configuration
 
@@ -163,6 +168,19 @@ Most build and runtime options live in `config.txt`. Useful runtime switches:
 - `HEADLESS_MODE=0` or `./run.sh visual` / `run.bat visual` for visual mode.
 - `SIM_ENGINE=ecs_abm_cuda` remains the canonical engine compatibility setting;
   `SIM_BACKEND` controls CUDA versus CPU.
+
+## Importing from Python
+
+```python
+import avabm
+
+sim, backend = avabm.select_backend("auto")
+sim.step(...)  # the selected CPU or CUDA extension API
+```
+
+For application code, use `import avabm`. The CPU and CUDA binaries remain
+separate compiled extension modules internally, but they live under the same
+package namespace.
 
 ## CUDA build stability notes
 

@@ -6,8 +6,9 @@ title AVABM Launcher
 cd /d "%~dp0"
 
 set "ROOT_DIR=%~dp0"
-set "CUDA_DIR=%~dp0avabm_cuda"
-set "CPU_DIR=%~dp0avabm_cpu"
+set "PACKAGE_DIR=%~dp0avabm"
+set "CUDA_DIR=%PACKAGE_DIR%\cuda"
+set "CPU_DIR=%PACKAGE_DIR%\cpu"
 set "CONFIG_FILE=%~dp0config.txt"
 set "BUILD_HELPER=%CUDA_DIR%\build_helper.py"
 set "ORIGINAL_ARGS=%*"
@@ -98,9 +99,11 @@ if /I "%~1"=="visual" goto :cmd_visual
 if /I "%~1"=="--visual" goto :cmd_visual
 if /I "%~1"=="gui" goto :cmd_visual
 if /I "%~1"=="--gui" goto :cmd_visual
-if /I "%~1"=="build" goto :cmd_build
-if /I "%~1"=="build-selected" goto :cmd_build
-if /I "%~1"=="selected-build" goto :cmd_build
+if /I "%~1"=="build" goto :cmd_build_all
+if /I "%~1"=="build-all" goto :cmd_build_all
+if /I "%~1"=="all-build" goto :cmd_build_all
+if /I "%~1"=="build-selected" goto :cmd_build_selected
+if /I "%~1"=="selected-build" goto :cmd_build_selected
 if /I "%~1"=="build-cuda" goto :cmd_build_cuda
 if /I "%~1"=="cuda-build" goto :cmd_build_cuda
 if /I "%~1"=="build-cpu" goto :cmd_build_cpu
@@ -125,29 +128,36 @@ echo AVABM Launcher
 echo =======================================================
 echo 1. Turbo   - headless selected-backend batch run
 echo 2. Visual  - OpenGL/Pygame selected-backend window run
-echo 3. Build selected backend from SIM_BACKEND
-echo 4. Build CUDA only ^(skip if up to date^)
-echo 5. Build CPU only
-echo 6. Clean rebuild CUDA
-echo 7. Hard clean + rebuild CUDA
-echo 8. CUDA build status
-echo 9. Exit
+echo 3. Build avabm package ^(CPU + CUDA^)
+echo 4. Build selected backend from SIM_BACKEND
+echo 5. Build CUDA only ^(skip if up to date^)
+echo 6. Build CPU only
+echo 7. Clean rebuild CUDA
+echo 8. Hard clean + rebuild CUDA
+echo 9. CUDA build status
+echo 10. Exit
 echo.
 set "CHOICE="
-set /p "CHOICE=Select [1-9]: "
+set /p "CHOICE=Select [1-10]: "
 if "%CHOICE%"=="1" goto :cmd_turbo
 if "%CHOICE%"=="2" goto :cmd_visual
-if "%CHOICE%"=="3" goto :cmd_build
-if "%CHOICE%"=="4" goto :cmd_build_cuda
-if "%CHOICE%"=="5" goto :cmd_build_cpu
-if "%CHOICE%"=="6" goto :cmd_rebuild
-if "%CHOICE%"=="7" goto :cmd_hardclean
-if "%CHOICE%"=="8" goto :cmd_status
-if "%CHOICE%"=="9" goto :finish
+if "%CHOICE%"=="3" goto :cmd_build_all
+if "%CHOICE%"=="4" goto :cmd_build_selected
+if "%CHOICE%"=="5" goto :cmd_build_cuda
+if "%CHOICE%"=="6" goto :cmd_build_cpu
+if "%CHOICE%"=="7" goto :cmd_rebuild
+if "%CHOICE%"=="8" goto :cmd_hardclean
+if "%CHOICE%"=="9" goto :cmd_status
+if "%CHOICE%"=="10" goto :finish
 if /I "%CHOICE%"=="t" goto :cmd_turbo
 if /I "%CHOICE%"=="turbo" goto :cmd_turbo
 if /I "%CHOICE%"=="v" goto :cmd_visual
 if /I "%CHOICE%"=="visual" goto :cmd_visual
+if /I "%CHOICE%"=="build" goto :cmd_build_all
+if /I "%CHOICE%"=="build-all" goto :cmd_build_all
+if /I "%CHOICE%"=="all" goto :cmd_build_all
+if /I "%CHOICE%"=="selected" goto :cmd_build_selected
+if /I "%CHOICE%"=="build-selected" goto :cmd_build_selected
 echo [Warning] Invalid selection.
 goto :menu
 
@@ -167,7 +177,12 @@ call :launch_mode visual
 set "AVABM_EXIT_CODE=%ERRORLEVEL%"
 goto :finish
 
-:cmd_build
+:cmd_build_all
+call :build_all
+set "AVABM_EXIT_CODE=%ERRORLEVEL%"
+goto :finish
+
+:cmd_build_selected
 call :ensure_backend_built
 set "AVABM_EXIT_CODE=%ERRORLEVEL%"
 goto :finish
@@ -270,21 +285,27 @@ if not exist "%CPU_DIR%\setup.py" (
     echo [Error] Missing CPU backend setup.py: %CPU_DIR%\setup.py
     exit /b 1
 )
-echo [Info] Building C++ CPU extension in place...
+echo [Info] Building avabm CPU extension in place...
 pushd "%CPU_DIR%"
 %PYTHON_COMMAND% setup.py build_ext --inplace
 set "AVABM_CPU_BUILD_RC=%ERRORLEVEL%"
 popd
 exit /b %AVABM_CPU_BUILD_RC%
 
+:build_all
+call :build_cpu
+if errorlevel 1 exit /b %ERRORLEVEL%
+call :build_cuda auto
+exit /b %ERRORLEVEL%
+
 :ensure_cpu_built
 call :activate_conda
 if errorlevel 1 exit /b 1
-%PYTHON_COMMAND% -c "import avabm_cpu" >nul 2>nul
+%PYTHON_COMMAND% -c "import avabm; avabm.import_cpu()" >nul 2>nul
 if not errorlevel 1 exit /b 0
 if /I not "%CPU_AUTO_BUILD%"=="1" (
     echo [Error] CPU backend is missing and CPU_AUTO_BUILD is disabled.
-    echo [Error] Build it with: cd avabm_cpu ^&^& %PYTHON_COMMAND% setup.py build_ext --inplace
+    echo [Error] Build it with: cd avabm\cpu ^&^& %PYTHON_COMMAND% setup.py build_ext --inplace
     exit /b 1
 )
 call :build_cpu

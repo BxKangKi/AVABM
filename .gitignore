@@ -11,5 +11,6 @@
 *.ipynb
 *.json
 *.zip
-/avabm_cuda/build
-/avabm_cuda/build_logs
+/avabm/cuda/build
+/avabm/cuda/build_logs
+/avabm/cpu/build

@@ -18,7 +18,8 @@ import tokenize
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 CUDA_DIR = Path(__file__).resolve().parent
-ROOT_DIR = CUDA_DIR.parent
+PACKAGE_DIR = CUDA_DIR.parent
+ROOT_DIR = PACKAGE_DIR.parent
 STAMP_PATH = CUDA_DIR / ".avabm_cuda_build_fingerprint.json"
 LAST_BUILD_ENV_PATH = CUDA_DIR / ".avabm_cuda_last_build_env.json"
 SOURCE_FILES = [
@@ -428,12 +429,13 @@ def _extension_globs(directory: Path) -> List[Path]:
         paths.extend(directory.glob(pattern))
     return sorted(paths, key=lambda p: p.stat().st_mtime, reverse=True)
 
-def find_pyds() -> Tuple[List[Path], List[Path]]:
+def find_pyds() -> Tuple[List[Path], ...]:
     # Historical name kept for compatibility with the rest of this helper.
     # Windows builds produce .pyd; Linux builds produce .so.
+    package = _extension_globs(PACKAGE_DIR)
     local = _extension_globs(CUDA_DIR)
     root = _extension_globs(ROOT_DIR)
-    return local, root
+    return package, local, root
 def newest(paths: Iterable[Path]) -> Path | None:
     existing = [p for p in paths if p.exists()]
     if not existing:
@@ -448,18 +450,17 @@ def remove_pyds() -> None:
             except FileNotFoundError:
                 pass
 def copy_latest_pyd() -> Path | None:
-    local, root = find_pyds()
-    src = newest([*local, *root])
+    groups = find_pyds()
+    src = newest([path for group in groups for path in group])
     if src is None:
         return None
-    for dst_dir in (CUDA_DIR, ROOT_DIR):
-        dst = dst_dir / src.name
-        if dst.resolve() == src.resolve():
-            continue
-        if (not dst.exists()) or src.stat().st_mtime >= dst.stat().st_mtime:
-            shutil.copy2(src, dst)
-            print(f"[Info] Synced binary: {src.name} -> {dst_dir}")
-    return src
+    dst_dir = PACKAGE_DIR
+    dst_dir.mkdir(exist_ok=True)
+    dst = dst_dir / src.name
+    if dst.resolve() != src.resolve() and ((not dst.exists()) or src.stat().st_mtime >= dst.stat().st_mtime):
+        shutil.copy2(src, dst)
+        print(f"[Info] Synced binary into package: {src.name} -> {dst_dir}")
+    return dst if dst.exists() else src
 def read_stamp() -> Dict[str, object] | None:
     try:
         return json.loads(STAMP_PATH.read_text(encoding="utf-8"))
@@ -472,8 +473,8 @@ def is_up_to_date() -> bool:
     stamp = read_stamp()
     if not stamp or stamp.get("digest") != fp["digest"]:
         return False
-    local, root = find_pyds()
-    if not local and not root:
+    groups = find_pyds()
+    if not any(groups):
         return False
     copy_latest_pyd()
     return True
@@ -778,8 +779,11 @@ def _external_cache_candidates() -> list[tuple[Path, str]]:
     if userprofile:
         _add_cache_dir(candidates, str(Path(userprofile) / ".nv" / "ComputeCache"), "user .nv ComputeCache")
     _add_cache_dir(candidates, str(ROOT_DIR / "__pycache__"), "project Python bytecode")
+    _add_cache_dir(candidates, str(PACKAGE_DIR / "__pycache__"), "package Python bytecode")
     _add_cache_dir(candidates, str(CUDA_DIR / "__pycache__"), "CUDA helper Python bytecode")
-    _add_cache_dir(candidates, str(CUDA_DIR / "avabm_cuda.egg-info"), "setuptools egg-info")
+    _add_cache_dir(candidates, str(ROOT_DIR / "avabm.egg-info"), "setuptools egg-info")
+    _add_cache_dir(candidates, str(CUDA_DIR / "avabm.egg-info"), "setuptools egg-info")
+    _add_cache_dir(candidates, str(CUDA_DIR / "avabm_cuda.egg-info"), "legacy setuptools egg-info")
     unique: list[tuple[Path, str]] = []
     seen: set[str] = set()
     for path, reason in candidates:
@@ -799,7 +803,7 @@ def _is_safe_cache_dir(path: Path) -> bool:
         full = str(path).lower()
     except OSError:
         return False
-    if name in {"torch_extensions", "computecache", "__pycache__", "avabm_cuda.egg-info"}:
+    if name in {"torch_extensions", "computecache", "__pycache__", "avabm.egg-info", "avabm_cuda.egg-info"}:
         return True
     if "torch_extensions" in full and "temp" in full:
         return True
@@ -861,11 +865,12 @@ def command_mark() -> int:
         return 1
 def command_status() -> int:
     fp = build_fingerprint()
-    local, root = find_pyds()
+    package, local, root = find_pyds()
     print(f"[Info] Fingerprint: {fp['digest']}")
     print(f"[Info] Resolved inputs: {json.dumps(fp['payload']['resolved_build_inputs'], ensure_ascii=False)}")
-    print(f"[Info] Local extension binaries: {[p.name for p in local]}")
-    print(f"[Info] Root extension binaries: {[p.name for p in root]}")
+    print(f"[Info] Package extension binaries: {[p.name for p in package]}")
+    print(f"[Info] CUDA source-dir extension binaries: {[p.name for p in local]}")
+    print(f"[Info] Root legacy extension binaries: {[p.name for p in root]}")
     print(f"[Info] Stamp exists: {STAMP_PATH.exists()}")
     return 0
 def main(argv: List[str]) -> int:

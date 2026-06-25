@@ -2,7 +2,9 @@ import os
 from pathlib import Path
 from setuptools import setup, Extension
 
-ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = Path(__file__).resolve().parent
+ROOT = SRC_DIR.parents[1]
+PACKAGE_DIR = ROOT / "avabm"
 CONFIG_PATH = ROOT / "config.txt"
 
 
@@ -116,12 +118,15 @@ else:
 print(f"[Info] AVABM CUDA-source-parity CPU extension: c++{std}, O{opt}, flags={' '.join(compile_args)}")
 
 setup(
-    name="avabm_cpu",
-    version="0.2.0",
+    name="avabm",
+    version="0.3.0",
+    packages=["avabm"],
+    package_dir={"avabm": str(PACKAGE_DIR)},
     ext_modules=[
         Extension(
-            "avabm_cpu_ext",
-            ["binding.cpp", "cpu_kernels.cpp"],
+            "avabm.avabm_cpu_ext",
+            [str(SRC_DIR / "binding.cpp"), str(SRC_DIR / "cpu_kernels.cpp")],
+            include_dirs=[str(SRC_DIR), str(SRC_DIR.parent / "cuda")],
             language="c++",
             extra_compile_args=compile_args,
             extra_link_args=link_args,

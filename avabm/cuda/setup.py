@@ -36,7 +36,9 @@ def _split_flags(value):
     if not value:
         return []
     return shlex.split(str(value), posix=(os.name != "nt"))
-ROOT_DIR = Path(__file__).resolve().parent.parent
+CUDA_SRC_DIR = Path(__file__).resolve().parent
+ROOT_DIR = CUDA_SRC_DIR.parents[1]
+PACKAGE_DIR = ROOT_DIR / "avabm"
 CONFIG = _read_config(ROOT_DIR / "config.txt")
 def _cfg(key, default=None):
     value = os.environ.get(key)
@@ -349,11 +351,11 @@ if ptxas_maxrregcount > 0:
 if ptxas_verbose:
     nvcc_flags.extend(["-Xptxas", "-v"])
 if ptxas_keep_files:
-    keep_dir = ROOT_DIR / "avabm_cuda" / "build_logs" / "nvcc_keep"
+    keep_dir = CUDA_SRC_DIR / "build_logs" / "nvcc_keep"
     keep_dir.mkdir(parents=True, exist_ok=True)
     nvcc_flags.extend(["--keep", "--keep-dir", str(keep_dir)])
 if nvcc_time_log:
-    nvcc_time_path = ROOT_DIR / "avabm_cuda" / "build_logs" / "nvcc_time.csv"
+    nvcc_time_path = CUDA_SRC_DIR / "build_logs" / "nvcc_time.csv"
     nvcc_time_path.parent.mkdir(exist_ok=True)
     nvcc_flags.extend(["--time", str(nvcc_time_path)])
 if fast_math:
@@ -492,21 +494,24 @@ class AVABMBuildExtension(_BaseBuildExtension):
                 self.compiler.initialize()
             self._strip_msvc_slow_defaults()
         super().build_extensions()
-cuda_sources = ["binding.cpp", "main.cu"]
+cuda_sources = [str(CUDA_SRC_DIR / "binding.cpp"), str(CUDA_SRC_DIR / "main.cu")]
 if ptxas_partition_build:
     cuda_sources = [
-        "binding.cpp",
-        "main_core_grid_spawn.cu",
-        "main_core_decision.cu",
-        "main_core_motion.cu",
-        "main_render_launch.cu",
+        str(CUDA_SRC_DIR / "binding.cpp"),
+        str(CUDA_SRC_DIR / "main_core_grid_spawn.cu"),
+        str(CUDA_SRC_DIR / "main_core_decision.cu"),
+        str(CUDA_SRC_DIR / "main_core_motion.cu"),
+        str(CUDA_SRC_DIR / "main_render_launch.cu"),
     ]
 print(f"[Info] AVABM CUDA sources: {', '.join(cuda_sources)}")
 setup(
-    name="avabm_cuda",
+    name="avabm",
+    version="0.3.0",
+    packages=["avabm"],
+    package_dir={"avabm": str(PACKAGE_DIR)},
     ext_modules=[
         CUDAExtension(
-            name="avabm_cuda",
+            name="avabm.avabm_cuda",
             sources=cuda_sources,
             define_macros=common_defines,
             extra_compile_args={

@@ -105,9 +105,9 @@ inline unsigned int atomicCAS(unsigned int* addr, unsigned int compare, unsigned
 
 #define AVABM_PART_SKIP_COMMON 1
 #include "main_common_cpu.hpp"
-#include "../avabm_cuda/main_core_grid_spawn.cu"
-#include "../avabm_cuda/main_core_decision.cu"
-#include "../avabm_cuda/main_core_motion.cu"
+#include "../cuda/main_core_grid_spawn.cu"
+#include "../cuda/main_core_decision.cu"
+#include "../cuda/main_core_motion.cu"
 
 namespace {
 
