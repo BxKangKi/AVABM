@@ -197,3 +197,49 @@ CUDA_PTXAS_SAFE_MODE=0
 CUDA_PTXAS_PARTITION_BUILD=1
 CUDA_SINGLE_TU_BUILD=0
 ```
+
+## Benchmark mode
+
+Use benchmark mode to run the same scenario once on the C++ CPU backend and once
+on the CUDA backend, then print and save a throughput comparison.
+
+```bash
+./run.sh benchmark
+```
+
+```bat
+run.bat benchmark
+```
+
+Defaults are configured in `config.txt`:
+
+```text
+BENCHMARK_STEPS=10000
+BENCHMARK_ORDER=cpu,cuda
+BENCHMARK_FIXED_SPAWN=1
+BENCHMARK_OUTPUT_DIR=data/results
+BENCHMARK_SAVE_CHILD_METRICS=0
+```
+
+`BENCHMARK_FIXED_SPAWN=1` disables SPWNxx time-profile demand during the
+benchmark run, so both child runs use the same constant default spawn demand
+computed from `BASE_VPS`, lane/road-width multipliers, and `MAX_TOTAL_VPS`.
+Each child process also receives the same deterministic benchmark RNG state from
+`SCENARIO_SEED`.
+
+Results are written to:
+
+- `data/results/benchmark_summary.json`
+- `data/results/benchmark_summary.csv`
+- `data/results/benchmark_01_cpu.log`
+- `data/results/benchmark_02_cuda.log`
+
+To override the step count without editing the config:
+
+```bash
+./run.sh benchmark --benchmark-steps=20000
+```
+
+```bat
+run.bat benchmark --benchmark-steps=20000
+```

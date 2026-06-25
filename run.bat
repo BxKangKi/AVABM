@@ -100,6 +100,7 @@ if "%~1"=="6" goto :cmd_build_cpu
 if "%~1"=="7" goto :cmd_rebuild
 if "%~1"=="8" goto :cmd_hardclean
 if "%~1"=="9" goto :cmd_status
+if "%~1"=="11" goto :cmd_benchmark
 if "%~1"=="10" goto :finish
 if "%~1"=="0" goto :finish
 if /I "%~1"=="q" goto :finish
@@ -132,6 +133,8 @@ if /I "%~1"=="cleanall" goto :cmd_hardclean
 if /I "%~1"=="clean-all" goto :cmd_hardclean
 if /I "%~1"=="status" goto :cmd_status
 if /I "%~1"=="check" goto :cmd_status
+if /I "%~1"=="benchmark" goto :cmd_benchmark
+if /I "%~1"=="bench" goto :cmd_benchmark
 
 echo [Warning] Unknown command: %~1
 echo [Info] Opening launcher menu instead.
@@ -153,9 +156,10 @@ echo 7. Clean rebuild CUDA
 echo 8. Hard clean + rebuild CUDA
 echo 9. CUDA build status
 echo 10. Exit
+echo 11. Benchmark - CPU then CUDA throughput comparison
 echo.
 set "CHOICE="
-set /p "CHOICE=Select [1-10]: "
+set /p "CHOICE=Select [1-11]: "
 call :normalize_menu_choice
 if "%MENU_CHOICE%"=="1" goto :cmd_turbo
 if "%MENU_CHOICE%"=="2" goto :cmd_visual
@@ -166,6 +170,7 @@ if "%MENU_CHOICE%"=="6" goto :cmd_build_cpu
 if "%MENU_CHOICE%"=="7" goto :cmd_rebuild
 if "%MENU_CHOICE%"=="8" goto :cmd_hardclean
 if "%MENU_CHOICE%"=="9" goto :cmd_status
+if "%MENU_CHOICE%"=="11" goto :cmd_benchmark
 if "%MENU_CHOICE%"=="10" goto :finish
 if "%MENU_CHOICE%"=="0" goto :finish
 if /I "%MENU_CHOICE%"=="q" goto :finish
@@ -194,6 +199,8 @@ if /I "%MENU_CHOICE%"=="cleanall" goto :cmd_hardclean
 if /I "%MENU_CHOICE%"=="clean-all" goto :cmd_hardclean
 if /I "%MENU_CHOICE%"=="status" goto :cmd_status
 if /I "%MENU_CHOICE%"=="check" goto :cmd_status
+if /I "%MENU_CHOICE%"=="benchmark" goto :cmd_benchmark
+if /I "%MENU_CHOICE%"=="bench" goto :cmd_benchmark
 echo [Warning] Invalid selection: %CHOICE%
 goto :menu
 
@@ -256,6 +263,17 @@ if errorlevel 1 (
     goto :finish
 )
 %PYTHON_COMMAND% "%BUILD_HELPER%" status
+set "AVABM_EXIT_CODE=%ERRORLEVEL%"
+goto :finish
+
+:cmd_benchmark
+call :ensure_cpu_built
+set "AVABM_EXIT_CODE=%ERRORLEVEL%"
+if not "%AVABM_EXIT_CODE%"=="0" goto :finish
+call :ensure_cuda_built
+set "AVABM_EXIT_CODE=%ERRORLEVEL%"
+if not "%AVABM_EXIT_CODE%"=="0" goto :finish
+call :launch_mode benchmark
 set "AVABM_EXIT_CODE=%ERRORLEVEL%"
 goto :finish
 
@@ -420,6 +438,7 @@ set "SIM_ENGINE=ecs_abm_cuda"
 set "SIMULATION_ENGINE=ecs_abm_cuda"
 if /I "%RUN_MODE%"=="turbo" goto :launch_turbo
 if /I "%RUN_MODE%"=="visual" goto :launch_visual
+if /I "%RUN_MODE%"=="benchmark" goto :launch_benchmark
 echo [Error] Unknown run mode: %RUN_MODE%
 exit /b 1
 :launch_turbo
@@ -434,6 +453,14 @@ set "HEADLESS_MODE=0"
 set "SIM_HEADLESS=0"
 echo [Info] Starting AVABM in Visual mode.
 %PYTHON_COMMAND% main.py --ecs --visual %ORIGINAL_ARGS%
+exit /b %ERRORLEVEL%
+:launch_benchmark
+set "HEADLESS_MODE=1"
+set "SIM_HEADLESS=1"
+set "BENCHMARK_MODE=1"
+set "ABM_TURBO_PROFILE=1"
+echo [Info] Starting AVABM benchmark mode ^(CPU then CUDA, fixed spawn, 10000 steps by default^).
+%PYTHON_COMMAND% main.py --benchmark %ORIGINAL_ARGS%
 exit /b %ERRORLEVEL%
 
 :build_cuda

@@ -64,6 +64,33 @@ def _read_config_txt(path: Path):
 CONFIG = _read_config_txt(CONFIG_PATH)
 _CLI_CONFIG_OVERRIDES = {}
 _cli_args = {str(a).strip().lower() for a in sys.argv[1:]}
+def _cli_value(name, default=None):
+    """Return the value of --name=value from sys.argv, or default when absent."""
+    prefix = "--" + str(name).strip().lower().replace("_", "-") + "="
+    alt_prefix = "--" + str(name).strip().lower().replace("-", "_") + "="
+    for raw in sys.argv[1:]:
+        s = str(raw).strip()
+        low = s.lower()
+        if low.startswith(prefix):
+            return s[len(prefix):]
+        if low.startswith(alt_prefix):
+            return s[len(alt_prefix):]
+    return default
+if "--benchmark" in _cli_args or "benchmark" in _cli_args:
+    _CLI_CONFIG_OVERRIDES["BENCHMARK_MODE"] = "1"
+    _CLI_CONFIG_OVERRIDES["HEADLESS_MODE"] = "1"
+    _CLI_CONFIG_OVERRIDES["SIM_HEADLESS"] = "1"
+if "--benchmark-child" in _cli_args:
+    _CLI_CONFIG_OVERRIDES["BENCHMARK_CHILD"] = "1"
+    _CLI_CONFIG_OVERRIDES["HEADLESS_MODE"] = "1"
+    _CLI_CONFIG_OVERRIDES["SIM_HEADLESS"] = "1"
+for _cli_key in (
+    "BENCHMARK_STEPS", "BENCHMARK_ORDER", "BENCHMARK_FIXED_SPAWN",
+    "BENCHMARK_OUTPUT_DIR", "BENCHMARK_SAVE_CHILD_METRICS", "SIMULATION_MAX_STEPS",
+):
+    _cli_val = _cli_value(_cli_key)
+    if _cli_val is not None:
+        _CLI_CONFIG_OVERRIDES[_cli_key] = str(_cli_val)
 if "--visual" in _cli_args or "--window" in _cli_args or "--gui" in _cli_args:
     _CLI_CONFIG_OVERRIDES["HEADLESS_MODE"] = "0"
     _CLI_CONFIG_OVERRIDES["SIM_HEADLESS"] = "0"
@@ -350,6 +377,14 @@ ABM_TURBO_PROFILE = cfg_bool("ABM_TURBO_PROFILE", True)
 SCENARIO_ID = str(cfg("SCENARIO_ID", "default"))
 SCENARIO_SEED = cfg_int("SCENARIO_SEED", ROUTE_SEED)
 SIMULATION_DURATION_SECONDS = cfg_float("SIMULATION_DURATION_SECONDS", -1.0)
+BENCHMARK_MODE = cfg_bool("BENCHMARK_MODE", False)
+BENCHMARK_CHILD = cfg_bool("BENCHMARK_CHILD", False) or str(os.environ.get("AVABM_BENCHMARK_CHILD", "")).strip().lower() in {"1", "true", "yes", "on"}
+BENCHMARK_STEPS = max(1, cfg_int("BENCHMARK_STEPS", 10000))
+BENCHMARK_ORDER = str(cfg("BENCHMARK_ORDER", "cpu,cuda"))
+BENCHMARK_FIXED_SPAWN = cfg_bool("BENCHMARK_FIXED_SPAWN", True)
+BENCHMARK_OUTPUT_DIR = Path(cfg("BENCHMARK_OUTPUT_DIR", "data/results"))
+BENCHMARK_SAVE_CHILD_METRICS = cfg_bool("BENCHMARK_SAVE_CHILD_METRICS", False)
+SIMULATION_MAX_STEPS = max(0, cfg_int("SIMULATION_MAX_STEPS", BENCHMARK_STEPS if BENCHMARK_CHILD else 0))
 SECTION_STATS_ENABLED = cfg_bool("SECTION_STATS_ENABLED", True)
 if HEADLESS_MODE and TURBO_DISABLE_SECTION_STATS:
     SECTION_STATS_ENABLED = False
@@ -5275,6 +5310,249 @@ def update_cpu_vehicle_vbo(vbo, veh, max_agents, verts_per_vehicle=6, textured=F
     glBindBuffer(GL_ARRAY_BUFFER, 0)
     return n
 
+
+def _project_resolve(path_like):
+    p = Path(path_like)
+    if p.is_absolute():
+        return p
+    return PROJECT_DIR / p
+
+
+def _tail_text(text, max_lines=80):
+    lines = str(text or "").splitlines()
+    if len(lines) <= int(max_lines):
+        return "\n".join(lines)
+    return "\n".join(lines[-int(max_lines):])
+
+
+def _normalize_benchmark_order(raw):
+    aliases = {
+        "gpu": "cuda",
+        "cuda_gpu": "cuda",
+        "cuda-strict": "cuda",
+        "cuda_strict": "cuda",
+        "c++": "cpu",
+        "cpp": "cpu",
+        "cpp_cpu": "cpu",
+    }
+    parts = []
+    for token in re.split(r"[,;\s]+", str(raw or "cpu,cuda").strip().lower()):
+        if not token:
+            continue
+        token = aliases.get(token, token)
+        if token in {"cpu", "cuda"} and token not in parts:
+            parts.append(token)
+    if not parts:
+        parts = ["cpu", "cuda"]
+    for required in ("cpu", "cuda"):
+        if required not in parts:
+            parts.append(required)
+    return parts
+
+
+def _extract_benchmark_result(output_text):
+    for line in reversed(str(output_text or "").splitlines()):
+        if not line.startswith("[BenchmarkResult]"):
+            continue
+        payload = line[len("[BenchmarkResult]"):].strip()
+        try:
+            return json.loads(payload)
+        except Exception:
+            return None
+    return None
+
+
+def _write_benchmark_csv(path, rows):
+    ensure_parent(path)
+    fieldnames = [
+        "backend", "status", "return_code", "steps", "wall_seconds",
+        "steps_per_second", "sim_seconds", "sim_seconds_per_wall_second",
+        "spawned", "completed", "active", "rejected_spawn", "log_path", "error",
+    ]
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+
+def _print_benchmark_summary(rows, summary_json_path, summary_csv_path):
+    headers = ["backend", "status", "steps", "wall_s", "steps/s", "sim_s/s", "spawned", "done"]
+    table_rows = []
+    for row in rows:
+        table_rows.append([
+            str(row.get("backend", "")),
+            str(row.get("status", "")),
+            str(row.get("steps", "")),
+            f"{float(row.get('wall_seconds', 0.0) or 0.0):.3f}" if row.get("wall_seconds", "") != "" else "",
+            f"{float(row.get('steps_per_second', 0.0) or 0.0):.1f}" if row.get("steps_per_second", "") != "" else "",
+            f"{float(row.get('sim_seconds_per_wall_second', 0.0) or 0.0):.1f}" if row.get("sim_seconds_per_wall_second", "") != "" else "",
+            str(row.get("spawned", "")),
+            str(row.get("completed", "")),
+        ])
+    widths = [len(h) for h in headers]
+    for r in table_rows:
+        for i, cell in enumerate(r):
+            widths[i] = max(widths[i], len(str(cell)))
+    def fmt_row(values):
+        return "  ".join(str(v).ljust(widths[i]) for i, v in enumerate(values))
+    print("[Benchmark] summary")
+    print(fmt_row(headers))
+    print(fmt_row(["-" * w for w in widths]))
+    for r in table_rows:
+        print(fmt_row(r))
+    by_backend = {str(r.get("backend")): r for r in rows if str(r.get("status")) == "ok"}
+    cpu = by_backend.get("cpu")
+    cuda = by_backend.get("cuda")
+    if cpu and cuda:
+        cpu_rate = float(cpu.get("steps_per_second", 0.0) or 0.0)
+        cuda_rate = float(cuda.get("steps_per_second", 0.0) or 0.0)
+        if cpu_rate > 0.0 and cuda_rate > 0.0:
+            print(f"[Benchmark] CUDA/CPU speedup: {cuda_rate / cpu_rate:.2f}x")
+    print(f"[Benchmark] JSON: {summary_json_path}")
+    print(f"[Benchmark] CSV:  {summary_csv_path}")
+
+
+def run_benchmark():
+    """Run one CPU and one CUDA headless child process, then compare throughput."""
+    output_dir = _project_resolve(BENCHMARK_OUTPUT_DIR)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    steps = int(BENCHMARK_STEPS)
+    order = _normalize_benchmark_order(BENCHMARK_ORDER)
+    duration_seconds = float(steps) * float(DT)
+    fixed_spawn = bool(BENCHMARK_FIXED_SPAWN)
+    print(
+        "[Benchmark] mode=benchmark",
+        "order=" + ",".join(order),
+        "steps=" + str(steps),
+        "dt=" + str(float(DT)),
+        "fixed_spawn=" + str(int(fixed_spawn)),
+    )
+    rows = []
+    for run_index, backend in enumerate(order, start=1):
+        result_path = output_dir / f"benchmark_{run_index:02d}_{backend}.json"
+        log_path = output_dir / f"benchmark_{run_index:02d}_{backend}.log"
+        metrics_path = output_dir / f"benchmark_{run_index:02d}_{backend}_metrics.csv"
+        child_env = os.environ.copy()
+        child_env.update({
+            "AVABM_BENCHMARK_CHILD": "1",
+            "BENCHMARK_MODE": "1",
+            "BENCHMARK_CHILD": "1",
+            "BENCHMARK_BACKEND": backend,
+            "BENCHMARK_STEPS": str(steps),
+            "BENCHMARK_FIXED_SPAWN": "1" if fixed_spawn else "0",
+            "BENCHMARK_RESULT_JSON": str(result_path),
+            "SIMULATION_MAX_STEPS": str(steps),
+            "SIMULATION_DURATION_SECONDS": str(duration_seconds),
+            "SIM_BACKEND": "cpu" if backend == "cpu" else "cuda_strict",
+            "SIM_ENGINE": "ecs_abm_cuda",
+            "SIMULATION_ENGINE": "ecs_abm_cuda",
+            "HEADLESS_MODE": "1",
+            "SIM_HEADLESS": "1",
+            "ABM_TURBO_PROFILE": "1",
+            "TURBO_STATUS_INTERVAL_WALL": "0",
+            "TURBO_METRICS_INTERVAL_SIM": str(max(duration_seconds + abs(float(DT)), 1.0)),
+            "TURBO_SAVE_METRICS": "1" if BENCHMARK_SAVE_CHILD_METRICS else "0",
+            "TURBO_DISABLE_SECTION_STATS": "1",
+            "SECTION_STATS_ENABLED": "0",
+            "METRICS_PATH": str(metrics_path),
+            "SCENARIO_ID": f"benchmark_{backend}",
+            "SPAWN_PROFILE_FIELD_PREFIX": "__AVABM_BENCHMARK_DISABLED__" if fixed_spawn else str(SPAWN_PROFILE_FIELD_PREFIX),
+        })
+        cmd = [
+            sys.executable,
+            str(PROJECT_DIR / "main.py"),
+            "--benchmark-child",
+            "--ecs",
+            "--turbo",
+            "--backend=cpu" if backend == "cpu" else "--backend=cuda_strict",
+        ]
+        print(f"[Benchmark] run {run_index}/{len(order)} backend={backend} start")
+        started = time.perf_counter()
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(PROJECT_DIR),
+                env=child_env,
+                text=True,
+                capture_output=True,
+            )
+        except Exception as e:
+            elapsed = time.perf_counter() - started
+            row = {
+                "backend": backend,
+                "status": "failed",
+                "return_code": "",
+                "steps": steps,
+                "wall_seconds": elapsed,
+                "error": str(e),
+                "log_path": str(log_path),
+            }
+            rows.append(row)
+            print(f"[Benchmark] backend={backend} failed to launch: {e}")
+            continue
+        output_text = (proc.stdout or "") + ("\n" if proc.stdout and proc.stderr else "") + (proc.stderr or "")
+        try:
+            log_path.write_text(output_text, encoding="utf-8")
+        except Exception as e:
+            print(f"[Benchmark] failed to write log {log_path}: {e}")
+        result = None
+        if result_path.exists():
+            try:
+                result = json.loads(result_path.read_text(encoding="utf-8"))
+            except Exception:
+                result = None
+        if result is None:
+            result = _extract_benchmark_result(output_text)
+        if result is None:
+            result = {}
+        status = "ok" if proc.returncode == 0 and result else "failed"
+        row = dict(result)
+        row.update({
+            "backend": backend,
+            "status": status,
+            "return_code": int(proc.returncode),
+            "log_path": str(log_path),
+        })
+        if status != "ok":
+            row["error"] = row.get("error") or _tail_text(output_text, 30)
+            print(f"[Benchmark] backend={backend} failed return_code={proc.returncode}")
+            tail = _tail_text(output_text, 20)
+            if tail:
+                print(tail)
+        else:
+            print(
+                f"[Benchmark] backend={backend} done "
+                f"steps={row.get('steps')} wall={float(row.get('wall_seconds', 0.0)):.3f}s "
+                f"steps/s={float(row.get('steps_per_second', 0.0)):.1f}"
+            )
+        rows.append(row)
+    summary_json_path = output_dir / "benchmark_summary.json"
+    summary_csv_path = output_dir / "benchmark_summary.csv"
+    speedup = None
+    by_backend = {str(r.get("backend")): r for r in rows if str(r.get("status")) == "ok"}
+    if "cpu" in by_backend and "cuda" in by_backend:
+        cpu_rate = float(by_backend["cpu"].get("steps_per_second", 0.0) or 0.0)
+        cuda_rate = float(by_backend["cuda"].get("steps_per_second", 0.0) or 0.0)
+        if cpu_rate > 0.0:
+            speedup = cuda_rate / cpu_rate
+    summary = {
+        "mode": "benchmark",
+        "steps": steps,
+        "dt": float(DT),
+        "duration_seconds": duration_seconds,
+        "fixed_spawn": fixed_spawn,
+        "order": order,
+        "speedup_cuda_over_cpu": speedup,
+        "results": rows,
+    }
+    ensure_parent(summary_json_path)
+    with open(summary_json_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+    _write_benchmark_csv(summary_csv_path, rows)
+    _print_benchmark_summary(rows, summary_json_path, summary_csv_path)
+    return 0 if rows and all(str(r.get("status")) == "ok" for r in rows) else 1
+
 def main():
     global PHYSICS_ASYNC_SCHEDULER, RENDER_ASYNC_FULL_DRAW, RENDER_INTERPOLATION, RENDER_WHEELS, RENDER_VERTS_PER_VEHICLE
     sim, sim_backend = _resolve_sim_backend()
@@ -5425,24 +5703,27 @@ def main():
     profile_slots = max(1, int(SPAWN_PROFILE_SLOTS))
     spawn_profile_np = np.zeros((num_spawn_points, profile_slots), dtype=np.float32)
     spawn_profile_has_np = np.zeros(num_spawn_points, dtype=np.int32)
-    for origin_node, slots in spawn_node_slots.items():
-        prof = node_spawn_profiles.get(int(origin_node))
-        if prof is None or not slots:
-            continue
-        prof = np.asarray(prof, dtype=np.float32)
-        if prof.size != profile_slots:
-            tmp = np.full(profile_slots, np.nan, dtype=np.float32)
-            ncopy = min(profile_slots, int(prof.size))
-            if ncopy > 0:
-                tmp[:ncopy] = prof[:ncopy]
-            prof = _fill_spawn_profile_circular(tmp)
-        if prof is None:
-            continue
-        prof = np.maximum(np.asarray(prof, dtype=np.float32), 0.0)
-        per_slot_prof = prof / max(1, len(slots)) if split_spawn_group_demand else prof
-        for i in slots:
-            spawn_profile_np[int(i), :] = per_slot_prof
-            spawn_profile_has_np[int(i)] = 1
+    if BENCHMARK_CHILD and BENCHMARK_FIXED_SPAWN:
+        print("[Benchmark] fixed_spawn=1 | SPWNxx demand profiles ignored; using constant default demand_vps.")
+    else:
+        for origin_node, slots in spawn_node_slots.items():
+            prof = node_spawn_profiles.get(int(origin_node))
+            if prof is None or not slots:
+                continue
+            prof = np.asarray(prof, dtype=np.float32)
+            if prof.size != profile_slots:
+                tmp = np.full(profile_slots, np.nan, dtype=np.float32)
+                ncopy = min(profile_slots, int(prof.size))
+                if ncopy > 0:
+                    tmp[:ncopy] = prof[:ncopy]
+                prof = _fill_spawn_profile_circular(tmp)
+            if prof is None:
+                continue
+            prof = np.maximum(np.asarray(prof, dtype=np.float32), 0.0)
+            per_slot_prof = prof / max(1, len(slots)) if split_spawn_group_demand else prof
+            for i in slots:
+                spawn_profile_np[int(i), :] = per_slot_prof
+                spawn_profile_has_np[int(i)] = 1
     multi_lane_groups = sum(1 for slots in spawn_group_slots.values() if len(slots) > 1)
     multi_lane_slots = sum(len(slots) for slots in spawn_group_slots.values() if len(slots) > 1)
     if split_spawn_group_demand:
@@ -5631,7 +5912,13 @@ def main():
         "yellow_start": t(signal_np["yellow_start"].astype(np.float32)),
         "yellow_end": t(signal_np["yellow_end"].astype(np.float32)),
     }
-    rng_state = torch.randint(1, 1 << 31, (MAX_AGENTS + num_spawn_points + 32,), device=device, dtype=torch.int32)
+    if BENCHMARK_CHILD:
+        rng = np.random.default_rng(int(SCENARIO_SEED))
+        rng_state_np = rng.integers(1, 1 << 31, size=(MAX_AGENTS + num_spawn_points + 32,), dtype=np.int32)
+        rng_state = t(rng_state_np)
+        print("[Benchmark] deterministic_rng_seed:", int(SCENARIO_SEED))
+    else:
+        rng_state = torch.randint(1, 1 << 31, (MAX_AGENTS + num_spawn_points + 32,), device=device, dtype=torch.int32)
     metrics = torch.zeros(METRICS_SIZE, device=device, dtype=torch.float32)
     intersection_lock = torch.full((num_nodes,), -1, device=device, dtype=torch.int32)
     reservation_table = torch.full((num_nodes * RES_HORIZON_SLOTS,), -1, device=device, dtype=torch.int32)
@@ -5688,6 +5975,19 @@ def main():
         if remaining <= 0.0:
             return 0
         return max(1, int(math.ceil((remaining - 1.0e-12) / float(DT))))
+    def _steps_until_max_steps(start_step):
+        if int(SIMULATION_MAX_STEPS) <= 0:
+            return None
+        remaining = int(SIMULATION_MAX_STEPS) - int(start_step)
+        if remaining <= 0:
+            return 0
+        return int(remaining)
+    def _duration_or_step_limit_reached(current_time, current_step):
+        if int(SIMULATION_MAX_STEPS) > 0 and int(current_step) >= int(SIMULATION_MAX_STEPS):
+            return "step_limit"
+        if SIMULATION_DURATION_SECONDS >= 0.0 and float(current_time) >= float(SIMULATION_DURATION_SECONDS):
+            return "duration"
+        return None
     def _launch_cuda_steps(start_step, batch_count):
         batch_count = int(batch_count)
         start_step = int(start_step)
@@ -5760,10 +6060,17 @@ def main():
         try:
             while True:
                 current_time = float(step * DT)
-                if SIMULATION_DURATION_SECONDS >= 0.0 and current_time >= float(SIMULATION_DURATION_SECONDS):
-                    exit_reason = "duration"
+                limit_reason = _duration_or_step_limit_reached(current_time, step)
+                if limit_reason is not None:
+                    exit_reason = limit_reason
                     break
                 chunk_steps = int(TURBO_BATCH_STEPS)
+                max_step_steps = _steps_until_max_steps(step)
+                if max_step_steps is not None:
+                    if max_step_steps <= 0:
+                        exit_reason = "step_limit"
+                        break
+                    chunk_steps = min(chunk_steps, int(max_step_steps))
                 duration_steps = _steps_until_duration(current_time)
                 if duration_steps is not None:
                     if duration_steps <= 0:
@@ -5840,6 +6147,45 @@ def main():
                 writer.close()
             except Exception:
                 pass
+            if BENCHMARK_CHILD:
+                def _metric_number(name, default=0.0):
+                    try:
+                        return float(final_metrics.get(name, default) or 0.0)
+                    except Exception:
+                        return float(default)
+                benchmark_result = {
+                    "backend": str(sim_backend),
+                    "requested_backend": str(SIM_BACKEND),
+                    "reason": str(exit_reason),
+                    "steps": int(final_step),
+                    "target_steps": int(SIMULATION_MAX_STEPS),
+                    "dt": float(DT),
+                    "sim_seconds": float(final_sim_time),
+                    "wall_seconds": float(elapsed),
+                    "steps_per_second": float(final_step) / float(elapsed),
+                    "sim_seconds_per_wall_second": float(final_sim_time) / float(elapsed),
+                    "fixed_spawn": bool(BENCHMARK_FIXED_SPAWN),
+                    "total_spawn_vps": float(total_vps_host),
+                    "spawned": int(round(_metric_number("spawned"))),
+                    "completed": int(round(_metric_number("completed"))),
+                    "active": int(round(_metric_number("active"))),
+                    "rejected_spawn": int(round(_metric_number("rejected_spawn"))),
+                    "avg_speed": float(_metric_number("avg_speed")),
+                    "max_agents": int(MAX_AGENTS),
+                    "num_spawn_points": int(num_spawn_points),
+                    "num_lanes": int(num_lanes),
+                    "seed": int(SCENARIO_SEED),
+                }
+                result_path = cfg_optional("BENCHMARK_RESULT_JSON", None)
+                if result_path is not None:
+                    try:
+                        result_path = _project_resolve(result_path)
+                        ensure_parent(result_path)
+                        with open(result_path, "w", encoding="utf-8") as f:
+                            json.dump(benchmark_result, f, ensure_ascii=False, indent=2)
+                    except Exception as e:
+                        print("[Benchmark] result write failed:", e)
+                print("[BenchmarkResult] " + json.dumps(benchmark_result, ensure_ascii=False, sort_keys=True))
             print(
                 f"[Turbo] finished reason={exit_reason} sim_time={format_sim_time(final_sim_time)} "
                 f"steps={final_step} wall={elapsed:.3f}s rate={final_sim_time / elapsed:.1f} sim_s/s"
@@ -5857,6 +6203,11 @@ def main():
             render_curr[k].copy_(veh[k])
     def _planned_physics_chunk(start_time):
         chunk_steps = min(int(PHYSICS_STEPS_PER_FRAME), int(PHYSICS_MAX_BATCH_STEPS))
+        max_step_steps = _steps_until_max_steps(step)
+        if max_step_steps is not None:
+            if max_step_steps <= 0:
+                return 0
+            chunk_steps = min(chunk_steps, int(max_step_steps))
         duration_steps = _steps_until_duration(start_time)
         if duration_steps is not None:
             if duration_steps <= 0:
@@ -5978,25 +6329,35 @@ def main():
             if PHYSICS_ASYNC_SCHEDULER:
                 _complete_pending_physics_if_ready(force=False)
                 current_time = float(step * DT)
-                if pending_physics is None and SIMULATION_DURATION_SECONDS >= 0.0 and current_time >= float(SIMULATION_DURATION_SECONDS):
-                    exit_reason = "duration"
+                limit_reason = _duration_or_step_limit_reached(current_time, step)
+                if pending_physics is None and limit_reason is not None:
+                    exit_reason = limit_reason
                     running = False
                     break
             else:
                 current_time = float(step * DT)
-                if SIMULATION_DURATION_SECONDS >= 0.0 and current_time >= float(SIMULATION_DURATION_SECONDS):
-                    exit_reason = "duration"
+                limit_reason = _duration_or_step_limit_reached(current_time, step)
+                if limit_reason is not None:
+                    exit_reason = limit_reason
                     running = False
                     break
                 physics_steps_left = int(PHYSICS_STEPS_PER_FRAME)
                 frame_budget_start = time.perf_counter()
                 while physics_steps_left > 0:
                     current_time = float(step * DT)
-                    if SIMULATION_DURATION_SECONDS >= 0.0 and current_time >= float(SIMULATION_DURATION_SECONDS):
-                        exit_reason = "duration"
+                    limit_reason = _duration_or_step_limit_reached(current_time, step)
+                    if limit_reason is not None:
+                        exit_reason = limit_reason
                         running = False
                         break
                     chunk_steps = min(int(physics_steps_left), int(PHYSICS_MAX_BATCH_STEPS))
+                    max_step_steps = _steps_until_max_steps(step)
+                    if max_step_steps is not None:
+                        if max_step_steps <= 0:
+                            exit_reason = "step_limit"
+                            running = False
+                            break
+                        chunk_steps = min(chunk_steps, int(max_step_steps))
                     duration_steps = _steps_until_duration(current_time)
                     if duration_steps is not None:
                         if duration_steps <= 0:
@@ -6145,8 +6506,9 @@ def main():
             pygame.display.flip()
             if PHYSICS_ASYNC_SCHEDULER and running and pending_physics is None:
                 next_time = float(step * DT)
-                if SIMULATION_DURATION_SECONDS >= 0.0 and next_time >= float(SIMULATION_DURATION_SECONDS):
-                    exit_reason = "duration"
+                limit_reason = _duration_or_step_limit_reached(next_time, step)
+                if limit_reason is not None:
+                    exit_reason = limit_reason
                     running = False
                 else:
                     _begin_pending_physics()
@@ -6200,4 +6562,6 @@ def main():
             print("[Warning] unregister failed:", e)
         pygame.quit()
 if __name__ == "__main__":
+    if BENCHMARK_MODE and not BENCHMARK_CHILD:
+        raise SystemExit(run_benchmark())
     main()

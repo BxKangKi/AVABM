@@ -339,6 +339,14 @@ launch_mode() {
       echo "[Info] Starting AVABM in Visual mode."
       exec "$PYTHON_COMMAND" main.py --ecs --visual "$@"
       ;;
+    benchmark)
+      export HEADLESS_MODE=1
+      export SIM_HEADLESS=1
+      export BENCHMARK_MODE=1
+      export ABM_TURBO_PROFILE=1
+      echo "[Info] Starting AVABM benchmark mode (CPU then CUDA, fixed spawn, 10000 steps by default)."
+      exec "$PYTHON_COMMAND" main.py --benchmark "$@"
+      ;;
     *)
       echo "[Error] Unknown run mode: $mode" >&2
       return 1
@@ -361,8 +369,9 @@ show_menu() {
   echo "8. Hard clean + rebuild CUDA"
   echo "9. CUDA build status"
   echo "10. Exit"
+  echo "11. Benchmark - CPU then CUDA throughput comparison"
   echo
-  printf 'Select [1-10]: '
+  printf 'Select [1-11]: '
 }
 
 cmd="${1:-}"
@@ -381,6 +390,7 @@ if [ -z "$cmd" ]; then
     8|h|H|hardclean|Hardclean|cleanall|clean-all) set -- hardclean ;;
     9|s|S|status|Status|check|Check) set -- status ;;
     10|0|q|Q|exit|Exit) exit 0 ;;
+    11|bench|Bench|benchmark|Benchmark) set -- benchmark ;;
     *) echo "[Error] Invalid selection: $choice" >&2; exit 1 ;;
   esac
   cmd="$1"
@@ -420,13 +430,18 @@ case "$cmd" in
     activate_conda
     "$PYTHON_COMMAND" "$BUILD_HELPER" status
     ;;
+  11|bench|benchmark)
+    ensure_cpu_built
+    ensure_cuda_built
+    launch_mode benchmark "$@"
+    ;;
   10|0|q|Q|exit|Exit)
     exit 0
     ;;
   *)
     echo "[Error] Unknown command: $cmd" >&2
-    echo "Usage: ./run.sh [turbo|visual|build|build-selected|build-cuda|build-cpu|rebuild|hardclean|status] [extra main.py args...]" >&2
-    echo "       Numeric shortcuts are also accepted: 1..10"
+    echo "Usage: ./run.sh [turbo|visual|benchmark|build|build-selected|build-cuda|build-cpu|rebuild|hardclean|status] [extra main.py args...]" >&2
+    echo "       Numeric shortcuts are also accepted: 1..11"
     exit 1
     ;;
 esac
