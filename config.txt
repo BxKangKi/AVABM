@@ -78,6 +78,8 @@ CUDA_DEVICE_NOINLINE=0
 SIM_BACKEND=cpu
 CPU_WORKERS=12
 CPU_AUTO_BUILD=1
+CPU_REBUILD_IF_STALE=1
+CPU_PARALLEL_STATS_ENABLED=1
 CPU_CXX_STANDARD=17
 CPU_OPT_LEVEL=2
 CPU_BUILD_MAX_JOBS=0
@@ -273,9 +275,17 @@ LANE_GAIN_TAPER_ALIGN_CONTINUING_LANES=1
 LANE_GAIN_TAPER_RENDER_WIDTH=1
 LANE_GAIN_TAPER_AMBIGUOUS_RIGHT_FALLBACK=1
 LANE_GAIN_TAPER_START_PULL=0.86
+# Benchmark mode: run CPU/CUDA in headless mode, then compare throughput.
+# BENCHMARK_ORDER accepts cpu,cuda, cpu only, or cuda only.
 BENCHMARK_STEPS=10000
 BENCHMARK_ORDER=cpu,cuda
 BENCHMARK_FIXED_SPAWN=1
+# Warmup fills the road and CUDA queues before timing, reducing GPU load dips from cold-start spawn ramp.
+BENCHMARK_WARMUP_STEPS=1000
+# Large benchmark batches reduce Python/host gaps between CUDA kernel queues.
+BENCHMARK_BATCH_STEPS=16384
+# 0 means all logical CPUs; benchmark children pass the resolved value to the C++ CPU backend and Torch.
+BENCHMARK_CPU_WORKERS=0
 BENCHMARK_OUTPUT_DIR=data/results
 BENCHMARK_SAVE_CHILD_METRICS=0
 SIMULATION_MAX_STEPS=0

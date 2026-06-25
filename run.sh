@@ -318,6 +318,47 @@ ensure_backend_built() {
   esac
 }
 
+benchmark_order_from_args() {
+  local arg value order
+  order=""
+  for arg in "$@"; do
+    value=""
+    case "$arg" in
+      cpu|CPU|benchmark-cpu|bench-cpu|--cpu|--benchmark-cpu|--bench-cpu|--backend=cpu|--benchmark-backend=cpu|--benchmark-backends=cpu|--benchmark-order=cpu)
+        value="cpu" ;;
+      gpu|GPU|cuda|CUDA|benchmark-gpu|benchmark-cuda|bench-gpu|bench-cuda|--gpu|--cuda|--cuda-strict|--benchmark-gpu|--benchmark-cuda|--bench-gpu|--bench-cuda|--backend=cuda|--backend=cuda_strict|--benchmark-backend=gpu|--benchmark-backend=cuda|--benchmark-backends=gpu|--benchmark-backends=cuda|--benchmark-order=gpu|--benchmark-order=cuda)
+        value="cuda" ;;
+      both|Both|all|All|compare|Compare|cpu,cuda|cuda,cpu|--benchmark-order=cpu,cuda|--benchmark-order=cuda,cpu|--benchmark-backends=cpu,cuda|--benchmark-backends=cuda,cpu)
+        value="cpu,cuda" ;;
+      --benchmark-order=*|--benchmark-backend=*|--benchmark-backends=*)
+        value="${arg#*=}" ;;
+    esac
+    case "$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')" in
+      cpu|cpp|cpp_cpu|c++) order="cpu" ;;
+      gpu|cuda|cuda_strict|cuda-strict) order="cuda" ;;
+      both|all|compare|cpu,cuda|cuda,cpu) order="cpu,cuda" ;;
+    esac
+  done
+  printf '%s' "$order"
+}
+
+ensure_benchmark_backends_built() {
+  local order
+  order="$(benchmark_order_from_args "$@")"
+  case "$order" in
+    cpu)
+      ensure_cpu_built
+      ;;
+    cuda)
+      ensure_cuda_built
+      ;;
+    *)
+      ensure_cpu_built
+      ensure_cuda_built
+      ;;
+  esac
+}
+
 launch_mode() {
   local mode
   mode="$1"
@@ -344,7 +385,7 @@ launch_mode() {
       export SIM_HEADLESS=1
       export BENCHMARK_MODE=1
       export ABM_TURBO_PROFILE=1
-      echo "[Info] Starting AVABM benchmark mode (CPU then CUDA, fixed spawn, 10000 steps by default)."
+      echo "[Info] Starting AVABM benchmark mode (use: benchmark cpu | benchmark gpu | benchmark both)."
       exec "$PYTHON_COMMAND" main.py --benchmark "$@"
       ;;
     *)
@@ -369,7 +410,7 @@ show_menu() {
   echo "8. Hard clean + rebuild CUDA"
   echo "9. CUDA build status"
   echo "10. Exit"
-  echo "11. Benchmark - CPU then CUDA throughput comparison"
+  echo "11. Benchmark - CPU/CUDA throughput comparison"
   echo
   printf 'Select [1-11]: '
 }
@@ -430,10 +471,9 @@ case "$cmd" in
     activate_conda
     "$PYTHON_COMMAND" "$BUILD_HELPER" status
     ;;
-  11|bench|benchmark)
-    ensure_cpu_built
-    ensure_cuda_built
-    launch_mode benchmark "$@"
+  11|bench|benchmark|benchmark-cpu|bench-cpu|benchmark-gpu|benchmark-cuda|bench-gpu|bench-cuda)
+    ensure_benchmark_backends_built "$cmd" "$@"
+    launch_mode benchmark "$cmd" "$@"
     ;;
   10|0|q|Q|exit|Exit)
     exit 0
@@ -441,6 +481,7 @@ case "$cmd" in
   *)
     echo "[Error] Unknown command: $cmd" >&2
     echo "Usage: ./run.sh [turbo|visual|benchmark|build|build-selected|build-cuda|build-cpu|rebuild|hardclean|status] [extra main.py args...]" >&2
+    echo "       Benchmark shortcuts: ./run.sh benchmark cpu | ./run.sh benchmark gpu | ./run.sh benchmark both" >&2
     echo "       Numeric shortcuts are also accepted: 1..11"
     exit 1
     ;;

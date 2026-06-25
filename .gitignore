@@ -15,3 +15,4 @@
 /avabm/cuda/build_logs
 /avabm/cpu/build
 /avabm/__pycache__
+avabm/cpu/.avabm_cpu_ext_fingerprint

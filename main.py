@@ -10,6 +10,7 @@ import queue
 import ctypes
 import threading
 import re
+import hashlib
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import numpy as np
@@ -76,8 +77,18 @@ def _cli_value(name, default=None):
         if low.startswith(alt_prefix):
             return s[len(alt_prefix):]
     return default
-if "--benchmark" in _cli_args or "benchmark" in _cli_args:
+if "--benchmark" in _cli_args or "benchmark" in _cli_args or "bench" in _cli_args:
     _CLI_CONFIG_OVERRIDES["BENCHMARK_MODE"] = "1"
+    _CLI_CONFIG_OVERRIDES["HEADLESS_MODE"] = "1"
+    _CLI_CONFIG_OVERRIDES["SIM_HEADLESS"] = "1"
+if any(a in _cli_args for a in ("--benchmark-cpu", "--bench-cpu", "benchmark-cpu", "bench-cpu")):
+    _CLI_CONFIG_OVERRIDES["BENCHMARK_MODE"] = "1"
+    _CLI_CONFIG_OVERRIDES["BENCHMARK_ORDER"] = "cpu"
+    _CLI_CONFIG_OVERRIDES["HEADLESS_MODE"] = "1"
+    _CLI_CONFIG_OVERRIDES["SIM_HEADLESS"] = "1"
+if any(a in _cli_args for a in ("--benchmark-gpu", "--benchmark-cuda", "--bench-gpu", "--bench-cuda", "benchmark-gpu", "benchmark-cuda", "bench-gpu", "bench-cuda")):
+    _CLI_CONFIG_OVERRIDES["BENCHMARK_MODE"] = "1"
+    _CLI_CONFIG_OVERRIDES["BENCHMARK_ORDER"] = "cuda"
     _CLI_CONFIG_OVERRIDES["HEADLESS_MODE"] = "1"
     _CLI_CONFIG_OVERRIDES["SIM_HEADLESS"] = "1"
 if "--benchmark-child" in _cli_args:
@@ -85,12 +96,39 @@ if "--benchmark-child" in _cli_args:
     _CLI_CONFIG_OVERRIDES["HEADLESS_MODE"] = "1"
     _CLI_CONFIG_OVERRIDES["SIM_HEADLESS"] = "1"
 for _cli_key in (
-    "BENCHMARK_STEPS", "BENCHMARK_ORDER", "BENCHMARK_FIXED_SPAWN",
-    "BENCHMARK_OUTPUT_DIR", "BENCHMARK_SAVE_CHILD_METRICS", "SIMULATION_MAX_STEPS",
+    "BENCHMARK_STEPS", "BENCHMARK_ORDER", "BENCHMARK_BACKEND", "BENCHMARK_BACKENDS",
+    "BENCHMARK_FIXED_SPAWN", "BENCHMARK_WARMUP_STEPS", "BENCHMARK_BATCH_STEPS",
+    "BENCHMARK_CPU_WORKERS", "BENCHMARK_OUTPUT_DIR", "BENCHMARK_SAVE_CHILD_METRICS",
+    "SIMULATION_MAX_STEPS",
 ):
     _cli_val = _cli_value(_cli_key)
     if _cli_val is not None:
         _CLI_CONFIG_OVERRIDES[_cli_key] = str(_cli_val)
+_benchmark_cli_backend = _cli_value("benchmark-backend", None)
+if _benchmark_cli_backend is None:
+    _benchmark_cli_backend = _cli_value("benchmark-backends", None)
+if _benchmark_cli_backend is not None:
+    _CLI_CONFIG_OVERRIDES["BENCHMARK_ORDER"] = str(_benchmark_cli_backend)
+for _i, _arg in enumerate([str(a).strip().lower() for a in sys.argv[1:]]):
+    if _arg in {"benchmark", "bench", "--benchmark"} and _i + 1 < len(sys.argv[1:]):
+        _next = str(sys.argv[1:][_i + 1]).strip().lower()
+        if _next in {"cpu", "cpp", "cpp_cpu", "c++"}:
+            _CLI_CONFIG_OVERRIDES["BENCHMARK_ORDER"] = "cpu"
+        elif _next in {"gpu", "cuda", "cuda_strict", "cuda-strict"}:
+            _CLI_CONFIG_OVERRIDES["BENCHMARK_ORDER"] = "cuda"
+        elif _next in {"both", "all", "compare", "cpu,cuda", "cuda,cpu"}:
+            _CLI_CONFIG_OVERRIDES["BENCHMARK_ORDER"] = _next
+if ("BENCHMARK_MODE" in _CLI_CONFIG_OVERRIDES) and ("BENCHMARK_ORDER" not in _CLI_CONFIG_OVERRIDES):
+    _backend_arg = _cli_value("backend", None)
+    if "--cpu" in _cli_args or str(_backend_arg or "").strip().lower() in {"cpu", "cpp", "cpp_cpu", "c++"}:
+        _CLI_CONFIG_OVERRIDES["BENCHMARK_ORDER"] = "cpu"
+    elif ("--gpu" in _cli_args or "--cuda" in _cli_args or "--cuda-strict" in _cli_args
+          or str(_backend_arg or "").strip().lower() in {"gpu", "cuda", "cuda_strict", "cuda-strict"}):
+        _CLI_CONFIG_OVERRIDES["BENCHMARK_ORDER"] = "cuda"
+if "BENCHMARK_BACKENDS" in _CLI_CONFIG_OVERRIDES and "BENCHMARK_ORDER" not in _CLI_CONFIG_OVERRIDES:
+    _CLI_CONFIG_OVERRIDES["BENCHMARK_ORDER"] = _CLI_CONFIG_OVERRIDES["BENCHMARK_BACKENDS"]
+if "BENCHMARK_BACKEND" in _CLI_CONFIG_OVERRIDES and "BENCHMARK_ORDER" not in _CLI_CONFIG_OVERRIDES:
+    _CLI_CONFIG_OVERRIDES["BENCHMARK_ORDER"] = _CLI_CONFIG_OVERRIDES["BENCHMARK_BACKEND"]
 if "--visual" in _cli_args or "--window" in _cli_args or "--gui" in _cli_args:
     _CLI_CONFIG_OVERRIDES["HEADLESS_MODE"] = "0"
     _CLI_CONFIG_OVERRIDES["SIM_HEADLESS"] = "0"
@@ -380,8 +418,11 @@ SIMULATION_DURATION_SECONDS = cfg_float("SIMULATION_DURATION_SECONDS", -1.0)
 BENCHMARK_MODE = cfg_bool("BENCHMARK_MODE", False)
 BENCHMARK_CHILD = cfg_bool("BENCHMARK_CHILD", False) or str(os.environ.get("AVABM_BENCHMARK_CHILD", "")).strip().lower() in {"1", "true", "yes", "on"}
 BENCHMARK_STEPS = max(1, cfg_int("BENCHMARK_STEPS", 10000))
-BENCHMARK_ORDER = str(cfg("BENCHMARK_ORDER", "cpu,cuda"))
+BENCHMARK_ORDER = str(cfg("BENCHMARK_ORDER", cfg("BENCHMARK_BACKENDS", cfg("BENCHMARK_BACKEND", "cpu,cuda"))))
 BENCHMARK_FIXED_SPAWN = cfg_bool("BENCHMARK_FIXED_SPAWN", True)
+BENCHMARK_WARMUP_STEPS = max(0, cfg_int("BENCHMARK_WARMUP_STEPS", 1000))
+BENCHMARK_BATCH_STEPS = max(1, cfg_int("BENCHMARK_BATCH_STEPS", cfg_int("TURBO_BATCH_STEPS", 16384)))
+BENCHMARK_CPU_WORKERS = max(0, cfg_int("BENCHMARK_CPU_WORKERS", 0))
 BENCHMARK_OUTPUT_DIR = Path(cfg("BENCHMARK_OUTPUT_DIR", "data/results"))
 BENCHMARK_SAVE_CHILD_METRICS = cfg_bool("BENCHMARK_SAVE_CHILD_METRICS", False)
 SIMULATION_MAX_STEPS = max(0, cfg_int("SIMULATION_MAX_STEPS", BENCHMARK_STEPS if BENCHMARK_CHILD else 0))
@@ -5218,15 +5259,80 @@ class VehicleECSWorld:
             f"entities={self.max_entities} component_groups={len(self.components)} "
             f"component_arrays={component_count} layout=SoA {layout}"
         )
-def _build_cpu_extension_inplace():
+def _cpu_extension_source_fingerprint():
+    h = hashlib.sha256()
+    for p in sorted(_cpu_extension_sources(), key=lambda x: str(x)):
+        try:
+            rel = str(p.relative_to(PROJECT_DIR)).replace(os.sep, "/")
+        except Exception:
+            rel = str(p)
+        try:
+            data = p.read_bytes()
+        except Exception:
+            continue
+        h.update(rel.encode("utf-8", "ignore"))
+        h.update(b"\0")
+        h.update(data)
+        h.update(b"\0")
+    return h.hexdigest()
+
+def _cpu_extension_fingerprint_path():
+    return PROJECT_DIR / "avabm" / "cpu" / ".avabm_cpu_ext_fingerprint"
+
+def _write_cpu_extension_fingerprint():
+    try:
+        _cpu_extension_fingerprint_path().write_text(_cpu_extension_source_fingerprint() + "\n", encoding="utf-8")
+    except Exception as e:
+        print("[CPU Warning] failed to write CPU build fingerprint:", e)
+
+def _build_cpu_extension_inplace(reason="missing"):
     setup_path = PROJECT_DIR / "avabm" / "cpu" / "setup.py"
     if not setup_path.exists():
         raise RuntimeError(f"CPU backend setup.py not found: {setup_path}")
-    print("[CPU] avabm CPU extension is missing; building C++ CPU backend in place...")
+    print(f"[CPU] building C++ CPU backend in place ({reason})...")
     subprocess.check_call([sys.executable, str(setup_path), "build_ext", "--inplace"], cwd=str(setup_path.parent))
+    _write_cpu_extension_fingerprint()
+
+def _cpu_extension_binaries():
+    package_dir = PROJECT_DIR / "avabm"
+    patterns = ["avabm_cpu_ext*.pyd", "avabm_cpu_ext*.so", "avabm_cpu_ext*.dll", "avabm_cpu_ext*.dylib"]
+    out = []
+    for pattern in patterns:
+        out.extend(package_dir.glob(pattern))
+    return [p for p in out if p.is_file()]
+
+def _cpu_extension_sources():
+    cpu_dir = PROJECT_DIR / "avabm" / "cpu"
+    names = ["binding.cpp", "cpu_kernels.cpp", "cpu_port_api.hpp", "main_common_cpu.hpp", "setup.py"]
+    return [cpu_dir / name for name in names if (cpu_dir / name).exists()]
+
+def _cpu_extension_needs_build():
+    bins = _cpu_extension_binaries()
+    if not bins:
+        return True
+    srcs = _cpu_extension_sources()
+    if not srcs:
+        return False
+    try:
+        expected_fp = _cpu_extension_source_fingerprint()
+        fp_path = _cpu_extension_fingerprint_path()
+        if not fp_path.exists() or fp_path.read_text(encoding="utf-8").strip() != expected_fp:
+            return True
+    except Exception:
+        pass
+    try:
+        newest_src = max(p.stat().st_mtime for p in srcs)
+        newest_bin = max(p.stat().st_mtime for p in bins)
+        return newest_bin + 1.0e-6 < newest_src
+    except Exception:
+        return False
 
 def _import_cpu_backend():
+    import importlib
     import avabm
+    if CPU_AUTO_BUILD and cfg_bool("CPU_REBUILD_IF_STALE", True) and _cpu_extension_needs_build():
+        _build_cpu_extension_inplace("source fingerprint changed or binary stale")
+        importlib.invalidate_caches()
     try:
         return avabm.import_cpu()
     except ImportError as first_exc:
@@ -5235,7 +5341,7 @@ def _import_cpu_backend():
                 "avabm CPU extension is missing. Build it with `(cd avabm/cpu && python setup.py build_ext --inplace)` "
                 "or set CPU_AUTO_BUILD=1."
             ) from first_exc
-        _build_cpu_extension_inplace()
+        _build_cpu_extension_inplace("missing")
         try:
             return avabm.import_cpu()
         except ImportError as second_exc:
@@ -5331,12 +5437,18 @@ def _normalize_benchmark_order(raw):
         "cuda_gpu": "cuda",
         "cuda-strict": "cuda",
         "cuda_strict": "cuda",
+        "strict_cuda": "cuda",
         "c++": "cpu",
         "cpp": "cpu",
         "cpp_cpu": "cpu",
+        "both": "cpu,cuda",
+        "all": "cpu,cuda",
+        "compare": "cpu,cuda",
     }
+    raw_text = str(raw or "cpu,cuda").strip().lower()
+    raw_text = aliases.get(raw_text, raw_text)
     parts = []
-    for token in re.split(r"[,;\s]+", str(raw or "cpu,cuda").strip().lower()):
+    for token in re.split(r"[,;\s]+", raw_text):
         if not token:
             continue
         token = aliases.get(token, token)
@@ -5344,9 +5456,6 @@ def _normalize_benchmark_order(raw):
             parts.append(token)
     if not parts:
         parts = ["cpu", "cuda"]
-    for required in ("cpu", "cuda"):
-        if required not in parts:
-            parts.append(required)
     return parts
 
 
@@ -5365,9 +5474,10 @@ def _extract_benchmark_result(output_text):
 def _write_benchmark_csv(path, rows):
     ensure_parent(path)
     fieldnames = [
-        "backend", "status", "return_code", "steps", "wall_seconds",
-        "steps_per_second", "sim_seconds", "sim_seconds_per_wall_second",
-        "spawned", "completed", "active", "rejected_spawn", "log_path", "error",
+        "backend", "status", "return_code", "steps", "total_steps", "warmup_steps", "target_steps",
+        "batch_steps", "wall_seconds", "steps_per_second", "sim_seconds", "total_sim_seconds",
+        "sim_seconds_per_wall_second", "spawned", "completed", "active", "rejected_spawn",
+        "cpu_workers", "log_path", "error",
     ]
     with open(path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -5419,14 +5529,22 @@ def run_benchmark():
     output_dir.mkdir(parents=True, exist_ok=True)
     steps = int(BENCHMARK_STEPS)
     order = _normalize_benchmark_order(BENCHMARK_ORDER)
-    duration_seconds = float(steps) * float(DT)
+    warmup_steps = int(BENCHMARK_WARMUP_STEPS)
+    batch_steps = int(BENCHMARK_BATCH_STEPS)
+    timed_duration_seconds = float(steps) * float(DT)
+    child_duration_seconds = float(steps + warmup_steps) * float(DT)
     fixed_spawn = bool(BENCHMARK_FIXED_SPAWN)
+    cpu_workers_for_benchmark = int(BENCHMARK_CPU_WORKERS if BENCHMARK_CPU_WORKERS > 0 else (os.cpu_count() or 1))
+    cpu_workers_for_benchmark = max(1, min(cpu_workers_for_benchmark, 1024))
     print(
         "[Benchmark] mode=benchmark",
         "order=" + ",".join(order),
         "steps=" + str(steps),
+        "warmup_steps=" + str(warmup_steps),
+        "batch_steps=" + str(batch_steps),
         "dt=" + str(float(DT)),
         "fixed_spawn=" + str(int(fixed_spawn)),
+        "cpu_workers=" + str(cpu_workers_for_benchmark),
     )
     rows = []
     for run_index, backend in enumerate(order, start=1):
@@ -5443,7 +5561,7 @@ def run_benchmark():
             "BENCHMARK_FIXED_SPAWN": "1" if fixed_spawn else "0",
             "BENCHMARK_RESULT_JSON": str(result_path),
             "SIMULATION_MAX_STEPS": str(steps),
-            "SIMULATION_DURATION_SECONDS": str(duration_seconds),
+            "SIMULATION_DURATION_SECONDS": str(child_duration_seconds),
             "SIM_BACKEND": "cpu" if backend == "cpu" else "cuda_strict",
             "SIM_ENGINE": "ecs_abm_cuda",
             "SIMULATION_ENGINE": "ecs_abm_cuda",
@@ -5451,14 +5569,25 @@ def run_benchmark():
             "SIM_HEADLESS": "1",
             "ABM_TURBO_PROFILE": "1",
             "TURBO_STATUS_INTERVAL_WALL": "0",
-            "TURBO_METRICS_INTERVAL_SIM": str(max(duration_seconds + abs(float(DT)), 1.0)),
+            "TURBO_BATCH_STEPS": str(batch_steps),
+            "TURBO_METRICS_INTERVAL_SIM": str(max(child_duration_seconds + abs(float(DT)), 1.0)),
             "TURBO_SAVE_METRICS": "1" if BENCHMARK_SAVE_CHILD_METRICS else "0",
             "TURBO_DISABLE_SECTION_STATS": "1",
             "SECTION_STATS_ENABLED": "0",
             "METRICS_PATH": str(metrics_path),
             "SCENARIO_ID": f"benchmark_{backend}",
+            "BENCHMARK_WARMUP_STEPS": str(warmup_steps),
+            "BENCHMARK_BATCH_STEPS": str(batch_steps),
             "SPAWN_PROFILE_FIELD_PREFIX": "__AVABM_BENCHMARK_DISABLED__" if fixed_spawn else str(SPAWN_PROFILE_FIELD_PREFIX),
         })
+        if backend == "cpu":
+            child_env.update({
+                "CPU_WORKERS": str(cpu_workers_for_benchmark),
+                "OMP_NUM_THREADS": str(cpu_workers_for_benchmark),
+                "MKL_NUM_THREADS": str(cpu_workers_for_benchmark),
+                "OPENBLAS_NUM_THREADS": str(cpu_workers_for_benchmark),
+                "NUMEXPR_NUM_THREADS": str(cpu_workers_for_benchmark),
+            })
         cmd = [
             sys.executable,
             str(PROJECT_DIR / "main.py"),
@@ -5540,9 +5669,12 @@ def run_benchmark():
         "mode": "benchmark",
         "steps": steps,
         "dt": float(DT),
-        "duration_seconds": duration_seconds,
+        "duration_seconds": timed_duration_seconds,
+        "warmup_steps": warmup_steps,
+        "batch_steps": batch_steps,
         "fixed_spawn": fixed_spawn,
         "order": order,
+        "cpu_workers": cpu_workers_for_benchmark,
         "speedup_cuda_over_cpu": speedup,
         "results": rows,
     }
@@ -5777,16 +5909,24 @@ def main():
             print("[Accel] mode=cuda | CUDA-focused per-tick simulation; CPU preprocessing follows ROUTE_PARALLEL settings")
     else:
         device = torch.device("cpu")
-        if CPU_WORKERS > 0:
-            try:
-                torch.set_num_threads(int(CPU_WORKERS))
-            except Exception as e:
-                print("[CPU Warning] torch.set_num_threads failed:", e)
+        cpu_requested = int(CPU_WORKERS)
+        cpu_resolved = int(cpu_requested if cpu_requested > 0 else (os.cpu_count() or 1))
+        cpu_resolved = max(1, min(cpu_resolved, 1024))
+        try:
+            torch.set_num_threads(cpu_resolved)
+        except Exception as e:
+            print("[CPU Warning] torch.set_num_threads failed:", e)
+        try:
+            torch.set_num_interop_threads(max(1, min(4, cpu_resolved)))
+        except Exception:
+            pass
+        for _env_name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+            os.environ.setdefault(_env_name, str(cpu_resolved))
         if hasattr(sim, "set_num_threads"):
-            sim.set_num_threads(int(CPU_WORKERS))
-        resolved_cpu_threads = int(sim.get_num_threads()) if hasattr(sim, "get_num_threads") else int(CPU_WORKERS or (os.cpu_count() or 1))
+            sim.set_num_threads(cpu_resolved)
+        resolved_cpu_threads = int(sim.get_num_threads()) if hasattr(sim, "get_num_threads") else cpu_resolved
         print("[Backend] selected: cpu")
-        print("[CPU] worker_threads:", resolved_cpu_threads, "requested:", int(CPU_WORKERS), "torch_threads:", torch.get_num_threads())
+        print("[CPU] worker_threads:", resolved_cpu_threads, "requested:", int(CPU_WORKERS), "torch_threads:", torch.get_num_threads(), "logical_cpu:", int(os.cpu_count() or 1))
         print("[Accel] mode=cpu | C++ std::thread backend for spawn/motion/stat steps; CUDA-only perception/priority kernels are bypassed.")
     def _sync_backend():
         if backend_is_cuda:
@@ -5951,6 +6091,9 @@ def main():
     sim_update_render_vbo_interpolated_full_draw = getattr(sim, "update_render_vbo_interpolated_full_draw", None)
     use_interpolated_full_draw = bool(backend_is_cuda and RENDER_INTERPOLATION and RENDER_ASYNC_FULL_DRAW and sim_update_render_vbo_interpolated_full_draw is not None)
     use_async_full_draw = bool(backend_is_cuda and RENDER_ASYNC_FULL_DRAW and sim_update_render_vbo_full_draw is not None)
+    simulation_step_limit_absolute = int(SIMULATION_MAX_STEPS)
+    benchmark_timed_start_step = 0
+    benchmark_completed_warmup_steps = 0
     if use_interpolated_full_draw:
         print("[RuntimeOpt] render_interpolated_full_draw: enabled | snapshot interpolation + no draw-count sync")
     elif use_async_full_draw:
@@ -5976,14 +6119,14 @@ def main():
             return 0
         return max(1, int(math.ceil((remaining - 1.0e-12) / float(DT))))
     def _steps_until_max_steps(start_step):
-        if int(SIMULATION_MAX_STEPS) <= 0:
+        if int(simulation_step_limit_absolute) <= 0:
             return None
-        remaining = int(SIMULATION_MAX_STEPS) - int(start_step)
+        remaining = int(simulation_step_limit_absolute) - int(start_step)
         if remaining <= 0:
             return 0
         return int(remaining)
     def _duration_or_step_limit_reached(current_time, current_step):
-        if int(SIMULATION_MAX_STEPS) > 0 and int(current_step) >= int(SIMULATION_MAX_STEPS):
+        if int(simulation_step_limit_absolute) > 0 and int(current_step) >= int(simulation_step_limit_absolute):
             return "step_limit"
         if SIMULATION_DURATION_SECONDS >= 0.0 and float(current_time) >= float(SIMULATION_DURATION_SECONDS):
             return "duration"
@@ -6053,6 +6196,32 @@ def main():
             "section_stats:", bool(SECTION_STATS_ENABLED),
             "metrics_interval_sim:", float(TURBO_METRICS_INTERVAL_SIM),
         )
+        if BENCHMARK_CHILD:
+            benchmark_timed_start_step = int(step)
+            benchmark_completed_warmup_steps = 0
+            warmup_remaining = int(BENCHMARK_WARMUP_STEPS)
+            if warmup_remaining > 0:
+                print("[Benchmark] warmup start | steps:", int(warmup_remaining), "excluded_from_timing: 1")
+                while warmup_remaining > 0:
+                    warmup_chunk = min(int(TURBO_BATCH_STEPS), int(warmup_remaining))
+                    warmup_chunk = max(1, int(warmup_chunk))
+                    _launch_cuda_steps(step, warmup_chunk)
+                    step += warmup_chunk
+                    warmup_remaining -= warmup_chunk
+                try:
+                    _sync_backend()
+                except Exception:
+                    pass
+                try:
+                    metrics.zero_()
+                    _sync_backend()
+                except Exception as e:
+                    print("[Benchmark] metrics reset after warmup failed:", e)
+                benchmark_timed_start_step = int(step)
+                benchmark_completed_warmup_steps = int(BENCHMARK_WARMUP_STEPS)
+                print("[Benchmark] warmup done | timed_start_step:", int(benchmark_timed_start_step))
+            if int(SIMULATION_MAX_STEPS) > 0:
+                simulation_step_limit_absolute = int(benchmark_timed_start_step) + int(SIMULATION_MAX_STEPS)
         start_wall = time.perf_counter()
         last_status_wall = start_wall
         last_metrics_sim = 0.0
@@ -6153,17 +6322,23 @@ def main():
                         return float(final_metrics.get(name, default) or 0.0)
                     except Exception:
                         return float(default)
+                timed_steps = max(0, int(final_step) - int(benchmark_timed_start_step))
+                timed_sim_time = float(timed_steps) * float(DT)
                 benchmark_result = {
                     "backend": str(sim_backend),
                     "requested_backend": str(SIM_BACKEND),
                     "reason": str(exit_reason),
-                    "steps": int(final_step),
+                    "steps": int(timed_steps),
+                    "total_steps": int(final_step),
+                    "warmup_steps": int(benchmark_completed_warmup_steps),
                     "target_steps": int(SIMULATION_MAX_STEPS),
+                    "batch_steps": int(TURBO_BATCH_STEPS),
                     "dt": float(DT),
-                    "sim_seconds": float(final_sim_time),
+                    "sim_seconds": float(timed_sim_time),
+                    "total_sim_seconds": float(final_sim_time),
                     "wall_seconds": float(elapsed),
-                    "steps_per_second": float(final_step) / float(elapsed),
-                    "sim_seconds_per_wall_second": float(final_sim_time) / float(elapsed),
+                    "steps_per_second": float(timed_steps) / float(elapsed),
+                    "sim_seconds_per_wall_second": float(timed_sim_time) / float(elapsed),
                     "fixed_spawn": bool(BENCHMARK_FIXED_SPAWN),
                     "total_spawn_vps": float(total_vps_host),
                     "spawned": int(round(_metric_number("spawned"))),
@@ -6173,6 +6348,7 @@ def main():
                     "avg_speed": float(_metric_number("avg_speed")),
                     "max_agents": int(MAX_AGENTS),
                     "num_spawn_points": int(num_spawn_points),
+                    "cpu_workers": int(cfg_int("CPU_WORKERS", 0)) if not backend_is_cuda else 0,
                     "num_lanes": int(num_lanes),
                     "seed": int(SCENARIO_SEED),
                 }
@@ -6186,10 +6362,19 @@ def main():
                     except Exception as e:
                         print("[Benchmark] result write failed:", e)
                 print("[BenchmarkResult] " + json.dumps(benchmark_result, ensure_ascii=False, sort_keys=True))
-            print(
-                f"[Turbo] finished reason={exit_reason} sim_time={format_sim_time(final_sim_time)} "
-                f"steps={final_step} wall={elapsed:.3f}s rate={final_sim_time / elapsed:.1f} sim_s/s"
-            )
+            if BENCHMARK_CHILD:
+                timed_steps_for_print = max(0, int(final_step) - int(benchmark_timed_start_step))
+                timed_sim_for_print = float(timed_steps_for_print) * float(DT)
+                print(
+                    f"[Turbo] finished reason={exit_reason} sim_time={format_sim_time(final_sim_time)} "
+                    f"timed_steps={timed_steps_for_print} total_steps={final_step} wall={elapsed:.3f}s "
+                    f"rate={timed_sim_for_print / elapsed:.1f} timed_sim_s/s"
+                )
+            else:
+                print(
+                    f"[Turbo] finished reason={exit_reason} sim_time={format_sim_time(final_sim_time)} "
+                    f"steps={final_step} wall={elapsed:.3f}s rate={final_sim_time / elapsed:.1f} sim_s/s"
+                )
         return
     pending_physics = None
     render_interp_start_wall = time.perf_counter()

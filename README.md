@@ -211,12 +211,29 @@ on the CUDA backend, then print and save a throughput comparison.
 run.bat benchmark
 ```
 
+You can also run one side only:
+
+```bash
+./run.sh benchmark cpu
+./run.sh benchmark gpu
+./run.sh benchmark --benchmark-order=cuda
+```
+
+```bat
+run.bat benchmark cpu
+run.bat benchmark gpu
+run.bat benchmark --benchmark-order=cuda
+```
+
 Defaults are configured in `config.txt`:
 
 ```text
 BENCHMARK_STEPS=10000
 BENCHMARK_ORDER=cpu,cuda
 BENCHMARK_FIXED_SPAWN=1
+BENCHMARK_WARMUP_STEPS=1000
+BENCHMARK_BATCH_STEPS=16384
+BENCHMARK_CPU_WORKERS=0
 BENCHMARK_OUTPUT_DIR=data/results
 BENCHMARK_SAVE_CHILD_METRICS=0
 ```
@@ -225,7 +242,11 @@ BENCHMARK_SAVE_CHILD_METRICS=0
 benchmark run, so both child runs use the same constant default spawn demand
 computed from `BASE_VPS`, lane/road-width multipliers, and `MAX_TOTAL_VPS`.
 Each child process also receives the same deterministic benchmark RNG state from
-`SCENARIO_SEED`.
+`SCENARIO_SEED`. `BENCHMARK_WARMUP_STEPS` runs before timing and resets metrics,
+which fills the road and reduces cold-start GPU utilization dips.
+`BENCHMARK_BATCH_STEPS` is intentionally large so CUDA can queue a long run with
+fewer host-side gaps. `BENCHMARK_CPU_WORKERS=0` resolves to all logical CPU
+threads and is passed to both Torch and the C++ CPU backend.
 
 Results are written to:
 

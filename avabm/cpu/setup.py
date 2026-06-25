@@ -1,4 +1,5 @@
 import os
+import hashlib
 from pathlib import Path
 from setuptools import setup, Extension
 
@@ -64,6 +65,7 @@ safety_interval = max(1, _int_value(_cfg(cfg, "CUDA_SAFETY_METRICS_INTERVAL", "1
 
 defines = [
     ("AVABM_CPU_CUDA_SOURCE_PARITY", "1"),
+    ("AVABM_CPU_PARALLEL_STATS_ENABLED", "1" if _truthy(_cfg(cfg, "CPU_PARALLEL_STATS_ENABLED", "1"), True) else "0"),
     ("AVABM_FAST_EQUIV_MATH", "1" if _truthy(_cfg(cfg, "CUDA_FAST_EQUIV_MATH", "1"), True) else "0"),
     ("AVABM_USE_ASYNC_MEMSET_CLEAR", "1" if _truthy(_cfg(cfg, "CUDA_USE_ASYNC_MEMSET_CLEAR", "1"), True) else "0"),
     ("AVABM_SPAWN_GRID_INSERT_FASTPATH", "1" if _truthy(_cfg(cfg, "CUDA_SPAWN_GRID_INSERT_FASTPATH", "1"), True) else "0"),
@@ -117,7 +119,7 @@ else:
 
 print(f"[Info] AVABM CUDA-source-parity CPU extension: c++{std}, O{opt}, flags={' '.join(compile_args)}")
 
-setup(
+_BUILD_RESULT = setup(
     name="avabm",
     version="0.3.0",
     packages=["avabm"],
@@ -134,3 +136,23 @@ setup(
         )
     ],
 )
+
+def _source_fingerprint():
+    h = hashlib.sha256()
+    for p in sorted([SRC_DIR / "binding.cpp", SRC_DIR / "cpu_kernels.cpp", SRC_DIR / "cpu_port_api.hpp", SRC_DIR / "main_common_cpu.hpp", SRC_DIR / "setup.py"], key=lambda x: str(x)):
+        if not p.exists():
+            continue
+        try:
+            rel = str(p.relative_to(ROOT)).replace(os.sep, "/")
+        except Exception:
+            rel = str(p)
+        h.update(rel.encode("utf-8", "ignore"))
+        h.update(b"\0")
+        h.update(p.read_bytes())
+        h.update(b"\0")
+    return h.hexdigest()
+
+try:
+    (SRC_DIR / ".avabm_cpu_ext_fingerprint").write_text(_source_fingerprint() + "\n", encoding="utf-8")
+except Exception as e:
+    print(f"[Warning] Failed to write CPU extension fingerprint: {e}")
