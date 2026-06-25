@@ -5,6 +5,7 @@ import time
 import json
 import csv
 import shutil
+import subprocess
 import queue
 import ctypes
 import threading
@@ -69,6 +70,14 @@ if "--visual" in _cli_args or "--window" in _cli_args or "--gui" in _cli_args:
 if "--headless" in _cli_args or "--turbo" in _cli_args:
     _CLI_CONFIG_OVERRIDES["HEADLESS_MODE"] = "1"
     _CLI_CONFIG_OVERRIDES["SIM_HEADLESS"] = "1"
+if "--cpu" in _cli_args or "--backend=cpu" in _cli_args:
+    _CLI_CONFIG_OVERRIDES["SIM_BACKEND"] = "cpu"
+if "--backend=auto" in _cli_args:
+    _CLI_CONFIG_OVERRIDES["SIM_BACKEND"] = "auto"
+if "--gpu" in _cli_args or "--cuda" in _cli_args or "--backend=cuda" in _cli_args:
+    _CLI_CONFIG_OVERRIDES["SIM_BACKEND"] = "cuda"
+if "--cuda-strict" in _cli_args or "--backend=cuda_strict" in _cli_args:
+    _CLI_CONFIG_OVERRIDES["SIM_BACKEND"] = "cuda_strict"
 if "--meso" in _cli_args or "--macro" in _cli_args or "--queue" in _cli_args:
     print("[Config] meso/macro/queue engine was removed; running ECS ABM CUDA instead.")
     _CLI_CONFIG_OVERRIDES["SIM_ENGINE"] = "ecs_abm_cuda"
@@ -151,14 +160,25 @@ CUDA_EXPENSIVE_SAFETY_METRICS_ENABLED = cfg_bool("CUDA_EXPENSIVE_SAFETY_METRICS_
 CUDA_EXPENSIVE_SAFETY_METRICS_INTERVAL = max(1, cfg_int("CUDA_EXPENSIVE_SAFETY_METRICS_INTERVAL", 1))
 CUDA_SAFETY_METRICS_INTERVAL = max(1, cfg_int("CUDA_SAFETY_METRICS_INTERVAL", CUDA_EXPENSIVE_SAFETY_METRICS_INTERVAL))
 CUDA_METRICS_MODE = max(0, min(2, cfg_int("CUDA_METRICS_MODE", 1)))
+SIM_BACKEND = str(cfg("SIM_BACKEND", cfg("AVABM_BACKEND", "auto"))).strip().lower()
+SIM_BACKEND = {"gpu": "cuda", "cuda_gpu": "cuda", "cpp_cpu": "cpu", "c++": "cpu"}.get(SIM_BACKEND, SIM_BACKEND)
+if SIM_BACKEND not in {"auto", "cuda", "cuda_strict", "cpu"}:
+    print(f"[Config Warning] Unsupported SIM_BACKEND={SIM_BACKEND!r}; using 'auto'.")
+    SIM_BACKEND = "auto"
+CPU_WORKERS = max(0, cfg_int("CPU_WORKERS", cfg_int("CPU_NUM_THREADS", 0)))
+CPU_AUTO_BUILD = cfg_bool("CPU_AUTO_BUILD", True)
 SIM_ENGINE = str(cfg("SIM_ENGINE", cfg("SIMULATION_ENGINE", "ecs_abm_cuda"))).strip().lower()
 ABM_ENGINE_ALIASES = {
-    "ecs", "ecs_cuda", "ecs_abm", "ecs_abm_cuda",
-    "micro", "micro_cuda", "cuda", "abm", "exact", "vehicle", "vehicle_cuda",
+    "ecs", "ecs_cuda", "ecs_abm", "ecs_abm_cuda", "ecs_cpu", "ecs_abm_cpu",
+    "micro", "micro_cuda", "cuda", "gpu", "cpu", "abm", "exact", "vehicle", "vehicle_cuda", "vehicle_cpu",
 }
+if SIM_ENGINE in {"ecs_cpu", "ecs_abm_cpu", "cpu", "vehicle_cpu"} and SIM_BACKEND == "auto":
+    SIM_BACKEND = "cpu"
+elif SIM_ENGINE in {"ecs_cuda", "ecs_abm_cuda", "cuda", "gpu", "vehicle_cuda"} and SIM_BACKEND == "auto":
+    SIM_BACKEND = "auto"
 if SIM_ENGINE not in ABM_ENGINE_ALIASES:
-    print(f"[Config Warning] Unsupported SIM_ENGINE={SIM_ENGINE!r}; using 'ecs_abm_cuda'.")
-SIM_ENGINE = "ecs_abm_cuda"
+    print(f"[Config Warning] Unsupported SIM_ENGINE={SIM_ENGINE!r}; using backend-selected ECS ABM engine.")
+SIM_ENGINE = "ecs_abm_cpu" if SIM_BACKEND == "cpu" else "ecs_abm_cuda"
 ROUTE_SEED = cfg_int("ROUTE_SEED", 20260529)
 MIN_TRIP_DISTANCE = cfg_float("MIN_TRIP_DISTANCE", 3000.0)
 MAX_ROUTE_TRIES = cfg_int("MAX_ROUTE_TRIES", 120000)
@@ -177,7 +197,7 @@ ROUTE_SPAWN_EXPANSION_WORKERS = max(1, int(ROUTE_WORKERS if _route_spawn_workers
 ROUTE_SPAWN_EXPANSION_MIN_ROUTES = cfg_int("ROUTE_SPAWN_EXPANSION_MIN_ROUTES", 1024)
 ROUTE_CACHE_VERSION = "ecs_v40_v30_mission_abandon_despawn"
 SIM_ACCELERATION_MODE = str(cfg("SIM_ACCELERATION_MODE", "hybrid")).strip().lower()
-if SIM_ACCELERATION_MODE not in {"hybrid", "cuda"}:
+if SIM_ACCELERATION_MODE not in {"hybrid", "cuda", "cpu"}:
     print(f"[Config Warning] Unsupported SIM_ACCELERATION_MODE={SIM_ACCELERATION_MODE!r}; using 'hybrid'.")
     SIM_ACCELERATION_MODE = "hybrid"
 WORLD_CELL_SIZE = cfg_float("WORLD_CELL_SIZE", 20.0)
@@ -5158,19 +5178,118 @@ class VehicleECSWorld:
         return self.arrays[key]
     def summary(self):
         component_count = sum(len(v) for v in self.components.values())
+        layout = "CUDA" if str(self.device).startswith("cuda") else "CPU"
         return (
             f"entities={self.max_entities} component_groups={len(self.components)} "
-            f"component_arrays={component_count} layout=SoA CUDA"
+            f"component_arrays={component_count} layout=SoA {layout}"
         )
-def main():
+def _build_cpu_extension_inplace():
+    setup_path = PROJECT_DIR / "avabm_cpu" / "setup.py"
+    if not setup_path.exists():
+        raise RuntimeError(f"CPU backend setup.py not found: {setup_path}")
+    print("[CPU] avabm_cpu extension is missing; building C++ CPU backend in place...")
+    subprocess.check_call([sys.executable, str(setup_path), "build_ext", "--inplace"], cwd=str(setup_path.parent))
+
+def _import_cpu_backend():
     try:
-        import avabm_cuda as sim
-    except ImportError as exc:
-        raise RuntimeError(
-            "avabm_cuda compiled module is missing or incompatible. "
-            "Runtime JIT compilation is disabled; use run.bat build or ./run.sh build once, "
-            "then start the simulator with run.bat or ./run.sh."
-        ) from exc
+        import avabm_cpu as sim
+        return sim
+    except ImportError as first_exc:
+        if not CPU_AUTO_BUILD:
+            raise RuntimeError(
+                "avabm_cpu extension is missing. Build it with `(cd avabm_cpu && python setup.py build_ext --inplace)` "
+                "or set CPU_AUTO_BUILD=1."
+            ) from first_exc
+        _build_cpu_extension_inplace()
+        try:
+            import importlib
+            return importlib.import_module("avabm_cpu")
+        except ImportError as second_exc:
+            raise RuntimeError("Failed to import avabm_cpu after building the CPU extension.") from second_exc
+
+def _resolve_sim_backend():
+    requested = str(SIM_BACKEND or "auto").strip().lower()
+    strict_cuda = requested == "cuda_strict"
+    if requested in {"cuda", "cuda_strict", "auto"}:
+        if torch.cuda.is_available():
+            try:
+                import avabm_cuda as sim
+                return sim, "cuda"
+            except ImportError as exc:
+                if strict_cuda:
+                    raise RuntimeError(
+                        "SIM_BACKEND=cuda_strict was requested, but avabm_cuda is missing or incompatible. "
+                        "Build it with run.bat build or ./run.sh build."
+                    ) from exc
+                print("[Backend Warning] CUDA is available, but avabm_cuda could not be imported; falling back to CPU backend.")
+        else:
+            if strict_cuda:
+                raise RuntimeError("SIM_BACKEND=cuda_strict was requested, but torch.cuda.is_available() is False.")
+            if requested in {"cuda", "auto"}:
+                print("[Backend] CUDA is not available; falling back to CPU backend.")
+    sim = _import_cpu_backend()
+    return sim, "cpu"
+
+def update_cpu_vehicle_vbo(vbo, veh, max_agents, verts_per_vehicle=6, textured=False):
+    """Upload CPU tensor vehicle geometry to the OpenGL VBO for visual CPU runs."""
+    from OpenGL.GL import glBindBuffer, glBufferSubData, GL_ARRAY_BUFFER
+    active = veh["active"].detach().cpu().numpy()
+    ids = np.nonzero(active == VEH_ON_LANE + 1)[0]
+    if ids.size <= 0:
+        return 0
+    if verts_per_vehicle != RENDER_BODY_VERTS_PER_VEHICLE:
+        ids = ids[: max(0, int(max_agents))]
+    ids = ids[: int(max_agents)]
+    x = veh["x"].detach().cpu().numpy()[ids].astype(np.float32, copy=False)
+    y = veh["y"].detach().cpu().numpy()[ids].astype(np.float32, copy=False)
+    h = veh["heading"].detach().cpu().numpy()[ids].astype(np.float32, copy=False)
+    length = np.maximum(veh["vehicle_length"].detach().cpu().numpy()[ids].astype(np.float32, copy=False), 0.5)
+    width = np.maximum(veh["vehicle_width"].detach().cpu().numpy()[ids].astype(np.float32, copy=False), 0.3)
+    driver = veh["driver_type"].detach().cpu().numpy()[ids].astype(np.float32, copy=False)
+    signal = np.zeros_like(driver, dtype=np.float32)
+    c = np.cos(h)
+    sn = np.sin(h)
+    local = np.asarray([[0.5, 0.5], [0.5, -0.5], [-0.5, -0.5], [0.5, 0.5], [-0.5, -0.5], [-0.5, 0.5]], dtype=np.float32)
+    uv = np.asarray([[1.0, 1.0], [1.0, 0.0], [0.0, 0.0], [1.0, 1.0], [0.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+    n = int(ids.size)
+    out = np.zeros((n, RENDER_BODY_VERTS_PER_VEHICLE, 7), dtype=np.float32)
+    lx = local[:, 0][None, :] * length[:, None]
+    ly = local[:, 1][None, :] * width[:, None]
+    out[:, :, 0] = x[:, None] + lx * c[:, None] - ly * sn[:, None]
+    out[:, :, 1] = y[:, None] + lx * sn[:, None] + ly * c[:, None]
+    if textured:
+        out[:, :, 2:4] = uv[None, :, :]
+        out[:, :, 4] = driver[:, None]
+        out[:, :, 5] = signal[:, None]
+        out[:, :, 6] = 1.0
+    else:
+        human = driver < 0.5
+        out[:, :, 2] = np.where(human[:, None], 0.94, 0.35)
+        out[:, :, 3] = np.where(human[:, None], 0.94, 0.78)
+        out[:, :, 4] = np.where(human[:, None], 0.90, 1.00)
+        out[:, :, 5] = 0.95
+        out[:, :, 6] = 1.0
+    arr = np.ascontiguousarray(out.reshape(-1))
+    glBindBuffer(GL_ARRAY_BUFFER, vbo)
+    if arr.nbytes > 0:
+        glBufferSubData(GL_ARRAY_BUFFER, 0, int(arr.nbytes), arr)
+    glBindBuffer(GL_ARRAY_BUFFER, 0)
+    return n
+
+def main():
+    global PHYSICS_ASYNC_SCHEDULER, RENDER_ASYNC_FULL_DRAW, RENDER_INTERPOLATION, RENDER_WHEELS, RENDER_VERTS_PER_VEHICLE
+    sim, sim_backend = _resolve_sim_backend()
+    backend_is_cuda = sim_backend == "cuda"
+    if not backend_is_cuda:
+        if PHYSICS_ASYNC_SCHEDULER:
+            print("[CPU] PHYSICS_ASYNC_SCHEDULER is CUDA-event based; disabling it for CPU backend.")
+        PHYSICS_ASYNC_SCHEDULER = False
+        RENDER_ASYNC_FULL_DRAW = False
+        RENDER_INTERPOLATION = False
+        if RENDER_WHEELS:
+            print("[CPU] RENDER_WHEELS uses CUDA VBO expansion; disabling wheel sub-geometry for CPU visual mode.")
+        RENDER_WHEELS = False
+        RENDER_VERTS_PER_VEHICLE = RENDER_BODY_VERTS_PER_VEHICLE
     if DT <= 0.0 or DT > 0.5:
         raise ValueError("DT must be in (0, 0.5] for ecs_abm_cuda")
     if not (0.0 <= AV_PENETRATION <= 1.0):
@@ -5365,15 +5484,33 @@ def main():
     cam_y = mid_y - SCREEN_H / (2.0 * scale * zoom)
     dragging = False
     last_mouse = (0, 0)
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is not available.")
-    torch.cuda.set_device(0)
-    device = torch.device("cuda:0")
-    print("[CUDA] device:", torch.cuda.get_device_name(0))
-    if SIM_ACCELERATION_MODE == "hybrid":
-        print("[Accel] mode=hybrid | CUDA: per-tick vehicles/perception/decision/motion/collision | CPU parallel: routes/static repair/metrics")
+    if backend_is_cuda:
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA backend was selected, but CUDA is not available.")
+        torch.cuda.set_device(0)
+        device = torch.device("cuda:0")
+        print("[Backend] selected: cuda")
+        print("[CUDA] device:", torch.cuda.get_device_name(0))
+        if SIM_ACCELERATION_MODE == "hybrid":
+            print("[Accel] mode=hybrid | CUDA: per-tick vehicles/perception/decision/motion/collision | CPU parallel: routes/static repair/metrics")
+        else:
+            print("[Accel] mode=cuda | CUDA-focused per-tick simulation; CPU preprocessing follows ROUTE_PARALLEL settings")
     else:
-        print("[Accel] mode=cuda | CUDA-focused per-tick simulation; CPU preprocessing follows ROUTE_PARALLEL settings")
+        device = torch.device("cpu")
+        if CPU_WORKERS > 0:
+            try:
+                torch.set_num_threads(int(CPU_WORKERS))
+            except Exception as e:
+                print("[CPU Warning] torch.set_num_threads failed:", e)
+        if hasattr(sim, "set_num_threads"):
+            sim.set_num_threads(int(CPU_WORKERS))
+        resolved_cpu_threads = int(sim.get_num_threads()) if hasattr(sim, "get_num_threads") else int(CPU_WORKERS or (os.cpu_count() or 1))
+        print("[Backend] selected: cpu")
+        print("[CPU] worker_threads:", resolved_cpu_threads, "requested:", int(CPU_WORKERS), "torch_threads:", torch.get_num_threads())
+        print("[Accel] mode=cpu | C++ std::thread backend for spawn/motion/stat steps; CUDA-only perception/priority kernels are bypassed.")
+    def _sync_backend():
+        if backend_is_cuda:
+            torch.cuda.synchronize()
     print("[Render] vehicle vertices:", RENDER_VERTS_PER_VEHICLE, "wheels:", bool(RENDER_WHEELS), "interval:", RENDER_INTERVAL, "textured:", bool(USE_TEXTURED_CARS), "interpolation:", bool(RENDER_INTERPOLATION), "interp_seconds:", float(RENDER_INTERP_SECONDS))
     print("[Scheduler] physics_async:", bool(PHYSICS_ASYNC_SCHEDULER), "physics_steps_per_frame:", int(PHYSICS_STEPS_PER_FRAME), "max_batch_steps:", int(PHYSICS_MAX_BATCH_STEPS), "frame_budget_ms:", float(PHYSICS_FRAME_BUDGET_MS))
     print("[Metrics] size:", METRICS_SIZE)
@@ -5499,11 +5636,14 @@ def main():
     metrics = torch.zeros(METRICS_SIZE, device=device, dtype=torch.float32)
     intersection_lock = torch.full((num_nodes,), -1, device=device, dtype=torch.int32)
     reservation_table = torch.full((num_nodes * RES_HORIZON_SLOTS,), -1, device=device, dtype=torch.int32)
-    torch.cuda.synchronize()
+    _sync_backend()
     if not HEADLESS_MODE:
-        sim.register_render_vbo(int(vehicle_vbo))
-        if hasattr(sim, "set_vehicle_texture_render"):
-            sim.set_vehicle_texture_render(bool(USE_TEXTURED_CARS))
+        if backend_is_cuda:
+            sim.register_render_vbo(int(vehicle_vbo))
+            if hasattr(sim, "set_vehicle_texture_render"):
+                sim.set_vehicle_texture_render(bool(USE_TEXTURED_CARS))
+        else:
+            print("[Render] CPU backend: vehicle VBO is updated from CPU tensors with glBufferSubData.")
         clock = pygame.time.Clock()
     else:
         clock = None
@@ -5523,8 +5663,8 @@ def main():
         print("[RuntimeOpt] batched_step: unavailable | falling back to one CUDA step per call")
     sim_update_render_vbo_full_draw = getattr(sim, "update_render_vbo_full_draw", None)
     sim_update_render_vbo_interpolated_full_draw = getattr(sim, "update_render_vbo_interpolated_full_draw", None)
-    use_interpolated_full_draw = bool(RENDER_INTERPOLATION and RENDER_ASYNC_FULL_DRAW and sim_update_render_vbo_interpolated_full_draw is not None)
-    use_async_full_draw = bool(RENDER_ASYNC_FULL_DRAW and sim_update_render_vbo_full_draw is not None)
+    use_interpolated_full_draw = bool(backend_is_cuda and RENDER_INTERPOLATION and RENDER_ASYNC_FULL_DRAW and sim_update_render_vbo_interpolated_full_draw is not None)
+    use_async_full_draw = bool(backend_is_cuda and RENDER_ASYNC_FULL_DRAW and sim_update_render_vbo_full_draw is not None)
     if use_interpolated_full_draw:
         print("[RuntimeOpt] render_interpolated_full_draw: enabled | snapshot interpolation + no draw-count sync")
     elif use_async_full_draw:
@@ -5606,7 +5746,7 @@ def main():
                 intersection_lock, reservation_table, int(num_nodes),
             )
             if DEBUG_SYNC:
-                torch.cuda.synchronize()
+                _sync_backend()
     if HEADLESS_MODE:
         print(
             "[Turbo] headless enabled | batch_steps:", int(TURBO_BATCH_STEPS),
@@ -5642,7 +5782,7 @@ def main():
                 step = end_step
                 current_time = float(step * DT)
                 if TURBO_SYNC_EVERY_BATCH or DEBUG_SYNC:
-                    torch.cuda.synchronize()
+                    _sync_backend()
                 if section_collector is not None:
                     section_collector.maybe_sample(current_time, end_step - 1, veh, force=False)
                 should_snapshot_metrics = False
@@ -5657,7 +5797,7 @@ def main():
                     and now_wall - last_status_wall >= float(TURBO_STATUS_INTERVAL_WALL)
                 )
                 if should_snapshot_metrics or should_status:
-                    torch.cuda.synchronize()
+                    _sync_backend()
                     snap = metrics_to_snapshot(metrics.detach().cpu().numpy())
                     if should_snapshot_metrics:
                         writer.write(step, snap)
@@ -5672,13 +5812,13 @@ def main():
                     )
                     last_status_wall = time.perf_counter()
                 if SIMULATION_DURATION_SECONDS < 0.0:
-                    torch.cuda.synchronize()
+                    _sync_backend()
         except KeyboardInterrupt:
             exit_reason = "keyboard_interrupt"
             print("[Turbo] interrupted by user")
         finally:
             try:
-                torch.cuda.synchronize()
+                _sync_backend()
             except Exception:
                 pass
             final_step = int(step)
@@ -5891,7 +6031,13 @@ def main():
             do_vehicle_render = bool(render_snapshot_dirty) or ((render_frame % RENDER_INTERVAL) == 0)
             can_update_vehicle_vbo = (not PHYSICS_ASYNC_SCHEDULER) or (pending_physics is None)
             if do_vehicle_render and can_update_vehicle_vbo:
-                if use_interpolated_full_draw:
+                if not backend_is_cuda:
+                    vehicle_draw_count = update_cpu_vehicle_vbo(
+                        vehicle_vbo, veh, int(MAX_AGENTS),
+                        verts_per_vehicle=int(RENDER_VERTS_PER_VEHICLE),
+                        textured=bool(USE_TEXTURED_CARS),
+                    )
+                elif use_interpolated_full_draw:
                     if RENDER_INTERP_SECONDS > 0.0:
                         render_alpha = (time.perf_counter() - render_interp_start_wall) / float(RENDER_INTERP_SECONDS)
                     else:
@@ -6013,7 +6159,7 @@ def main():
                 _complete_pending_physics_if_ready(force=True)
         except Exception:
             try:
-                torch.cuda.synchronize()
+                _sync_backend()
             except Exception:
                 pass
         final_step = int(step) if "step" in locals() else 0
@@ -6025,7 +6171,7 @@ def main():
         except Exception:
             final_reason = "normal"
         try:
-            torch.cuda.synchronize()
+            _sync_backend()
         except Exception:
             pass
         final_metrics = {}
@@ -6045,11 +6191,12 @@ def main():
         except Exception:
             pass
         try:
-            torch.cuda.synchronize()
+            _sync_backend()
         except Exception:
             pass
         try:
-            sim.unregister_render_vbo()
+            if backend_is_cuda:
+                sim.unregister_render_vbo()
         except Exception as e:
             print("[Warning] unregister failed:", e)
         pygame.quit()

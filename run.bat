@@ -7,6 +7,7 @@ cd /d "%~dp0"
 
 set "ROOT_DIR=%~dp0"
 set "CUDA_DIR=%~dp0avabm_cuda"
+set "CPU_DIR=%~dp0avabm_cpu"
 set "CONFIG_FILE=%~dp0config.txt"
 set "BUILD_HELPER=%CUDA_DIR%\build_helper.py"
 set "ORIGINAL_ARGS=%*"
@@ -29,6 +30,10 @@ if not defined TORCH_NVCC_FLAGS set "TORCH_NVCC_FLAGS=-allow-unsupported-compile
 if not defined TORCH_DONT_CHECK_COMPILER_ABI set "TORCH_DONT_CHECK_COMPILER_ABI=1"
 if not defined MAX_JOBS set "MAX_JOBS=1"
 if not defined CUDA_BUILD_MAX_JOBS set "CUDA_BUILD_MAX_JOBS=1"
+if not defined SIM_BACKEND set "SIM_BACKEND=auto"
+if not defined CPU_WORKERS set "CPU_WORKERS=0"
+if not defined CPU_AUTO_BUILD set "CPU_AUTO_BUILD=1"
+if not defined CPU_BUILD_MAX_JOBS set "CPU_BUILD_MAX_JOBS=0"
 if not defined TORCH_CUDA_ARCH_LIST set "TORCH_CUDA_ARCH_LIST=auto"
 if not defined CUDA_SUPPRESS_HEADER_WARNINGS set "CUDA_SUPPRESS_HEADER_WARNINGS=1"
 if not defined CUDA_SHOW_WARNINGS set "CUDA_SHOW_WARNINGS=0"
@@ -94,6 +99,12 @@ if /I "%~1"=="--visual" goto :cmd_visual
 if /I "%~1"=="gui" goto :cmd_visual
 if /I "%~1"=="--gui" goto :cmd_visual
 if /I "%~1"=="build" goto :cmd_build
+if /I "%~1"=="build-selected" goto :cmd_build
+if /I "%~1"=="selected-build" goto :cmd_build
+if /I "%~1"=="build-cuda" goto :cmd_build_cuda
+if /I "%~1"=="cuda-build" goto :cmd_build_cuda
+if /I "%~1"=="build-cpu" goto :cmd_build_cpu
+if /I "%~1"=="cpu-build" goto :cmd_build_cpu
 if /I "%~1"=="rebuild" goto :cmd_rebuild
 if /I "%~1"=="clean" goto :cmd_rebuild
 if /I "%~1"=="hardclean" goto :cmd_hardclean
@@ -112,23 +123,27 @@ echo.
 echo =======================================================
 echo AVABM Launcher
 echo =======================================================
-echo 1. Turbo   - headless CUDA batch run
-echo 2. Visual  - OpenGL/Pygame window run
-echo 3. Build CUDA only ^(skip if up to date^)
-echo 4. Clean rebuild CUDA
-echo 5. Hard clean + rebuild CUDA
-echo 6. CUDA build status
-echo 7. Exit
+echo 1. Turbo   - headless selected-backend batch run
+echo 2. Visual  - OpenGL/Pygame selected-backend window run
+echo 3. Build selected backend from SIM_BACKEND
+echo 4. Build CUDA only ^(skip if up to date^)
+echo 5. Build CPU only
+echo 6. Clean rebuild CUDA
+echo 7. Hard clean + rebuild CUDA
+echo 8. CUDA build status
+echo 9. Exit
 echo.
 set "CHOICE="
-set /p "CHOICE=Select [1-7]: "
+set /p "CHOICE=Select [1-9]: "
 if "%CHOICE%"=="1" goto :cmd_turbo
 if "%CHOICE%"=="2" goto :cmd_visual
 if "%CHOICE%"=="3" goto :cmd_build
-if "%CHOICE%"=="4" goto :cmd_rebuild
-if "%CHOICE%"=="5" goto :cmd_hardclean
-if "%CHOICE%"=="6" goto :cmd_status
-if "%CHOICE%"=="7" goto :finish
+if "%CHOICE%"=="4" goto :cmd_build_cuda
+if "%CHOICE%"=="5" goto :cmd_build_cpu
+if "%CHOICE%"=="6" goto :cmd_rebuild
+if "%CHOICE%"=="7" goto :cmd_hardclean
+if "%CHOICE%"=="8" goto :cmd_status
+if "%CHOICE%"=="9" goto :finish
 if /I "%CHOICE%"=="t" goto :cmd_turbo
 if /I "%CHOICE%"=="turbo" goto :cmd_turbo
 if /I "%CHOICE%"=="v" goto :cmd_visual
@@ -137,7 +152,7 @@ echo [Warning] Invalid selection.
 goto :menu
 
 :cmd_turbo
-call :ensure_cuda_built
+call :ensure_backend_built
 set "AVABM_EXIT_CODE=%ERRORLEVEL%"
 if not "%AVABM_EXIT_CODE%"=="0" goto :finish
 call :launch_mode turbo
@@ -145,7 +160,7 @@ set "AVABM_EXIT_CODE=%ERRORLEVEL%"
 goto :finish
 
 :cmd_visual
-call :ensure_cuda_built
+call :ensure_backend_built
 set "AVABM_EXIT_CODE=%ERRORLEVEL%"
 if not "%AVABM_EXIT_CODE%"=="0" goto :finish
 call :launch_mode visual
@@ -153,7 +168,17 @@ set "AVABM_EXIT_CODE=%ERRORLEVEL%"
 goto :finish
 
 :cmd_build
+call :ensure_backend_built
+set "AVABM_EXIT_CODE=%ERRORLEVEL%"
+goto :finish
+
+:cmd_build_cuda
 call :build_cuda auto
+set "AVABM_EXIT_CODE=%ERRORLEVEL%"
+goto :finish
+
+:cmd_build_cpu
+call :build_cpu
 set "AVABM_EXIT_CODE=%ERRORLEVEL%"
 goto :finish
 
@@ -231,6 +256,98 @@ exit /b 1
 echo [Info] CUDA extension is missing or stale. Building now...
 call :build_cuda auto
 exit /b %ERRORLEVEL%
+
+:python_cuda_available
+call :activate_conda
+if errorlevel 1 exit /b 1
+%PYTHON_COMMAND% -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)" >nul 2>nul
+exit /b %ERRORLEVEL%
+
+:build_cpu
+call :activate_conda
+if errorlevel 1 exit /b 1
+if not exist "%CPU_DIR%\setup.py" (
+    echo [Error] Missing CPU backend setup.py: %CPU_DIR%\setup.py
+    exit /b 1
+)
+echo [Info] Building C++ CPU extension in place...
+pushd "%CPU_DIR%"
+%PYTHON_COMMAND% setup.py build_ext --inplace
+set "AVABM_CPU_BUILD_RC=%ERRORLEVEL%"
+popd
+exit /b %AVABM_CPU_BUILD_RC%
+
+:ensure_cpu_built
+call :activate_conda
+if errorlevel 1 exit /b 1
+%PYTHON_COMMAND% -c "import avabm_cpu" >nul 2>nul
+if not errorlevel 1 exit /b 0
+if /I not "%CPU_AUTO_BUILD%"=="1" (
+    echo [Error] CPU backend is missing and CPU_AUTO_BUILD is disabled.
+    echo [Error] Build it with: cd avabm_cpu ^&^& %PYTHON_COMMAND% setup.py build_ext --inplace
+    exit /b 1
+)
+call :build_cpu
+exit /b %ERRORLEVEL%
+
+:ensure_backend_built
+set "REQUESTED_BACKEND=%SIM_BACKEND%"
+echo %ORIGINAL_ARGS% | findstr /I /C:"--cpu" /C:"--backend=cpu" >nul 2>nul
+if not errorlevel 1 set "REQUESTED_BACKEND=cpu"
+echo %ORIGINAL_ARGS% | findstr /I /C:"--gpu" /C:"--cuda" /C:"--backend=cuda" >nul 2>nul
+if not errorlevel 1 set "REQUESTED_BACKEND=cuda"
+echo %ORIGINAL_ARGS% | findstr /I /C:"--cuda-strict" /C:"--backend=cuda_strict" >nul 2>nul
+if not errorlevel 1 set "REQUESTED_BACKEND=cuda_strict"
+if not defined REQUESTED_BACKEND set "REQUESTED_BACKEND=auto"
+if /I "%REQUESTED_BACKEND%"=="cpu" goto :ensure_backend_cpu
+if /I "%REQUESTED_BACKEND%"=="cpp_cpu" goto :ensure_backend_cpu
+if /I "%REQUESTED_BACKEND%"=="c++" goto :ensure_backend_cpu
+if /I "%REQUESTED_BACKEND%"=="cuda_strict" goto :ensure_backend_cuda_strict
+if /I "%REQUESTED_BACKEND%"=="cuda" goto :ensure_backend_cuda_or_cpu
+if /I "%REQUESTED_BACKEND%"=="gpu" goto :ensure_backend_cuda_or_cpu
+goto :ensure_backend_auto
+
+:ensure_backend_cpu
+call :ensure_cpu_built
+exit /b %ERRORLEVEL%
+
+:ensure_backend_cuda_strict
+call :ensure_cuda_built
+exit /b %ERRORLEVEL%
+
+:ensure_backend_cuda_or_cpu
+call :python_cuda_available
+if errorlevel 1 (
+    echo [Warning] SIM_BACKEND=%REQUESTED_BACKEND% requested, but torch.cuda.is_available^(^) is false. Falling back to CPU backend.
+    call :ensure_cpu_built
+    if errorlevel 1 exit /b 1
+    exit /b 0
+)
+call :ensure_cuda_built
+if errorlevel 1 (
+    echo [Warning] CUDA backend build/verification failed. Falling back to CPU backend.
+    call :ensure_cpu_built
+    if errorlevel 1 exit /b 1
+    exit /b 0
+)
+exit /b 0
+
+:ensure_backend_auto
+call :python_cuda_available
+if errorlevel 1 (
+    echo [Info] CUDA is unavailable. Using C++ CPU backend.
+    call :ensure_cpu_built
+    if errorlevel 1 exit /b 1
+    exit /b 0
+)
+call :ensure_cuda_built
+if errorlevel 1 (
+    echo [Warning] CUDA backend build/verification failed. Falling back to CPU backend.
+    call :ensure_cpu_built
+    if errorlevel 1 exit /b 1
+    exit /b 0
+)
+exit /b 0
 
 :launch_mode
 set "RUN_MODE=%~1"

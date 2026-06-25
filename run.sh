@@ -4,6 +4,7 @@ set -Eeuo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 ROOT_DIR="$(pwd)"
 CUDA_DIR="$ROOT_DIR/avabm_cuda"
+CPU_DIR="$ROOT_DIR/avabm_cpu"
 CONFIG_FILE="$ROOT_DIR/config.txt"
 BUILD_HELPER="$CUDA_DIR/build_helper.py"
 
@@ -35,6 +36,10 @@ load_config "$CONFIG_FILE"
 : "${CUDA_INCREMENTAL_BUILD:=1}"
 : "${MAX_JOBS:=1}"
 : "${CUDA_BUILD_MAX_JOBS:=1}"
+: "${SIM_BACKEND:=auto}"
+: "${CPU_WORKERS:=0}"
+: "${CPU_AUTO_BUILD:=1}"
+: "${CPU_BUILD_MAX_JOBS:=0}"
 
 if [ ! -f "$BUILD_HELPER" ]; then
   echo "[Error] Missing CUDA build helper: $BUILD_HELPER" >&2
@@ -207,6 +212,103 @@ ensure_cuda_built() {
   esac
 }
 
+python_cuda_available() {
+  activate_conda
+  "$PYTHON_COMMAND" - <<'PY' >/dev/null 2>&1
+import sys
+try:
+    import torch
+    sys.exit(0 if torch.cuda.is_available() else 1)
+except Exception:
+    sys.exit(1)
+PY
+}
+
+build_cpu() {
+  activate_conda
+  if [ ! -f "$CPU_DIR/setup.py" ]; then
+    echo "[Error] Missing CPU backend setup.py: $CPU_DIR/setup.py" >&2
+    return 1
+  fi
+  echo "[Info] Building C++ CPU extension in place..."
+  (cd "$CPU_DIR" && "$PYTHON_COMMAND" setup.py build_ext --inplace)
+}
+
+ensure_cpu_built() {
+  local rc
+  activate_conda
+  set +e
+  "$PYTHON_COMMAND" -c 'import avabm_cpu' >/dev/null 2>&1
+  rc=$?
+  set -e
+  if [ "$rc" -eq 0 ]; then
+    return 0
+  fi
+  if [ "${CPU_AUTO_BUILD:-1}" != "1" ]; then
+    echo "[Error] CPU backend is missing and CPU_AUTO_BUILD is disabled." >&2
+    echo "[Error] Build it with: (cd avabm_cpu && $PYTHON_COMMAND setup.py build_ext --inplace)" >&2
+    return 1
+  fi
+  build_cpu
+}
+
+backend_from_args() {
+  local requested arg
+  requested="${SIM_BACKEND:-auto}"
+  for arg in "$@"; do
+    case "$arg" in
+      --cpu|--backend=cpu) requested="cpu" ;;
+      --gpu|--cuda|--backend=cuda) requested="cuda" ;;
+      --backend=cuda_strict|--cuda-strict) requested="cuda_strict" ;;
+    esac
+  done
+  printf '%s' "$requested" | tr '[:upper:]' '[:lower:]'
+}
+
+ensure_backend_built() {
+  local requested rc
+  requested="$(backend_from_args "$@")"
+  case "$requested" in
+    cpu|cpp_cpu|c++)
+      ensure_cpu_built
+      ;;
+    cuda_strict)
+      ensure_cuda_built
+      ;;
+    cuda|gpu)
+      if python_cuda_available; then
+        set +e
+        ensure_cuda_built
+        rc=$?
+        set -e
+        if [ "$rc" -eq 0 ]; then
+          return 0
+        fi
+        echo "[Warning] CUDA backend build/verification failed. Falling back to CPU backend."
+        ensure_cpu_built
+      else
+        echo "[Warning] SIM_BACKEND=$requested requested, but torch.cuda.is_available() is false. Falling back to CPU backend."
+        ensure_cpu_built
+      fi
+      ;;
+    auto|*)
+      if python_cuda_available; then
+        set +e
+        ensure_cuda_built
+        rc=$?
+        set -e
+        if [ "$rc" -eq 0 ]; then
+          return 0
+        fi
+        echo "[Warning] CUDA backend build/verification failed. Falling back to CPU backend."
+      else
+        echo "[Info] CUDA is unavailable. Using C++ CPU backend."
+      fi
+      ensure_cpu_built
+      ;;
+  esac
+}
+
 launch_mode() {
   local mode
   mode="$1"
@@ -240,15 +342,17 @@ show_menu() {
   echo "======================================================="
   echo "AVABM Launcher"
   echo "======================================================="
-  echo "1. Turbo   - headless CUDA batch run"
-  echo "2. Visual  - OpenGL/Pygame window run"
-  echo "3. Build CUDA only (skip if up to date)"
-  echo "4. Clean rebuild CUDA"
-  echo "5. Hard clean + rebuild CUDA"
-  echo "6. CUDA build status"
-  echo "7. Exit"
+  echo "1. Turbo   - headless selected-backend batch run"
+  echo "2. Visual  - OpenGL/Pygame selected-backend window run"
+  echo "3. Build selected backend from SIM_BACKEND"
+  echo "4. Build CUDA only (skip if up to date)"
+  echo "5. Build CPU only"
+  echo "6. Clean rebuild CUDA"
+  echo "7. Hard clean + rebuild CUDA"
+  echo "8. CUDA build status"
+  echo "9. Exit"
   echo
-  printf 'Select [1-7]: '
+  printf 'Select [1-9]: '
 }
 
 cmd="${1:-}"
@@ -259,10 +363,12 @@ if [ -z "$cmd" ]; then
     1|t|T|turbo|Turbo) set -- turbo ;;
     2|v|V|visual|Visual) set -- visual ;;
     3|b|B|build|Build) set -- build ;;
-    4|r|R|rebuild|Rebuild|clean|Clean) set -- rebuild ;;
-    5|h|H|hardclean|Hardclean|cleanall|clean-all) set -- hardclean ;;
-    6|s|S|status|Status|check|Check) set -- status ;;
-    7|q|Q|exit|Exit) exit 0 ;;
+    4|bc|build-cuda|cuda-build) set -- build-cuda ;;
+    5|cpu|build-cpu|cpu-build) set -- build-cpu ;;
+    6|r|R|rebuild|Rebuild|clean|Clean) set -- rebuild ;;
+    7|h|H|hardclean|Hardclean|cleanall|clean-all) set -- hardclean ;;
+    8|s|S|status|Status|check|Check) set -- status ;;
+    9|q|Q|exit|Exit) exit 0 ;;
     *) echo "[Error] Invalid selection." >&2; exit 1 ;;
   esac
   cmd="$1"
@@ -273,15 +379,21 @@ fi
 
 case "$cmd" in
   turbo|--turbo|headless|--headless)
-    ensure_cuda_built
+    ensure_backend_built "$@"
     launch_mode turbo "$@"
     ;;
   visual|--visual|gui|--gui|window|--window)
-    ensure_cuda_built
+    ensure_backend_built "$@"
     launch_mode visual "$@"
     ;;
-  build)
+  build|build-selected|selected-build)
+    ensure_backend_built "$@"
+    ;;
+  build-cuda|cuda-build)
     build_cuda auto
+    ;;
+  build-cpu|cpu-build)
+    build_cpu
     ;;
   rebuild|clean)
     build_cuda clean
@@ -295,7 +407,7 @@ case "$cmd" in
     ;;
   *)
     echo "[Error] Unknown command: $cmd" >&2
-    echo "Usage: ./run.sh [turbo|visual|build|rebuild|hardclean|status] [extra main.py args...]" >&2
+    echo "Usage: ./run.sh [turbo|visual|build|build-cuda|build-cpu|rebuild|hardclean|status] [extra main.py args...]" >&2
     exit 1
     ;;
 esac
