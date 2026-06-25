@@ -369,18 +369,19 @@ cmd="${1:-}"
 if [ -z "$cmd" ]; then
   show_menu
   read -r choice
+  choice="$(printf '%s' "$choice" | tr -d '[:space:]\"')"
   case "$choice" in
     1|t|T|turbo|Turbo) set -- turbo ;;
     2|v|V|visual|Visual) set -- visual ;;
     3|a|A|all|All|build|Build|build-all|all-build) set -- build ;;
     4|b|B|selected|build-selected|selected-build) set -- build-selected ;;
-    5|bc|build-cuda|cuda-build) set -- build-cuda ;;
-    6|cpu|build-cpu|cpu-build) set -- build-cpu ;;
+    5|bc|build-cuda|cuda-build|cuda|CUDA) set -- build-cuda ;;
+    6|cpu|CPU|build-cpu|cpu-build) set -- build-cpu ;;
     7|r|R|rebuild|Rebuild|clean|Clean) set -- rebuild ;;
     8|h|H|hardclean|Hardclean|cleanall|clean-all) set -- hardclean ;;
     9|s|S|status|Status|check|Check) set -- status ;;
-    10|q|Q|exit|Exit) exit 0 ;;
-    *) echo "[Error] Invalid selection." >&2; exit 1 ;;
+    10|0|q|Q|exit|Exit) exit 0 ;;
+    *) echo "[Error] Invalid selection: $choice" >&2; exit 1 ;;
   esac
   cmd="$1"
   shift || true
@@ -389,39 +390,43 @@ else
 fi
 
 case "$cmd" in
-  turbo|--turbo|headless|--headless)
+  1|turbo|--turbo|headless|--headless)
     ensure_backend_built "$@"
     launch_mode turbo "$@"
     ;;
-  visual|--visual|gui|--gui|window|--window)
+  2|visual|--visual|gui|--gui|window|--window)
     ensure_backend_built "$@"
     launch_mode visual "$@"
     ;;
-  build|build-all|all-build)
+  3|build|build-all|all-build|all)
     build_all
     ;;
-  build-selected|selected-build)
+  4|build-selected|selected-build|selected)
     ensure_backend_built "$@"
     ;;
-  build-cuda|cuda-build)
+  5|build-cuda|cuda-build|cuda)
     build_cuda auto
     ;;
-  build-cpu|cpu-build)
+  6|build-cpu|cpu-build|cpu)
     build_cpu
     ;;
-  rebuild|clean)
+  7|rebuild|clean)
     build_cuda clean
     ;;
-  hardclean|cleanall|clean-all)
+  8|hardclean|cleanall|clean-all)
     build_cuda hardclean
     ;;
-  status|check)
+  9|status|check)
     activate_conda
     "$PYTHON_COMMAND" "$BUILD_HELPER" status
+    ;;
+  10|0|q|Q|exit|Exit)
+    exit 0
     ;;
   *)
     echo "[Error] Unknown command: $cmd" >&2
     echo "Usage: ./run.sh [turbo|visual|build|build-selected|build-cuda|build-cpu|rebuild|hardclean|status] [extra main.py args...]" >&2
+    echo "       Numeric shortcuts are also accepted: 1..10"
     exit 1
     ;;
 esac

@@ -14,3 +14,4 @@
 /avabm/cuda/build
 /avabm/cuda/build_logs
 /avabm/cpu/build
+/avabm/__pycache__

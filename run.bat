@@ -91,6 +91,19 @@ if not exist "%BUILD_HELPER%" (
 )
 
 if "%~1"=="" goto :menu
+if "%~1"=="1" goto :cmd_turbo
+if "%~1"=="2" goto :cmd_visual
+if "%~1"=="3" goto :cmd_build_all
+if "%~1"=="4" goto :cmd_build_selected
+if "%~1"=="5" goto :cmd_build_cuda
+if "%~1"=="6" goto :cmd_build_cpu
+if "%~1"=="7" goto :cmd_rebuild
+if "%~1"=="8" goto :cmd_hardclean
+if "%~1"=="9" goto :cmd_status
+if "%~1"=="10" goto :finish
+if "%~1"=="0" goto :finish
+if /I "%~1"=="q" goto :finish
+if /I "%~1"=="exit" goto :finish
 if /I "%~1"=="turbo" goto :cmd_turbo
 if /I "%~1"=="--turbo" goto :cmd_turbo
 if /I "%~1"=="headless" goto :cmd_turbo
@@ -102,12 +115,16 @@ if /I "%~1"=="--gui" goto :cmd_visual
 if /I "%~1"=="build" goto :cmd_build_all
 if /I "%~1"=="build-all" goto :cmd_build_all
 if /I "%~1"=="all-build" goto :cmd_build_all
+if /I "%~1"=="all" goto :cmd_build_all
 if /I "%~1"=="build-selected" goto :cmd_build_selected
 if /I "%~1"=="selected-build" goto :cmd_build_selected
+if /I "%~1"=="selected" goto :cmd_build_selected
 if /I "%~1"=="build-cuda" goto :cmd_build_cuda
 if /I "%~1"=="cuda-build" goto :cmd_build_cuda
+if /I "%~1"=="cuda" goto :cmd_build_cuda
 if /I "%~1"=="build-cpu" goto :cmd_build_cpu
 if /I "%~1"=="cpu-build" goto :cmd_build_cpu
+if /I "%~1"=="cpu" goto :cmd_build_cpu
 if /I "%~1"=="rebuild" goto :cmd_rebuild
 if /I "%~1"=="clean" goto :cmd_rebuild
 if /I "%~1"=="hardclean" goto :cmd_hardclean
@@ -139,27 +156,52 @@ echo 10. Exit
 echo.
 set "CHOICE="
 set /p "CHOICE=Select [1-10]: "
-if "%CHOICE%"=="1" goto :cmd_turbo
-if "%CHOICE%"=="2" goto :cmd_visual
-if "%CHOICE%"=="3" goto :cmd_build_all
-if "%CHOICE%"=="4" goto :cmd_build_selected
-if "%CHOICE%"=="5" goto :cmd_build_cuda
-if "%CHOICE%"=="6" goto :cmd_build_cpu
-if "%CHOICE%"=="7" goto :cmd_rebuild
-if "%CHOICE%"=="8" goto :cmd_hardclean
-if "%CHOICE%"=="9" goto :cmd_status
-if "%CHOICE%"=="10" goto :finish
-if /I "%CHOICE%"=="t" goto :cmd_turbo
-if /I "%CHOICE%"=="turbo" goto :cmd_turbo
-if /I "%CHOICE%"=="v" goto :cmd_visual
-if /I "%CHOICE%"=="visual" goto :cmd_visual
-if /I "%CHOICE%"=="build" goto :cmd_build_all
-if /I "%CHOICE%"=="build-all" goto :cmd_build_all
-if /I "%CHOICE%"=="all" goto :cmd_build_all
-if /I "%CHOICE%"=="selected" goto :cmd_build_selected
-if /I "%CHOICE%"=="build-selected" goto :cmd_build_selected
-echo [Warning] Invalid selection.
+call :normalize_menu_choice
+if "%MENU_CHOICE%"=="1" goto :cmd_turbo
+if "%MENU_CHOICE%"=="2" goto :cmd_visual
+if "%MENU_CHOICE%"=="3" goto :cmd_build_all
+if "%MENU_CHOICE%"=="4" goto :cmd_build_selected
+if "%MENU_CHOICE%"=="5" goto :cmd_build_cuda
+if "%MENU_CHOICE%"=="6" goto :cmd_build_cpu
+if "%MENU_CHOICE%"=="7" goto :cmd_rebuild
+if "%MENU_CHOICE%"=="8" goto :cmd_hardclean
+if "%MENU_CHOICE%"=="9" goto :cmd_status
+if "%MENU_CHOICE%"=="10" goto :finish
+if "%MENU_CHOICE%"=="0" goto :finish
+if /I "%MENU_CHOICE%"=="q" goto :finish
+if /I "%MENU_CHOICE%"=="exit" goto :finish
+if /I "%MENU_CHOICE%"=="t" goto :cmd_turbo
+if /I "%MENU_CHOICE%"=="turbo" goto :cmd_turbo
+if /I "%MENU_CHOICE%"=="v" goto :cmd_visual
+if /I "%MENU_CHOICE%"=="visual" goto :cmd_visual
+if /I "%MENU_CHOICE%"=="build" goto :cmd_build_all
+if /I "%MENU_CHOICE%"=="build-all" goto :cmd_build_all
+if /I "%MENU_CHOICE%"=="all-build" goto :cmd_build_all
+if /I "%MENU_CHOICE%"=="all" goto :cmd_build_all
+if /I "%MENU_CHOICE%"=="selected" goto :cmd_build_selected
+if /I "%MENU_CHOICE%"=="build-selected" goto :cmd_build_selected
+if /I "%MENU_CHOICE%"=="selected-build" goto :cmd_build_selected
+if /I "%MENU_CHOICE%"=="cuda" goto :cmd_build_cuda
+if /I "%MENU_CHOICE%"=="build-cuda" goto :cmd_build_cuda
+if /I "%MENU_CHOICE%"=="cuda-build" goto :cmd_build_cuda
+if /I "%MENU_CHOICE%"=="cpu" goto :cmd_build_cpu
+if /I "%MENU_CHOICE%"=="build-cpu" goto :cmd_build_cpu
+if /I "%MENU_CHOICE%"=="cpu-build" goto :cmd_build_cpu
+if /I "%MENU_CHOICE%"=="rebuild" goto :cmd_rebuild
+if /I "%MENU_CHOICE%"=="clean" goto :cmd_rebuild
+if /I "%MENU_CHOICE%"=="hardclean" goto :cmd_hardclean
+if /I "%MENU_CHOICE%"=="cleanall" goto :cmd_hardclean
+if /I "%MENU_CHOICE%"=="clean-all" goto :cmd_hardclean
+if /I "%MENU_CHOICE%"=="status" goto :cmd_status
+if /I "%MENU_CHOICE%"=="check" goto :cmd_status
+echo [Warning] Invalid selection: %CHOICE%
 goto :menu
+
+:normalize_menu_choice
+set "MENU_CHOICE=%CHOICE%"
+set "MENU_CHOICE=%MENU_CHOICE: =%"
+set "MENU_CHOICE=%MENU_CHOICE:"=%"
+exit /b 0
 
 :cmd_turbo
 call :ensure_backend_built
