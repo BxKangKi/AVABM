@@ -1,675 +1,129 @@
 #ifndef AVABM_PART_SKIP_COMMON
 #include "main_common.cuh"
 #endif
-__global__ void clear_int_kernel(int* data, int n, int value) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) data[i] = value;
-}
-__global__ void clear_float_kernel(float* data, int n, float value) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) data[i] = value;
-}
-__global__ void clear_decision_kernel(DecisionSoA decision, int n, const int* active_ids, const int* active_count) {
-    AVABM_ACTIVE_LOOP_BEGIN(n, active_ids, active_count) decision.desired_speed[i] = 0.0f;
-    decision.target_accel[i] = 0.0f;
-    decision.wants_lane_change[i] = 0;
-    decision.lane_change_target[i] = -1;
-    decision.wants_connector[i] = 0;
-    decision.connector_target_lane[i] = -1;
-    decision.should_exit[i] = 0;
-    AVABM_ACTIVE_LOOP_END()
-}
-__global__ void compact_active_entities_kernel(ECSArrays ecs, int* active_ids, int* active_count, int max_entities) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    bool alive = (i < max_entities) && (ecs.alive[i] == ENTITY_ALIVE);
-    int out = avabm_warp_append_slot(alive, active_count);
-    if (alive && out >= 0 && out < max_entities) active_ids[out] = i;
-}
-__global__ void compact_active_archetypes_kernel(ECSArrays ecs, const int* active_ids, const int* active_count,
-        int* lane_active_ids, int* lane_active_count, int* connector_active_ids, int* connector_active_count, int max_entities) {
-    if (lane_active_ids == nullptr || lane_active_count == nullptr || connector_active_ids == nullptr ||
-            connector_active_count == nullptr) return;
-    AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) bool alive = (ecs.alive[i] == ENTITY_ALIVE);
-    int state = (alive && ecs.vehicle_state != nullptr) ? ecs.vehicle_state[i] : VEH_ON_LANE;
-    bool is_connector = alive && (state == VEH_IN_CONNECTOR);
-    bool is_lane = alive && !is_connector;
-    int conn_out = avabm_warp_append_slot(is_connector, connector_active_count);
-    if (is_connector && conn_out >= 0 && conn_out < max_entities) connector_active_ids[conn_out] = i;
-    int lane_out = avabm_warp_append_slot(is_lane, lane_active_count);
-    if (is_lane && lane_out >= 0 && lane_out < max_entities) lane_active_ids[lane_out] = i;
-    AVABM_ACTIVE_LOOP_END()
-}
-__global__ void compact_active_all_archetypes_kernel(ECSArrays ecs, int* active_ids, int* active_count, int* lane_active_ids,
-        int* lane_active_count, int* connector_active_ids, int* connector_active_count, int max_entities) {
-    if (active_ids == nullptr || active_count == nullptr || lane_active_ids == nullptr || lane_active_count == nullptr ||
-            connector_active_ids == nullptr || connector_active_count == nullptr) return;
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    bool alive = (i < max_entities) && (ecs.alive[i] == ENTITY_ALIVE);
-    int state = (alive && ecs.vehicle_state != nullptr) ? ecs.vehicle_state[i] : VEH_ON_LANE;
-    bool is_connector = alive && (state == VEH_IN_CONNECTOR);
-    bool is_lane = alive && !is_connector;
-    int active_out = avabm_warp_append_slot(alive, active_count);
-    if (alive && active_out >= 0 && active_out < max_entities) active_ids[active_out] = i;
-    int conn_out = avabm_warp_append_slot(is_connector, connector_active_count);
-    if (is_connector && conn_out >= 0 && conn_out < max_entities) connector_active_ids[conn_out] = i;
-    int lane_out = avabm_warp_append_slot(is_lane, lane_active_count);
-    if (is_lane && lane_out >= 0 && lane_out < max_entities) lane_active_ids[lane_out] = i;
-}
-__global__ void spatial_hash_build_system(ECSArrays ecs, SpatialGrid grid, int max_entities, const int* active_ids,
-        const int* active_count) {
-    AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) grid.cell_next[i] = -1;
-    if (ecs.alive[i] != ENTITY_ALIVE) continue;
-    int cell = world_cell_index(ecs.x[i], ecs.y[i], grid.min_x, grid.min_y, grid.cell_size, grid.width, grid.height);
-    if (cell < 0) continue;
-    grid_prepare_cell_for_write_ecs(grid, cell);
-    int old = atomicExch(&grid.cell_head[cell], i);
-    grid.cell_next[i] = old;
-    AVABM_ACTIVE_LOOP_END()
-}
-__global__ void lane_hash_build_system(ECSArrays ecs, RoadNetwork road, SpatialGrid grid, int max_entities, const int* active_ids,
-        const int* active_count) {
-    if (!avabm_lane_grid_available_ecs(grid)) return;
-    AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) grid.lane_cell_next[i] = -1;
-    if (ecs.alive[i] != ENTITY_ALIVE) continue;
-    if (ecs.vehicle_state[i] != VEH_ON_LANE) continue;
-    int lane = ecs.lane_id[i];
-    int cell = avabm_lane_grid_cell_from_s_ecs(lane, ecs.s[i], road, grid);
-    if (cell < 0) continue;
-    int old = atomicExch(&grid.lane_cell_head[cell], i);
-    grid.lane_cell_next[i] = old;
-    AVABM_ACTIVE_LOOP_END()
-}
-__global__ void clear_intersection_priority_gate_kernel(int* priority_table, int num_nodes) {
-    int node = blockIdx.x * blockDim.x + threadIdx.x;
-    if (node >= num_nodes || priority_table == nullptr) return;
-    int base = node * PRIORITY_GATE_SLOT_STRIDE;
-    priority_table[base + PRIORITY_GATE_SLOT_BEST] = PRIORITY_GATE_EMPTY;
-    priority_table[base + PRIORITY_GATE_SLOT_OCCUPIED] = 0;
-    priority_table[base + PRIORITY_GATE_SLOT_COUNT] = 0;
-    priority_table[base + PRIORITY_GATE_SLOT_GRANTED] = -1;
-}
-__global__ void mark_intersection_occupancy_kernel(ECSArrays ecs, RoadNetwork road, int* priority_table, int max_entities,
-        const int* active_ids, const int* active_count) {
-    AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) if (priority_table == nullptr ||
-            ecs.alive[i] != ENTITY_ALIVE || ecs.vehicle_state[i] != VEH_IN_CONNECTOR) continue;
-    int from_lane = ecs.connector_from_lane[i];
-    if (!valid_lane_ecs(from_lane, road)) continue;
-    int node = road.lane_end_node[from_lane];
-    if (node < 0 || node >= road.num_nodes) continue;
-    int base = node * PRIORITY_GATE_SLOT_STRIDE;
-    atomicAdd(&priority_table[base + PRIORITY_GATE_SLOT_OCCUPIED], 1);
-    AVABM_ACTIVE_LOOP_END()
-}
-__global__ void select_intersection_priority_candidates_kernel(ECSArrays ecs, RoadNetwork road, Signals signals,
-        DecisionSoA decision, PerceptionSoA perception, int* priority_table, float* metrics, float current_time, float dt,
-        int max_entities, const int* active_ids, const int* active_count) {
-    AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) if (priority_table == nullptr) continue;
-    int lane, next_lane, turn, node;
-    float dist_to_end;
-    bool signal_permits;
-    if (!intersection_priority_context_ecs(i, ecs, road, signals, current_time, lane, next_lane, turn, node, dist_to_end,
-            signal_permits)) {
-        continue;
-    }
-    if (dist_to_end > PRIORITY_GATE_APPROACH_RANGE) continue;
-    int key = priority_gate_key_ecs(i, lane, next_lane, turn, dist_to_end, perception, ecs, road);
-    int packed = (key << PRIORITY_GATE_ID_BITS) | (i & PRIORITY_GATE_ID_MASK);
-    int base = node * PRIORITY_GATE_SLOT_STRIDE;
-    atomicMin(&priority_table[base + PRIORITY_GATE_SLOT_BEST], packed);
-    atomicAdd(&priority_table[base + PRIORITY_GATE_SLOT_COUNT], 1);
-    if (metrics != nullptr) AVABM_METRIC_ADD(metrics, METRIC_PRIORITY_GATE_CANDIDATE, 1.0f);
-    AVABM_ACTIVE_LOOP_END()
-}
-__global__ void apply_intersection_priority_gate_kernel(ECSArrays ecs, RoadNetwork road, Signals signals, DecisionSoA decision,
-        SpatialGrid grid, PerceptionSoA perception, int* priority_table, float* metrics, float current_time, float dt,
-        int max_entities, const int* active_ids, const int* active_count) {
-    AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) if (priority_table == nullptr) continue;
-    int lane, next_lane, turn, node;
-    float dist_to_end;
-    bool signal_permits;
-    if (!intersection_priority_context_ecs(i, ecs, road, signals, current_time, lane, next_lane, turn, node, dist_to_end,
-            signal_permits)) {
-        continue;
-    }
-    int base = node * PRIORITY_GATE_SLOT_STRIDE;
-    int best = priority_table[base + PRIORITY_GATE_SLOT_BEST];
-    int count = priority_table[base + PRIORITY_GATE_SLOT_COUNT];
-    int occupied = priority_table[base + PRIORITY_GATE_SLOT_OCCUPIED];
-    if (best == PRIORITY_GATE_EMPTY || count <= 0) continue;
-    int key = priority_gate_key_ecs(i, lane, next_lane, turn, dist_to_end, perception, ecs, road);
-    int self_packed = (key << PRIORITY_GATE_ID_BITS) | (i & PRIORITY_GATE_ID_MASK);
-    int winner_id = best & PRIORITY_GATE_ID_MASK;
-    bool is_node_winner = ((i & PRIORITY_GATE_ID_MASK) == winner_id);
-    bool active_path_hold = false;
-    bool candidate_path_hold = false;
-    bool conflict_free = true;
-    bool path_blocked = priority_gate_path_blocked_ecs(i, lane, next_lane, turn, node, dist_to_end, self_packed, ecs, road,
-            signals, grid, perception, max_entities, current_time, dt, metrics, &active_path_hold, &candidate_path_hold,
-            &conflict_free);
-    float gate_wait_time = ecs.connector_length[i];
-    if (!isfinite(gate_wait_time) || gate_wait_time < 0.0f || ecs.vehicle_state[i] != VEH_ON_LANE) gate_wait_time = 0.0f;
-    bool gate_front_clear = priority_front_clear_ecs(i, perception, ecs);
-    bool gate_exit_clear = true;
+
+__global__ void clear_int_kernel(int* data, int n, int value) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) data[i] = value; } __global__ void clear_float_kernel(float* data, int n, float value) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) data[i] = value; }
+__global__ void clear_decision_kernel(DecisionSoA decision,int n,const int* active_ids,const int* active_count) { AVABM_ACTIVE_LOOP_BEGIN(n, active_ids, active_count) decision.desired_speed[i] = 0.0f; decision.target_accel[i] = 0.0f; decision.wants_lane_change[i] = 0; decision.lane_change_target[i] = -1; decision.wants_connector[i] = 0;
+decision.connector_target_lane[i] = -1; decision.should_exit[i] = 0; AVABM_ACTIVE_LOOP_END()} __global__ void compact_active_entities_kernel(ECSArrays ecs,int* active_ids,int* active_count,int max_entities) { int i = blockIdx.x * blockDim.x + threadIdx.x; bool alive = (i < max_entities) && (ecs.alive[i] == ENTITY_ALIVE);
+int out = avabm_warp_append_slot(alive, active_count); if (alive && out >= 0 && out < max_entities) active_ids[out] = i; } __global__ void compact_active_archetypes_kernel(ECSArrays ecs,const int* active_ids,const int* active_count,int* lane_active_ids,int* lane_active_count,int* connector_active_ids,int* connector_active_count,int max_entities) {
+if (lane_active_ids == nullptr || lane_active_count == nullptr || connector_active_ids == nullptr || connector_active_count == nullptr) return; AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) bool alive = (ecs.alive[i] == ENTITY_ALIVE); int state = (alive && ecs.vehicle_state != nullptr) ? ecs.vehicle_state[i] : VEH_ON_LANE;
+bool is_connector = alive && (state == VEH_IN_CONNECTOR); bool is_lane = alive && !is_connector; int conn_out = avabm_warp_append_slot(is_connector, connector_active_count); if (is_connector && conn_out >= 0 && conn_out < max_entities) connector_active_ids[conn_out] = i; int lane_out = avabm_warp_append_slot(is_lane, lane_active_count);
+if (is_lane && lane_out >= 0 && lane_out < max_entities) lane_active_ids[lane_out] = i; AVABM_ACTIVE_LOOP_END()} __global__ void compact_active_all_archetypes_kernel(ECSArrays ecs,int* active_ids,int* active_count,int* lane_active_ids,int* lane_active_count,int* connector_active_ids,int* connector_active_count,int max_entities) {
+if (active_ids == nullptr || active_count == nullptr || lane_active_ids == nullptr || lane_active_count == nullptr || connector_active_ids == nullptr || connector_active_count == nullptr) return; int i = blockIdx.x * blockDim.x + threadIdx.x; bool alive = (i < max_entities) && (ecs.alive[i] == ENTITY_ALIVE);
+int state = (alive && ecs.vehicle_state != nullptr) ? ecs.vehicle_state[i] : VEH_ON_LANE; bool is_connector = alive && (state == VEH_IN_CONNECTOR); bool is_lane = alive && !is_connector; int active_out = avabm_warp_append_slot(alive, active_count); if (alive && active_out >= 0 && active_out < max_entities) active_ids[active_out] = i;
+int conn_out = avabm_warp_append_slot(is_connector, connector_active_count); if (is_connector && conn_out >= 0 && conn_out < max_entities) connector_active_ids[conn_out] = i; int lane_out = avabm_warp_append_slot(is_lane, lane_active_count); if (is_lane && lane_out >= 0 && lane_out < max_entities) lane_active_ids[lane_out] = i; }
+__global__ void spatial_hash_build_system(ECSArrays ecs,SpatialGrid grid,int max_entities,const int* active_ids,const int* active_count) { AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) grid.cell_next[i] = -1; if (ecs.alive[i] != ENTITY_ALIVE) continue;
+int cell = world_cell_index(ecs.x[i],ecs.y[i],grid.min_x,grid.min_y,grid.cell_size,grid.width,grid.height); if (cell < 0) continue; grid_prepare_cell_for_write_ecs(grid, cell); int old = atomicExch(&grid.cell_head[cell], i); grid.cell_next[i] = old; AVABM_ACTIVE_LOOP_END()}
+__global__ void lane_hash_build_system(ECSArrays ecs,RoadNetwork road,SpatialGrid grid,int max_entities,const int* active_ids,const int* active_count) { if (!avabm_lane_grid_available_ecs(grid)) return; AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) grid.lane_cell_next[i] = -1; if (ecs.alive[i] != ENTITY_ALIVE) continue;
+if (ecs.vehicle_state[i] != VEH_ON_LANE) continue; int lane = ecs.lane_id[i]; int cell = avabm_lane_grid_cell_from_s_ecs(lane, ecs.s[i], road, grid); if (cell < 0) continue; int old = atomicExch(&grid.lane_cell_head[cell], i); grid.lane_cell_next[i] = old; AVABM_ACTIVE_LOOP_END()}
+__global__ void clear_intersection_priority_gate_kernel(int* priority_table,int num_nodes) { int node = blockIdx.x * blockDim.x + threadIdx.x; if (node >= num_nodes || priority_table == nullptr) return; int base = node * PRIORITY_GATE_SLOT_STRIDE; priority_table[base + PRIORITY_GATE_SLOT_BEST] = PRIORITY_GATE_EMPTY;
+priority_table[base + PRIORITY_GATE_SLOT_OCCUPIED] = 0; priority_table[base + PRIORITY_GATE_SLOT_COUNT] = 0; priority_table[base + PRIORITY_GATE_SLOT_GRANTED] = -1; } __global__ void mark_intersection_occupancy_kernel(ECSArrays ecs,RoadNetwork road,int* priority_table,int max_entities,const int* active_ids,const int* active_count) {
+AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) if (priority_table == nullptr || ecs.alive[i] != ENTITY_ALIVE || ecs.vehicle_state[i] != VEH_IN_CONNECTOR) continue; int from_lane = ecs.connector_from_lane[i]; if (!valid_lane_ecs(from_lane, road)) continue; int node = road.lane_end_node[from_lane];
+if (node < 0 || node >= road.num_nodes) continue; int base = node * PRIORITY_GATE_SLOT_STRIDE; atomicAdd(&priority_table[base + PRIORITY_GATE_SLOT_OCCUPIED], 1); AVABM_ACTIVE_LOOP_END()}
+__global__ void select_intersection_priority_candidates_kernel(ECSArrays ecs,RoadNetwork road,Signals signals,DecisionSoA decision,PerceptionSoA perception,int* priority_table,float* metrics,float current_time,float dt,int max_entities,const int* active_ids,const int* active_count) {
+AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) if (priority_table == nullptr) continue; int lane, next_lane, turn, node; float dist_to_end; bool signal_permits; if (!intersection_priority_context_ecs(i, ecs, road, signals, current_time,lane, next_lane, turn, node, dist_to_end, signal_permits)) { continue; }
+if (dist_to_end > PRIORITY_GATE_APPROACH_RANGE) continue; int key = priority_gate_key_ecs(i, lane, next_lane, turn, dist_to_end, perception, ecs, road); int packed = (key << PRIORITY_GATE_ID_BITS) | (i & PRIORITY_GATE_ID_MASK); int base = node * PRIORITY_GATE_SLOT_STRIDE; atomicMin(&priority_table[base + PRIORITY_GATE_SLOT_BEST], packed);
+atomicAdd(&priority_table[base + PRIORITY_GATE_SLOT_COUNT], 1); if (metrics != nullptr) AVABM_METRIC_ADD(metrics, METRIC_PRIORITY_GATE_CANDIDATE, 1.0f); AVABM_ACTIVE_LOOP_END()}
+__global__ void apply_intersection_priority_gate_kernel(ECSArrays ecs,RoadNetwork road,Signals signals,DecisionSoA decision,SpatialGrid grid,PerceptionSoA perception,int* priority_table,float* metrics,float current_time,float dt,int max_entities,const int* active_ids,const int* active_count) {
+AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) if (priority_table == nullptr) continue; int lane, next_lane, turn, node; float dist_to_end; bool signal_permits; if (!intersection_priority_context_ecs(i, ecs, road, signals, current_time,lane, next_lane, turn, node, dist_to_end, signal_permits)) { continue; }
+int base = node * PRIORITY_GATE_SLOT_STRIDE; int best = priority_table[base + PRIORITY_GATE_SLOT_BEST]; int count = priority_table[base + PRIORITY_GATE_SLOT_COUNT]; int occupied = priority_table[base + PRIORITY_GATE_SLOT_OCCUPIED]; if (best == PRIORITY_GATE_EMPTY || count <= 0) continue;
+int key = priority_gate_key_ecs(i, lane, next_lane, turn, dist_to_end, perception, ecs, road); int self_packed = (key << PRIORITY_GATE_ID_BITS) | (i & PRIORITY_GATE_ID_MASK); int winner_id = best & PRIORITY_GATE_ID_MASK; bool is_node_winner = ((i & PRIORITY_GATE_ID_MASK) == winner_id); bool active_path_hold = false; bool candidate_path_hold = false;
+bool conflict_free = true; bool path_blocked = priority_gate_path_blocked_ecs(i,lane,next_lane,turn,node,dist_to_end,self_packed,ecs,road,signals,grid,perception,max_entities,current_time,dt,metrics,&active_path_hold,&candidate_path_hold,&conflict_free); float gate_wait_time = ecs.connector_length[i];
+if (!isfinite(gate_wait_time) || gate_wait_time < 0.0f || ecs.vehicle_state[i] != VEH_ON_LANE) gate_wait_time = 0.0f; bool gate_front_clear = priority_front_clear_ecs(i, perception, ecs); bool gate_exit_clear = true;
 #if GRIDLOCK_NODE_DRAIN_ENABLED
-    if (gate_front_clear) {
-        gate_exit_clear = connector_exit_space_clear_ecs(i, lane, next_lane, ecs, road, grid, max_entities);
-    }
+if (gate_front_clear) { gate_exit_clear = connector_exit_space_clear_ecs(i, lane, next_lane, ecs, road, grid, max_entities); }
 #endif
-    bool gate_candidate_front_override = (path_blocked && candidate_path_hold && !active_path_hold && gate_front_clear &&
-            gate_wait_time >= PRIORITY_GATE_FRONT_CLEAR_OVERRIDE_WAIT);
+bool gate_candidate_front_override = (path_blocked && candidate_path_hold && !active_path_hold && gate_front_clear && gate_wait_time >= PRIORITY_GATE_FRONT_CLEAR_OVERRIDE_WAIT);
 #if GRIDLOCK_NODE_DRAIN_ENABLED
-    bool gate_long_drain_release = (path_blocked && candidate_path_hold && !active_path_hold && gate_front_clear &&
-            gate_exit_clear && dist_to_end <= GRIDLOCK_NODE_DRAIN_NEAR_DIST && gate_wait_time >= GRIDLOCK_NODE_DRAIN_WAIT);
+bool gate_long_drain_release = (path_blocked && candidate_path_hold && !active_path_hold && gate_front_clear && gate_exit_clear && dist_to_end <= GRIDLOCK_NODE_DRAIN_NEAR_DIST && gate_wait_time >= GRIDLOCK_NODE_DRAIN_WAIT);
 #else
-    bool gate_long_drain_release = false;
+bool gate_long_drain_release = false;
 #endif
-    if (gate_candidate_front_override || gate_long_drain_release) {
-        path_blocked = false;
-        if (metrics != nullptr) {
-            AVABM_METRIC_ADD(metrics, METRIC_FRONT_SPACE_RELEASE, 1.0f);
-            if (gate_long_drain_release) AVABM_METRIC_ADD(metrics, METRIC_DEADLOCK_RELEASE, 1.0f);
-        }
-    }
-    if (path_blocked) {
-        float v = fmaxf(ecs.speed[i], 0.0f);
-        float stop_dist = fmaxf(dist_to_end - PRIORITY_GATE_STOP_BUFFER, 0.60f);
-        float req = -(v * v) / fmaxf(2.0f * stop_dist, 0.5f);
-        req = clampf_cuda(req, -EMERGENCY_DECEL, -0.04f);
-        if (ecs.driver_type[i] == HUMAN) {
-            float courtesy = clampf_cuda(ecs.politeness[i], 0.0f, 1.0f);
-            req *= (1.0f + HUMAN_AI_COURTESY_HOLD_SCALE * courtesy);
-        }
-        decision.target_accel[i] = fminf(decision.target_accel[i], req);
-        decision.wants_connector[i] = 0;
-        decision.connector_target_lane[i] = -1;
-        float wait_time = ecs.connector_length[i];
-        if (!isfinite(wait_time) || wait_time < 0.0f || ecs.vehicle_state[i] != VEH_ON_LANE) wait_time = 0.0f;
-        if (dist_to_end <= PRIORITY_GATE_NEAR_LINE_DIST + 5.0f && ecs.speed[i] < 1.0f) {
-            ecs.connector_length[i] = fminf(wait_time + dt, 45.0f);
-        }
-        if (metrics != nullptr) {
-            AVABM_METRIC_ADD(metrics, METRIC_PRIORITY_GATE_BLOCKED, 1.0f);
-            AVABM_METRIC_ADD(metrics, METRIC_ENTRY_QUEUE_HOLD, dt);
-            if (active_path_hold || occupied > 0) AVABM_METRIC_ADD(metrics, METRIC_INTERSECTION_OCCUPIED_HOLD, 1.0f);
-        }
-        continue;
-    }
-    atomicMax(&priority_table[base + PRIORITY_GATE_SLOT_GRANTED], i);
-    bool human = ecs.driver_type[i] == HUMAN;
-    float target_v = human ? PRIORITY_GATE_RELEASE_SPEED_HUMAN : PRIORITY_GATE_RELEASE_SPEED_AV;
-    float max_accel = human ? MAX_ACCEL_HUMAN : MAX_ACCEL_AV;
-    float behavior = 0.5f;
-    if (human) {
-        behavior = clampf_cuda(0.52f * ecs.aggressiveness[i] + 0.38f * ecs.risk_tolerance[i] + 0.20f * (1.0f - ecs.politeness[i]),
-                0.0f, 1.0f);
-        target_v += HUMAN_AI_ASSERTIVE_BOOST_HUMAN * behavior;
-    } else {
-        target_v += HUMAN_AI_ASSERTIVE_BOOST_AV;
-    }
-    float release_a = (target_v - ecs.speed[i]) / fmaxf(dt, 0.01f);
-    float release_scale = human ? (0.32f + 0.28f * behavior) : PRIORITY_GATE_MAX_RELEASE_ACCEL;
-    release_a = clampf_cuda(release_a, 0.0f, max_accel * release_scale);
-    if (release_a > 0.0f) decision.target_accel[i] = fmaxf(decision.target_accel[i], release_a);
-    float v_after = fmaxf(0.0f, ecs.speed[i] + decision.target_accel[i] * dt);
-    float trigger = fmaxf(intersection_box_depth_ecs(lane, next_lane, road), v_after * dt + CONNECTOR_TRIGGER_MARGIN + 0.10f);
-    if (dist_to_end <= trigger) {
-        decision.wants_connector[i] = 1;
-        decision.connector_target_lane[i] = next_lane;
-    }
-    if (metrics != nullptr) {
-        AVABM_METRIC_ADD(metrics, METRIC_PRIORITY_GATE_GRANTED, 1.0f);
-        if (conflict_free) AVABM_METRIC_ADD(metrics, METRIC_PRIORITY_CONFLICT_FREE_GO, 1.0f);
-        if (count > 1 && !is_node_winner) AVABM_METRIC_ADD(metrics, METRIC_FRONT_SPACE_RELEASE, 1.0f);
-        if (human && release_a > 0.0f) AVABM_METRIC_ADD(metrics, METRIC_HUMAN_AI_ASSERTIVE_GO, 1.0f);
-        if (count > 1) {
-            AVABM_METRIC_ADD(metrics, METRIC_UNIQUE_PRIORITY_TIE, 1.0f);
-            if (is_node_winner || conflict_free) AVABM_METRIC_ADD(metrics, METRIC_DEADLOCK_PRIORITY_RELEASE, 1.0f);
-        }
-    }
-    AVABM_ACTIVE_LOOP_END()
-}
-__global__ void resolve_spawn_overlap_system_kernel(ECSArrays ecs, RoadNetwork road, SpatialGrid grid, SpawnConfig spawn,
-        float* metrics, float current_time, float dt, int max_entities, const int* active_ids, const int* active_count) {
-    AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) if (ecs.alive[i] != ENTITY_ALIVE) continue;
-    float recent_window = fmaxf(fmaxf(dt * 2.5f, SPAWN_RACE_RECENT_WINDOW), 1.0e-4f);
-    bool i_recent = fabsf(ecs.entry_time[i] - current_time) <= recent_window;
-    if (!i_recent) continue;
-    int lane_i = ecs.lane_id[i];
-    float limit = MAX_SPEED_FALLBACK;
-    if (lane_i >= 0 && lane_i < road.num_lanes) {
-        limit = road.lane_speed_limit[lane_i];
-        if (!isfinite(limit) || limit < 2.0f) limit = MAX_SPEED_FALLBACK;
-    }
-    limit = fmaxf(limit, avabm_min_cruise_speed_mps_ecs());
-    float required_gap = fmaxf(14.0f, ecs.length[i] + 0.95f * limit);
-    float radial_gap = fmaxf(8.0f, 0.70f * required_gap);
-    int base = world_cell_index(ecs.x[i], ecs.y[i], grid.min_x, grid.min_y, grid.cell_size, grid.width, grid.height);
-    if (base < 0) continue;
-    int bc_x = base % grid.width;
-    int bc_y = base / grid.width;
-    int cr = clampi_cuda((int)ceilf(radial_gap / fmaxf(grid.cell_size, 0.1f)) + 1, 1, WORLD_MAX_CELL_RADIUS);
-    bool delete_i = false;
-    for (int dy = -cr; dy <= cr && !delete_i; ++dy) {
-        for (int dx = -cr; dx <= cr && !delete_i; ++dx) {
-            int cx = bc_x + dx;
-            int cy = bc_y + dy;
-            if (cx < 0 || cx >= grid.width || cy < 0 || cy >= grid.height) continue;
-            int j = grid_head_ecs(grid, cy * grid.width + cx);
-            int guard = 0;
-            while (j >= 0 && guard < avabm_world_scan_limit_ecs(max_entities) && !delete_i) {
-                if (j != i && ecs.alive[j] == ENTITY_ALIVE) {
-                    float dxp = ecs.x[j] - ecs.x[i];
-                    float dyp = ecs.y[j] - ecs.y[i];
-                    float d2 = dxp * dxp + dyp * dyp;
-                    bool same_surface = ecs.lane_id[j] == lane_i;
-                    same_surface = same_surface || ecs.connector_from_lane[j] == lane_i;
-                    same_surface = same_surface || ecs.connector_to_lane[j] == lane_i;
-                    same_surface = same_surface || ecs.lane_change_from_lane[j] == lane_i;
-                    same_surface = same_surface || ecs.lane_change_to_lane[j] == lane_i;
-                    bool spatial_conflict = d2 < radial_gap * radial_gap;
-                    bool lane_conflict = false;
-                    if (same_surface) {
-                        float gap = fabsf(ecs.s[j] - ecs.s[i]) - 0.5f * ecs.length[j] - 0.5f * ecs.length[i];
-                        lane_conflict = gap < required_gap;
-                    }
-                    if (spatial_conflict || lane_conflict) {
-                        bool j_recent = fabsf(ecs.entry_time[j] - current_time) <= recent_window;
-                        if (!j_recent) {
-                            delete_i = true;
-                        } else {
-                            delete_i = i > j;
-                        }
-                    }
-                }
-                j = grid.cell_next[j];
-                guard++;
-            }
-        }
-    }
-    if (delete_i) {
-        int rid = ecs.route_id[i];
-        requeue_spawn_demand_for_vehicle_ecs(lane_i, rid, spawn);
-        ecs.alive[i] = ENTITY_FREE;
-        ecs.speed[i] = 0.0f;
-        ecs.accel[i] = 0.0f;
-        if (metrics != nullptr) {
-            AVABM_METRIC_ADD(metrics, METRIC_SPAWN_FAIL, 1.0f);
-            AVABM_METRIC_ADD(metrics, METRIC_PENETRATION_PREVENTED, 1.0f);
-        }
-    }
-    AVABM_ACTIVE_LOOP_END()
-}
-__global__ void spawn_system_kernel(ECSArrays ecs, RoadNetwork road, SpatialGrid grid, SpawnConfig spawn, uint32_t* rng_state,
-        float* metrics, int* spawn_lane_locks, int spawn_lock_count, float current_time, float dt, int max_entities,
-        int step_index, int* active_ids, int* active_count) {
-    int p = blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= spawn.num_spawn_points) return;
-    int ln = spawn.spawn_lane[p];
-    int rid = spawn.spawn_route[p];
-    if (ln < 0 || ln >= road.num_lanes || rid < 0 || rid >= road.num_routes) {
-        return;
-    }
-    int initial_route_pos = route_pos_for_lane_ecs(rid, ln, road);
-    if (initial_route_pos < 0) {
-        AVABM_METRIC_ADD(metrics, METRIC_SPAWN_FAIL, 1.0f);
-        return;
-    }
-    float rate = spawn_rate_vps_at(spawn, p, current_time);
-    uint32_t st = rng_state[p] ^ ((uint32_t)step_index * 747796405u + (uint32_t)p * 2891336453u + 1u);
-    float acc = spawn.spawn_accumulator[p] + rate * dt;
-    if (!isfinite(acc) || acc < 0.0f) acc = 0.0f;
-    acc = fminf(acc, SPAWN_ACCUMULATOR_MAX);
-    int count = clampi_cuda((int)floorf(acc), 0, SPAWN_MAX_PER_POINT_PER_STEP);
-    if (count <= 0) {
-        spawn.spawn_accumulator[p] = acc;
-        rng_state[p] = st;
-        return;
-    }
-    if (spawn_lane_locks != nullptr && spawn_lock_count > 0) {
-        int lock_idx = ln % spawn_lock_count;
-        int old_owner = atomicCAS(&spawn_lane_locks[lock_idx], RESERVATION_FREE, p);
-        if (old_owner != RESERVATION_FREE && old_owner != p) {
-            spawn.spawn_accumulator[p] = acc;
-            rng_state[p] = st;
-            if (metrics != nullptr) AVABM_METRIC_ADD(metrics, METRIC_ENTRY_QUEUE_HOLD, dt);
-            return;
-        }
-    }
-    spawn.spawn_accumulator[p] = acc - (float)count;
-    int failed = 0;
-    int deferred = 0;
-    int spawned_now = 0;
-    for (int c = 0; c < count; ++c) {
-        float len = 4.2f + 0.7f * rand_uniform(st);
-        float wid = 1.7f + 0.25f * rand_uniform(st);
-        float limit = road.lane_speed_limit[ln];
-        if (!isfinite(limit) || limit < 2.0f) limit = MAX_SPEED_FALLBACK;
-        limit = fmaxf(limit, avabm_min_cruise_speed_mps_ecs());
-        float required_gap = fmaxf(12.0f, len + 0.80f * limit);
-        float center_spacing = required_gap + len + 1.0f;
-        float spawn_s = len * 0.5f + 2.0f + (float)spawned_now * center_spacing;
-        float max_spawn_s = fmaxf(0.0f, road.lane_length[ln] - len * 0.5f - 0.25f);
-        if (spawn_s > max_spawn_s) {
-            deferred += count - c;
-            break;
-        }
-        spawn_s = clampf_cuda(spawn_s, 0.0f, max_spawn_s);
-        float px, py;
-        lane_xy_from_s(ln, spawn_s, road, px, py);
-        bool entry_clear = spawn_area_clear(ln, spawn_s, px, py, len, ecs, road, grid, max_entities, -1);
+if (gate_candidate_front_override || gate_long_drain_release) { path_blocked = false; if (metrics != nullptr) { AVABM_METRIC_ADD(metrics, METRIC_FRONT_SPACE_RELEASE, 1.0f); if (gate_long_drain_release) AVABM_METRIC_ADD(metrics, METRIC_DEADLOCK_RELEASE, 1.0f); } } if (path_blocked) { float v = fmaxf(ecs.speed[i], 0.0f);
+float stop_dist = fmaxf(dist_to_end - PRIORITY_GATE_STOP_BUFFER, 0.60f); float req = -(v * v) / fmaxf(2.0f * stop_dist, 0.5f); req = clampf_cuda(req, -EMERGENCY_DECEL, -0.04f); if (ecs.driver_type[i] == HUMAN) { float courtesy = clampf_cuda(ecs.politeness[i], 0.0f, 1.0f); req *= (1.0f + HUMAN_AI_COURTESY_HOLD_SCALE * courtesy); }
+decision.target_accel[i] = fminf(decision.target_accel[i], req); decision.wants_connector[i] = 0; decision.connector_target_lane[i] = -1; float wait_time = ecs.connector_length[i]; if (!isfinite(wait_time) || wait_time < 0.0f || ecs.vehicle_state[i] != VEH_ON_LANE) wait_time = 0.0f;
+if (dist_to_end <= PRIORITY_GATE_NEAR_LINE_DIST + 5.0f && ecs.speed[i] < 1.0f) { ecs.connector_length[i] = fminf(wait_time + dt, 45.0f); } if (metrics != nullptr) { AVABM_METRIC_ADD(metrics, METRIC_PRIORITY_GATE_BLOCKED, 1.0f); AVABM_METRIC_ADD(metrics, METRIC_ENTRY_QUEUE_HOLD, dt);
+if (active_path_hold || occupied > 0) AVABM_METRIC_ADD(metrics, METRIC_INTERSECTION_OCCUPIED_HOLD, 1.0f); } continue; } atomicMax(&priority_table[base + PRIORITY_GATE_SLOT_GRANTED], i); bool human = ecs.driver_type[i] == HUMAN; float target_v = human ? PRIORITY_GATE_RELEASE_SPEED_HUMAN : PRIORITY_GATE_RELEASE_SPEED_AV;
+float max_accel = human ? MAX_ACCEL_HUMAN : MAX_ACCEL_AV; float behavior = 0.5f; if (human) { behavior = clampf_cuda(0.52f * ecs.aggressiveness[i] + 0.38f * ecs.risk_tolerance[i] + 0.20f * (1.0f - ecs.politeness[i]),0.0f,1.0f); target_v += HUMAN_AI_ASSERTIVE_BOOST_HUMAN * behavior; } else { target_v += HUMAN_AI_ASSERTIVE_BOOST_AV; }
+float release_a = (target_v - ecs.speed[i]) / fmaxf(dt, 0.01f); float release_scale = human ? (0.32f + 0.28f * behavior) : PRIORITY_GATE_MAX_RELEASE_ACCEL; release_a = clampf_cuda(release_a, 0.0f, max_accel * release_scale); if (release_a > 0.0f) decision.target_accel[i] = fmaxf(decision.target_accel[i], release_a);
+float v_after = fmaxf(0.0f, ecs.speed[i] + decision.target_accel[i] * dt); float trigger = fmaxf(intersection_box_depth_ecs(lane, next_lane, road),v_after * dt + CONNECTOR_TRIGGER_MARGIN + 0.10f); if (dist_to_end <= trigger) { decision.wants_connector[i] = 1; decision.connector_target_lane[i] = next_lane; } if (metrics != nullptr) {
+AVABM_METRIC_ADD(metrics, METRIC_PRIORITY_GATE_GRANTED, 1.0f); if (conflict_free) AVABM_METRIC_ADD(metrics, METRIC_PRIORITY_CONFLICT_FREE_GO, 1.0f); if (count > 1 && !is_node_winner) AVABM_METRIC_ADD(metrics, METRIC_FRONT_SPACE_RELEASE, 1.0f); if (human && release_a > 0.0f) AVABM_METRIC_ADD(metrics, METRIC_HUMAN_AI_ASSERTIVE_GO, 1.0f); if (count > 1) {
+AVABM_METRIC_ADD(metrics, METRIC_UNIQUE_PRIORITY_TIE, 1.0f); if (is_node_winner || conflict_free) AVABM_METRIC_ADD(metrics, METRIC_DEADLOCK_PRIORITY_RELEASE, 1.0f); } } AVABM_ACTIVE_LOOP_END()}
+__global__ void resolve_spawn_overlap_system_kernel(ECSArrays ecs,RoadNetwork road,SpatialGrid grid,SpawnConfig spawn,float* metrics,float current_time,float dt,int max_entities,const int* active_ids,const int* active_count) { AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) if (ecs.alive[i] != ENTITY_ALIVE) continue;
+float recent_window = fmaxf(fmaxf(dt * 2.5f, SPAWN_RACE_RECENT_WINDOW), 1.0e-4f); bool i_recent = fabsf(ecs.entry_time[i] - current_time) <= recent_window; if (!i_recent) continue; int lane_i = ecs.lane_id[i]; float limit = MAX_SPEED_FALLBACK; if (lane_i >= 0 && lane_i < road.num_lanes) { limit = road.lane_speed_limit[lane_i];
+if (!isfinite(limit) || limit < 2.0f) limit = MAX_SPEED_FALLBACK; } limit = fmaxf(limit, avabm_min_cruise_speed_mps_ecs()); float required_gap = fmaxf(14.0f, ecs.length[i] + 0.95f * limit); float radial_gap = fmaxf(8.0f, 0.70f * required_gap); int base = world_cell_index(ecs.x[i],ecs.y[i],grid.min_x,grid.min_y,grid.cell_size,grid.width,grid.height);
+if (base < 0) continue; int bc_x = base % grid.width; int bc_y = base / grid.width; int cr = clampi_cuda((int)ceilf(radial_gap / fmaxf(grid.cell_size, 0.1f)) + 1,1,WORLD_MAX_CELL_RADIUS); bool delete_i = false; for (int dy = -cr; dy <= cr && !delete_i; ++dy) { for (int dx = -cr; dx <= cr && !delete_i; ++dx) { int cx = bc_x + dx; int cy = bc_y + dy;
+if (cx < 0 || cx >= grid.width || cy < 0 || cy >= grid.height) continue; int j = grid_head_ecs(grid, cy * grid.width + cx); int guard = 0; while (j >= 0 && guard < avabm_world_scan_limit_ecs(max_entities) && !delete_i) { if (j != i && ecs.alive[j] == ENTITY_ALIVE) { float dxp = ecs.x[j] - ecs.x[i]; float dyp = ecs.y[j] - ecs.y[i];
+float d2 = dxp * dxp + dyp * dyp; bool same_surface = ecs.lane_id[j] == lane_i; same_surface = same_surface || ecs.connector_from_lane[j] == lane_i; same_surface = same_surface || ecs.connector_to_lane[j] == lane_i; same_surface = same_surface || ecs.lane_change_from_lane[j] == lane_i; same_surface = same_surface || ecs.lane_change_to_lane[j] == lane_i;
+bool spatial_conflict = d2 < radial_gap * radial_gap; bool lane_conflict = false; if (same_surface) { float gap = fabsf(ecs.s[j] - ecs.s[i]) - 0.5f * ecs.length[j] - 0.5f * ecs.length[i]; lane_conflict = gap < required_gap; } if (spatial_conflict || lane_conflict) { bool j_recent = fabsf(ecs.entry_time[j] - current_time) <= recent_window; if (!j_recent) {
+delete_i = true; } else { delete_i = i > j; } } } j = grid.cell_next[j]; guard++; } } } if (delete_i) { int rid = ecs.route_id[i]; requeue_spawn_demand_for_vehicle_ecs(lane_i, rid, spawn); ecs.alive[i] = ENTITY_FREE; ecs.speed[i] = 0.0f; ecs.accel[i] = 0.0f; if (metrics != nullptr) { AVABM_METRIC_ADD(metrics, METRIC_SPAWN_FAIL, 1.0f);
+AVABM_METRIC_ADD(metrics, METRIC_PENETRATION_PREVENTED, 1.0f); } } AVABM_ACTIVE_LOOP_END()}
+__global__ void spawn_system_kernel(ECSArrays ecs,RoadNetwork road,SpatialGrid grid,SpawnConfig spawn,uint32_t* rng_state,float* metrics,int* spawn_lane_locks,int spawn_lock_count,float current_time,float dt,int max_entities,int step_index,int* active_ids,int* active_count) { int p = blockIdx.x * blockDim.x + threadIdx.x;
+if (p >= spawn.num_spawn_points) return; int ln = spawn.spawn_lane[p]; int rid = spawn.spawn_route[p]; if (ln < 0 || ln >= road.num_lanes || rid < 0 || rid >= road.num_routes) { return; } int initial_route_pos = route_pos_for_lane_ecs(rid, ln, road); if (initial_route_pos < 0) { AVABM_METRIC_ADD(metrics, METRIC_SPAWN_FAIL, 1.0f); return; }
+float rate = spawn_rate_vps_at(spawn, p, current_time); uint32_t st = rng_state[p] ^ ((uint32_t)step_index * 747796405u + (uint32_t)p * 2891336453u + 1u); float acc = spawn.spawn_accumulator[p] + rate * dt; if (!isfinite(acc) || acc < 0.0f) acc = 0.0f; acc = fminf(acc, SPAWN_ACCUMULATOR_MAX);
+int count = clampi_cuda((int)floorf(acc), 0, SPAWN_MAX_PER_POINT_PER_STEP); if (count <= 0) { spawn.spawn_accumulator[p] = acc; rng_state[p] = st; return; } if (spawn_lane_locks != nullptr && spawn_lock_count > 0) { int lock_idx = ln % spawn_lock_count; int old_owner = atomicCAS(&spawn_lane_locks[lock_idx], RESERVATION_FREE, p);
+if (old_owner != RESERVATION_FREE && old_owner != p) { spawn.spawn_accumulator[p] = acc; rng_state[p] = st; if (metrics != nullptr) AVABM_METRIC_ADD(metrics, METRIC_ENTRY_QUEUE_HOLD, dt); return; } } spawn.spawn_accumulator[p] = acc - (float)count; int failed = 0; int deferred = 0; int spawned_now = 0; for (int c = 0; c < count; ++c) {
+float len = 4.2f + 0.7f * rand_uniform(st); float wid = 1.7f + 0.25f * rand_uniform(st); float limit = road.lane_speed_limit[ln]; if (!isfinite(limit) || limit < 2.0f) limit = MAX_SPEED_FALLBACK; limit = fmaxf(limit, avabm_min_cruise_speed_mps_ecs()); float required_gap = fmaxf(12.0f, len + 0.80f * limit); float center_spacing = required_gap + len + 1.0f;
+float spawn_s = len * 0.5f + 2.0f + (float)spawned_now * center_spacing; float max_spawn_s = fmaxf(0.0f, road.lane_length[ln] - len * 0.5f - 0.25f); if (spawn_s > max_spawn_s) { deferred += count - c; break; } spawn_s = clampf_cuda(spawn_s, 0.0f, max_spawn_s); float px, py; lane_xy_from_s(ln, spawn_s, road, px, py);
+bool entry_clear = spawn_area_clear(ln,spawn_s,px,py,len,ecs,road,grid,max_entities,-1);
 #if !AVABM_SPAWN_GRID_INSERT_FASTPATH
-        if (entry_clear) {
-            entry_clear = spawn_area_clear_fullscan(ln, spawn_s, px, py, len, ecs, road, max_entities, -1);
-        }
+if (entry_clear) { entry_clear = spawn_area_clear_fullscan(ln,spawn_s,px,py,len,ecs,road,max_entities,-1); }
 #endif
-        if (!entry_clear) {
-            deferred += count - c;
-            break;
-        }
-        int id = -1;
+if (!entry_clear) { deferred += count - c; break; } int id = -1;
 #if AVABM_ECS_CURSOR_ALLOCATOR
-        if (spawn.spawn_alloc_cursor != nullptr && max_entities > 0) {
-            int scan_limit = clampi_cuda(AVABM_SPAWN_ALLOC_SCAN_LIMIT, 32, max_entities);
-            unsigned int old_cursor = atomicAdd((unsigned int*)spawn.spawn_alloc_cursor, (unsigned int)scan_limit);
-            int start_id = (int)(old_cursor % (unsigned int)max_entities);
-            for (int k = 0; k < scan_limit; ++k) {
-                int cand = start_id + k;
-                if (cand >= max_entities) cand -= max_entities;
-                if (atomicCAS((unsigned int*)&ecs.alive[cand], ENTITY_FREE, ENTITY_SPAWNING) == ENTITY_FREE) {
-                    id = cand;
-                    break;
-                }
-            }
-        }
+if (spawn.spawn_alloc_cursor != nullptr && max_entities > 0) { int scan_limit = clampi_cuda(AVABM_SPAWN_ALLOC_SCAN_LIMIT, 32, max_entities); unsigned int old_cursor = atomicAdd((unsigned int*)spawn.spawn_alloc_cursor, (unsigned int)scan_limit); int start_id = (int)(old_cursor % (unsigned int)max_entities); for (int k = 0; k < scan_limit; ++k) {
+int cand = start_id + k; if (cand >= max_entities) cand -= max_entities; if (atomicCAS((unsigned int*)&ecs.alive[cand], ENTITY_FREE, ENTITY_SPAWNING) == ENTITY_FREE) { id = cand; break; } } }
 #endif
-        for (int tries = 0; id < 0 && tries < 16; ++tries) {
-            int cand = clampi_cuda((int)(rand_uniform(st) * max_entities), 0, max_entities - 1);
-            if (atomicCAS((unsigned int*)&ecs.alive[cand], ENTITY_FREE, ENTITY_SPAWNING) == ENTITY_FREE) {
-                id = cand;
-                break;
-            }
-        }
-        if (id < 0) {
-            int start_id = clampi_cuda((int)(rand_uniform(st) * max_entities), 0, max_entities - 1);
-            int scan_limit = clampi_cuda(AVABM_SPAWN_ALLOC_SCAN_LIMIT, 32, max_entities);
-            int stride = 9973 + (int)((uint32_t)p * 37u + (uint32_t)c * 101u) % 7919;
-            if (stride < 1) stride = 1;
-            for (int k = 0; k < scan_limit; ++k) {
-                int cand = (start_id + k * stride) % max_entities;
-                if (atomicCAS((unsigned int*)&ecs.alive[cand], ENTITY_FREE, ENTITY_SPAWNING) == ENTITY_FREE) {
-                    id = cand;
-                    break;
-                }
-            }
-        }
-        if (id < 0) {
-            deferred += count - c;
-            if (metrics != nullptr) AVABM_METRIC_ADD(metrics, METRIC_ENTRY_QUEUE_HOLD, dt * (float)(count - c));
-            break;
-        }
-        uint32_t rs = rng_state[id + spawn.num_spawn_points] ^ ((uint32_t)step_index + 12345u) ^ ((uint32_t)p * 1103515245u);
-        int dtype = rand_uniform(rs) < clampf_cuda(spawn.av_penetration, 0.0f, 1.0f) ? AV : HUMAN;
-        ecs.x[id] = px;
-        ecs.y[id] = py;
-        ecs.s[id] = spawn_s;
+for (int tries = 0; id < 0 && tries < 16; ++tries) { int cand = clampi_cuda((int)(rand_uniform(st) * max_entities), 0, max_entities - 1); if (atomicCAS((unsigned int*)&ecs.alive[cand], ENTITY_FREE, ENTITY_SPAWNING) == ENTITY_FREE) { id = cand; break; } } if (id < 0) { int start_id = clampi_cuda((int)(rand_uniform(st) * max_entities), 0, max_entities - 1);
+int scan_limit = clampi_cuda(AVABM_SPAWN_ALLOC_SCAN_LIMIT, 32, max_entities); int stride = 9973 + (int)((uint32_t)p * 37u + (uint32_t)c * 101u) % 7919; if (stride < 1) stride = 1; for (int k = 0; k < scan_limit; ++k) { int cand = (start_id + k * stride) % max_entities;
+if (atomicCAS((unsigned int*)&ecs.alive[cand], ENTITY_FREE, ENTITY_SPAWNING) == ENTITY_FREE) { id = cand; break; } } } if (id < 0) { deferred += count - c; if (metrics != nullptr) AVABM_METRIC_ADD(metrics, METRIC_ENTRY_QUEUE_HOLD, dt * (float)(count - c)); break; }
+uint32_t rs = rng_state[id + spawn.num_spawn_points] ^ ((uint32_t)step_index + 12345u) ^ ((uint32_t)p * 1103515245u); int dtype = rand_uniform(rs) < clampf_cuda(spawn.av_penetration, 0.0f, 1.0f) ? AV : HUMAN; ecs.x[id] = px; ecs.y[id] = py; ecs.s[id] = spawn_s;
 #if AVABM_MIN_CRUISE_SPEED_ENABLED
-        float min_spawn_v = avabm_min_cruise_speed_mps_ecs();
-        float spawn_v = fmaxf(limit * 0.45f, min_spawn_v);
-        spawn_v = fminf(spawn_v, fmaxf(limit, min_spawn_v));
-        ecs.speed[id] = fmaxf(0.0f, spawn_v);
+float min_spawn_v = avabm_min_cruise_speed_mps_ecs(); float spawn_v = fmaxf(limit * 0.45f, min_spawn_v); spawn_v = fminf(spawn_v, fmaxf(limit, min_spawn_v)); ecs.speed[id] = fmaxf(0.0f, spawn_v);
 #else
-        ecs.speed[id] = clampf_cuda(limit * 0.45f, 3.0f, limit * 0.7f);
+ecs.speed[id] = clampf_cuda(limit * 0.45f, 3.0f, limit * 0.7f);
 #endif
-        ecs.accel[id] = 0.0f;
-        ecs.heading[id] = lane_heading(ln, road);
-        ecs.steer_angle[id] = 0.0f;
-        ecs.length[id] = len;
-        ecs.width[id] = wid;
-        ecs.driver_type[id] = dtype;
-        ecs.reaction_time[id] = dtype == AV ? 0.38f : 1.55f;
-        ecs.min_gap[id] = dtype == AV ? SAFE_GAP_AV : SAFE_GAP_HUMAN;
-        ecs.lane_id[id] = ln;
-        ecs.route_id[id] = rid;
-        ecs.route_pos[id] = initial_route_pos;
-        ecs.entry_time[id] = current_time;
-        ecs.vehicle_state[id] = VEH_ON_LANE;
-        ecs.connector_from_lane[id] = -1;
-        ecs.connector_to_lane[id] = -1;
-        ecs.connector_s[id] = 0.0f;
-        ecs.connector_length[id] = 0.0f;
-        ecs.lane_change_active[id] = 0;
-        ecs.lane_change_from_lane[id] = ln;
-        ecs.lane_change_to_lane[id] = ln;
-        ecs.lane_change_t[id] = 0.0f;
-        ecs.lane_change_duration[id] = dtype == AV ? LANE_CHANGE_DURATION_AV : LANE_CHANGE_DURATION_HUMAN;
-        if (ecs.turn_signal != nullptr) ecs.turn_signal[id] = INDICATOR_NONE;
-        if (ecs.turn_signal_time != nullptr) ecs.turn_signal_time[id] = 0.0f;
-        init_driver_personality_ecs(id, dtype, rs, ecs);
-        rng_state[id + spawn.num_spawn_points] = rs;
-        __threadfence();
+ecs.accel[id] = 0.0f; ecs.heading[id] = lane_heading(ln, road); ecs.steer_angle[id] = 0.0f; ecs.length[id] = len; ecs.width[id] = wid; ecs.driver_type[id] = dtype; ecs.reaction_time[id] = dtype == AV ? 0.38f : 1.55f; ecs.min_gap[id] = dtype == AV ? SAFE_GAP_AV : SAFE_GAP_HUMAN; ecs.lane_id[id] = ln; ecs.route_id[id] = rid;
+ecs.route_pos[id] = initial_route_pos; ecs.entry_time[id] = current_time; ecs.vehicle_state[id] = VEH_ON_LANE; ecs.connector_from_lane[id] = -1; ecs.connector_to_lane[id] = -1; ecs.connector_s[id] = 0.0f; ecs.connector_length[id] = 0.0f; ecs.lane_change_active[id] = 0; ecs.lane_change_from_lane[id] = ln; ecs.lane_change_to_lane[id] = ln;
+ecs.lane_change_t[id] = 0.0f; ecs.lane_change_duration[id] = dtype == AV ? LANE_CHANGE_DURATION_AV : LANE_CHANGE_DURATION_HUMAN; if (ecs.turn_signal != nullptr) ecs.turn_signal[id] = INDICATOR_NONE; if (ecs.turn_signal_time != nullptr) ecs.turn_signal_time[id] = 0.0f; init_driver_personality_ecs(id, dtype, rs, ecs);
+rng_state[id + spawn.num_spawn_points] = rs; __threadfence();
 #if AVABM_SPAWN_GRID_INSERT_FASTPATH
-        insert_new_spawn_into_grid_ecs(id, ecs, grid);
-        __threadfence();
+insert_new_spawn_into_grid_ecs(id, ecs, grid); __threadfence();
 #endif
-        atomicExch((unsigned int*)&ecs.alive[id], (unsigned int)ENTITY_ALIVE);
-        __threadfence();
+atomicExch((unsigned int*)&ecs.alive[id], (unsigned int)ENTITY_ALIVE); __threadfence();
 #if AVABM_INCREMENTAL_ACTIVE_LIST
-        if (active_ids != nullptr && active_count != nullptr) {
-            int slot = atomicAdd(active_count, 1);
-            if (slot >= 0 && slot < max_entities) active_ids[slot] = id;
-        }
+if (active_ids != nullptr && active_count != nullptr) { int slot = atomicAdd(active_count, 1); if (slot >= 0 && slot < max_entities) active_ids[slot] = id; }
 #endif
-        spawned_now++;
-        AVABM_METRIC_ADD(metrics, METRIC_SPAWNED, 1.0f);
-    }
-    if (failed > 0 || deferred > 0) {
-        spawn.spawn_accumulator[p] = fminf(spawn.spawn_accumulator[p] + (float)(failed + deferred), SPAWN_ACCUMULATOR_MAX);
-    }
-    rng_state[p] = st;
-}
-__global__ void turn_signal_system_kernel(ECSArrays ecs, DecisionSoA decision, RoadNetwork road, float* metrics, float dt,
-        int max_entities, const int* active_ids, const int* active_count) {
-    AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) decision.desired_speed[i] = 0.0f;
-    decision.target_accel[i] = 0.0f;
-    decision.wants_lane_change[i] = 0;
-    decision.lane_change_target[i] = -1;
-    decision.wants_connector[i] = 0;
-    decision.connector_target_lane[i] = -1;
-    decision.should_exit[i] = 0;
-    if (ecs.alive[i] != ENTITY_ALIVE) {
-        if (ecs.turn_signal != nullptr) ecs.turn_signal[i] = INDICATOR_NONE;
-        if (ecs.turn_signal_time != nullptr) ecs.turn_signal_time[i] = 0.0f;
-        continue;
-    }
-    int desired_signal = INDICATOR_NONE;
-    int lane = ecs.lane_id[i];
-    bool human = ecs.driver_type[i] == HUMAN;
-    if (ecs.vehicle_state[i] == VEH_IN_CONNECTOR) {
-        int turn = turn_code_from_lanes_ecs(ecs.connector_from_lane[i], ecs.connector_to_lane[i], road);
-        if (turn == TURN_LEFT) desired_signal = INDICATOR_LEFT;
-        else if (turn == TURN_RIGHT) desired_signal = INDICATOR_RIGHT;
-    } else if (valid_lane_ecs(lane, road)) {
-        if (ecs.lane_change_active[i] != 0) {
-            desired_signal = indicator_from_lateral_move_ecs(ecs.lane_change_from_lane[i], ecs.lane_change_to_lane[i], road);
-        }
-        int rid = ecs.route_id[i];
-        int rpos = ecs.route_pos[i];
-        if (rid >= 0 && rid < road.num_routes) {
-            int repaired_pos = repair_route_pos_unless_missed_exit_tail_ecs(lane, rid, rpos, road);
-            if (repaired_pos >= 0) {
-                rpos = repaired_pos;
-                ecs.route_pos[i] = repaired_pos;
-            }
-            int ro0 = road.route_offsets[rid];
-            int ro1 = road.route_offsets[rid + 1];
-            int route_len = ro1 - ro0;
-            if (rpos >= 0 && rpos < route_len) {
-                int next_lane = route_next_lane_for_vehicle_ecs(i, ecs, road);
-                rpos = ecs.route_pos[i];
-                bool has_next = valid_lane_ecs(next_lane, road) && lane_connected(lane, next_lane, road);
-                int turn = route_turn_for_vehicle_ecs(i, ecs, road);
-                if (has_next) {
-                    turn = effective_turn_code_ecs(lane, next_lane, turn, road);
-                    int adjusted_next = interchange_receiving_outer_lane_ecs(lane, next_lane, road);
-                    adjusted_next = receiving_lane_for_turn_ecs(adjusted_next, turn, road);
-                    adjusted_next = interchange_receiving_outer_lane_ecs(lane, adjusted_next, road);
-                    if (valid_lane_ecs(adjusted_next, road) && lane_connected(lane, adjusted_next, road)) {
-                        next_lane = adjusted_next;
-                    }
-                }
-                float L = fmaxf(road.lane_length[lane], 0.1f);
-                float dist_to_end = fmaxf(0.0f, L - ecs.s[i]);
-                float turn_lookahead = human ? INDICATOR_TURN_LOOKAHEAD_HUMAN : INDICATOR_TURN_LOOKAHEAD_AV;
-                float lc_lookahead = human ? INDICATOR_LC_LOOKAHEAD_HUMAN : INDICATOR_LC_LOOKAHEAD_AV;
-                int interchange_source_lane = has_next ? interchange_source_outer_lane_ecs(lane, next_lane, road) : -1;
-                bool interchange_dedicated = has_next && valid_lane_ecs(interchange_source_lane, road) &&
-                        lane != interchange_source_lane;
-                bool ordinary_dedicated = has_next && turn_requires_dedicated_lane_ecs(turn);
-                bool dedicated = interchange_dedicated || ordinary_dedicated;
-                bool lane_ok = true;
-                if (interchange_dedicated) lane_ok = false;
-                else if (ordinary_dedicated) lane_ok = lane_legal_for_turn_ecs(lane, turn, road);
-                if (interchange_dedicated && !lane_ok && dist_to_end < lc_lookahead) {
-                    int target = adjacent_lane_toward_specific_lane_ecs(lane, interchange_source_lane, road);
-                    desired_signal = indicator_from_lateral_move_ecs(lane, target, road);
-                } else if (ordinary_dedicated && !lane_ok && dist_to_end < lc_lookahead) {
-                    int target = adjacent_lane_toward_turn_lane_ecs(lane, turn, road);
-                    desired_signal = indicator_from_lateral_move_ecs(lane, target, road);
-                } else if (has_next && next_lane != lane && dist_to_end < lc_lookahead &&
-                        lanes_share_link_geometry_ecs(lane, next_lane, road)) {
-                    desired_signal = indicator_from_lateral_move_ecs(lane, next_lane, road);
-                } else if (has_next && dist_to_end < turn_lookahead) {
-                    if (turn == TURN_LEFT) desired_signal = INDICATOR_LEFT;
-                    else if (turn == TURN_RIGHT) desired_signal = INDICATOR_RIGHT;
-                }
-            }
-        }
-    }
-    int old_signal = ecs.turn_signal != nullptr ? ecs.turn_signal[i] : INDICATOR_NONE;
-    if (ecs.turn_signal != nullptr) ecs.turn_signal[i] = desired_signal;
-    if (ecs.turn_signal_time != nullptr) {
-        if (desired_signal == INDICATOR_NONE) {
-            ecs.turn_signal_time[i] = 0.0f;
-        } else if (old_signal == desired_signal) {
-            ecs.turn_signal_time[i] = fminf(ecs.turn_signal_time[i] + dt, 60.0f);
-        } else {
-            ecs.turn_signal_time[i] = dt;
-        }
-    }
-    if (desired_signal == INDICATOR_LEFT) AVABM_METRIC_ADD(metrics, METRIC_INDICATOR_LEFT_ON, 1.0f);
-    if (desired_signal == INDICATOR_RIGHT) AVABM_METRIC_ADD(metrics, METRIC_INDICATOR_RIGHT_ON, 1.0f);
-    AVABM_ACTIVE_LOOP_END()
-}
-__global__ void perception_system_kernel(ECSArrays ecs, RoadNetwork road, SpatialGrid grid, PerceptionSoA perception,
-        float* metrics, int max_entities, const int* active_ids, const int* active_count) {
-    AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) if (ecs.alive[i] != ENTITY_ALIVE) continue;
-    int lane = ecs.lane_id[i];
-    if (lane < 0 || lane >= road.num_lanes) continue;
-    int rid = ecs.route_id[i];
-    int rpos = ecs.route_pos[i];
-    if (rid < 0 || rid >= road.num_routes) {
-        perception.front_gap[i] = 1.0e9f;
-        perception.front_speed[i] = 0.0f;
-        perception.front_s[i] = 1.0e9f;
-        perception.front_length[i] = 0.0f;
-        perception.front_lane[i] = -1;
-        perception.target_front_gap[i] = 1.0e9f;
-        perception.target_front_speed[i] = 0.0f;
-        perception.target_rear_gap[i] = 1.0e9f;
-        perception.target_rear_speed[i] = 0.0f;
-        continue;
-    }
-    int ro0 = road.route_offsets[rid];
-    int ro1 = road.route_offsets[rid + 1];
-    int route_len = ro1 - ro0;
-    bool skip_initial_tail_repair = false;
+spawned_now++; AVABM_METRIC_ADD(metrics, METRIC_SPAWNED, 1.0f); } if (failed > 0 || deferred > 0) { spawn.spawn_accumulator[p] = fminf(spawn.spawn_accumulator[p] + (float)(failed + deferred),SPAWN_ACCUMULATOR_MAX); } rng_state[p] = st; }
+__global__ void turn_signal_system_kernel(ECSArrays ecs,DecisionSoA decision,RoadNetwork road,float* metrics,float dt,int max_entities,const int* active_ids,const int* active_count) { AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) decision.desired_speed[i] = 0.0f; decision.target_accel[i] = 0.0f; decision.wants_lane_change[i] = 0;
+decision.lane_change_target[i] = -1; decision.wants_connector[i] = 0; decision.connector_target_lane[i] = -1; decision.should_exit[i] = 0; if (ecs.alive[i] != ENTITY_ALIVE) { if (ecs.turn_signal != nullptr) ecs.turn_signal[i] = INDICATOR_NONE; if (ecs.turn_signal_time != nullptr) ecs.turn_signal_time[i] = 0.0f; continue; }
+int desired_signal = INDICATOR_NONE; int lane = ecs.lane_id[i]; bool human = ecs.driver_type[i] == HUMAN; if (ecs.vehicle_state[i] == VEH_IN_CONNECTOR) { int turn = turn_code_from_lanes_ecs(ecs.connector_from_lane[i], ecs.connector_to_lane[i], road); if (turn == TURN_LEFT) desired_signal = INDICATOR_LEFT;
+else if (turn == TURN_RIGHT) desired_signal = INDICATOR_RIGHT; } else if (valid_lane_ecs(lane, road)) { if (ecs.lane_change_active[i] != 0) { desired_signal = indicator_from_lateral_move_ecs(ecs.lane_change_from_lane[i],ecs.lane_change_to_lane[i],road); } int rid = ecs.route_id[i]; int rpos = ecs.route_pos[i]; if (rid >= 0 && rid < road.num_routes) {
+int repaired_pos = repair_route_pos_unless_missed_exit_tail_ecs(lane, rid, rpos, road); if (repaired_pos >= 0) { rpos = repaired_pos; ecs.route_pos[i] = repaired_pos; } int ro0 = road.route_offsets[rid]; int ro1 = road.route_offsets[rid + 1]; int route_len = ro1 - ro0; if (rpos >= 0 && rpos < route_len) {
+int next_lane = route_next_lane_for_vehicle_ecs(i, ecs, road); rpos = ecs.route_pos[i]; bool has_next = valid_lane_ecs(next_lane, road) && lane_connected(lane, next_lane, road); int turn = route_turn_for_vehicle_ecs(i, ecs, road); if (has_next) { turn = effective_turn_code_ecs(lane, next_lane, turn, road);
+int adjusted_next = interchange_receiving_outer_lane_ecs(lane, next_lane, road); adjusted_next = receiving_lane_for_turn_ecs(adjusted_next, turn, road); adjusted_next = interchange_receiving_outer_lane_ecs(lane, adjusted_next, road); if (valid_lane_ecs(adjusted_next, road) && lane_connected(lane, adjusted_next, road)) { next_lane = adjusted_next; } }
+float L = fmaxf(road.lane_length[lane], 0.1f); float dist_to_end = fmaxf(0.0f, L - ecs.s[i]); float turn_lookahead = human ? INDICATOR_TURN_LOOKAHEAD_HUMAN : INDICATOR_TURN_LOOKAHEAD_AV; float lc_lookahead = human ? INDICATOR_LC_LOOKAHEAD_HUMAN : INDICATOR_LC_LOOKAHEAD_AV;
+int interchange_source_lane = has_next ? interchange_source_outer_lane_ecs(lane, next_lane, road) : -1; bool interchange_dedicated = has_next && valid_lane_ecs(interchange_source_lane, road) && lane != interchange_source_lane; bool ordinary_dedicated = has_next && turn_requires_dedicated_lane_ecs(turn);
+bool dedicated = interchange_dedicated || ordinary_dedicated; bool lane_ok = true; if (interchange_dedicated) lane_ok = false; else if (ordinary_dedicated) lane_ok = lane_legal_for_turn_ecs(lane, turn, road); if (interchange_dedicated && !lane_ok && dist_to_end < lc_lookahead) {
+int target = adjacent_lane_toward_specific_lane_ecs(lane, interchange_source_lane, road); desired_signal = indicator_from_lateral_move_ecs(lane, target, road); } else if (ordinary_dedicated && !lane_ok && dist_to_end < lc_lookahead) { int target = adjacent_lane_toward_turn_lane_ecs(lane, turn, road);
+desired_signal = indicator_from_lateral_move_ecs(lane, target, road); } else if (has_next && next_lane != lane && dist_to_end < lc_lookahead && lanes_share_link_geometry_ecs(lane, next_lane, road)) { desired_signal = indicator_from_lateral_move_ecs(lane, next_lane, road); } else if (has_next && dist_to_end < turn_lookahead) {
+if (turn == TURN_LEFT) desired_signal = INDICATOR_LEFT; else if (turn == TURN_RIGHT) desired_signal = INDICATOR_RIGHT; } } } } int old_signal = ecs.turn_signal != nullptr ? ecs.turn_signal[i] : INDICATOR_NONE; if (ecs.turn_signal != nullptr) ecs.turn_signal[i] = desired_signal; if (ecs.turn_signal_time != nullptr) { if (desired_signal == INDICATOR_NONE) {
+ecs.turn_signal_time[i] = 0.0f; } else if (old_signal == desired_signal) { ecs.turn_signal_time[i] = fminf(ecs.turn_signal_time[i] + dt, 60.0f); } else { ecs.turn_signal_time[i] = dt; } } if (desired_signal == INDICATOR_LEFT) AVABM_METRIC_ADD(metrics, METRIC_INDICATOR_LEFT_ON, 1.0f);
+if (desired_signal == INDICATOR_RIGHT) AVABM_METRIC_ADD(metrics, METRIC_INDICATOR_RIGHT_ON, 1.0f); AVABM_ACTIVE_LOOP_END()} __global__ void perception_system_kernel(ECSArrays ecs,RoadNetwork road,SpatialGrid grid,PerceptionSoA perception,float* metrics,int max_entities,const int* active_ids,const int* active_count) {
+AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) if (ecs.alive[i] != ENTITY_ALIVE) continue; int lane = ecs.lane_id[i]; if (lane < 0 || lane >= road.num_lanes) continue; int rid = ecs.route_id[i]; int rpos = ecs.route_pos[i]; if (rid < 0 || rid >= road.num_routes) { perception.front_gap[i] = 1.0e9f; perception.front_speed[i] = 0.0f;
+perception.front_s[i] = 1.0e9f; perception.front_length[i] = 0.0f; perception.front_lane[i] = -1; perception.target_front_gap[i] = 1.0e9f; perception.target_front_speed[i] = 0.0f; perception.target_rear_gap[i] = 1.0e9f; perception.target_rear_speed[i] = 0.0f; continue; } int ro0 = road.route_offsets[rid]; int ro1 = road.route_offsets[rid + 1];
+int route_len = ro1 - ro0; bool skip_initial_tail_repair = false;
 #if MISSED_EXIT_OFFROUTE_TAIL_ENABLED
-    if (route_len > 0 && rpos >= 0 && rpos < route_len && rpos >= route_len - 1) {
-        int tail_lane = road.route_lanes[ro0 + rpos];
-        skip_initial_tail_repair = !route_lane_current_compatible_ecs(tail_lane, lane, road);
-    }
+if (route_len > 0 && rpos >= 0 && rpos < route_len && rpos >= route_len - 1) { int tail_lane = road.route_lanes[ro0 + rpos]; skip_initial_tail_repair = !route_lane_current_compatible_ecs(tail_lane, lane, road); }
 #endif
-    if (!skip_initial_tail_repair) {
-        int repaired_pos = repair_route_pos_unless_missed_exit_tail_ecs(lane, rid, rpos, road);
-        if (repaired_pos >= 0) {
-            rpos = repaired_pos;
-            ecs.route_pos[i] = repaired_pos;
-        }
-    }
-    if (route_len <= 0 || rpos < 0 || rpos >= route_len) {
-        perception.front_gap[i] = 1.0e9f;
-        perception.front_speed[i] = 0.0f;
-        perception.front_s[i] = 1.0e9f;
-        perception.front_length[i] = 0.0f;
-        perception.front_lane[i] = -1;
-        perception.target_front_gap[i] = 1.0e9f;
-        perception.target_front_speed[i] = 0.0f;
-        perception.target_rear_gap[i] = 1.0e9f;
-        perception.target_rear_speed[i] = 0.0f;
-        continue;
-    }
-    int next_lane = route_next_lane_for_vehicle_ecs(i, ecs, road);
-    rpos = ecs.route_pos[i];
-    bool human = ecs.driver_type[i] == HUMAN;
-    find_front_on_route_ecs(i, lane, next_lane, ecs, road, grid, max_entities, human ? 170.0f : 150.0f, nullptr,
-            perception.front_gap[i], perception.front_speed[i], perception.front_s[i], perception.front_length[i],
-            perception.front_lane[i]);
-    int ll = geometric_left_neighbor_ecs(lane, road);
-    int rr = geometric_right_neighbor_ecs(lane, road);
-    float fg, fv, rg, rv;
-    int target_lane = -1;
-    int turn = TURN_STRAIGHT;
-    bool has_next = next_lane >= 0 && next_lane < road.num_lanes && lane_connected(lane, next_lane, road);
-    if (has_next) {
-        int route_turn = (rpos >= 0 && rpos < route_len) ? road.route_turns[ro0 + rpos] : TURN_STRAIGHT;
-        turn = effective_turn_code_ecs(lane, next_lane, route_turn, road);
-        int adjusted_next = interchange_receiving_outer_lane_ecs(lane, next_lane, road);
-        adjusted_next = receiving_lane_for_turn_ecs(adjusted_next, turn, road);
-        adjusted_next = interchange_receiving_outer_lane_ecs(lane, adjusted_next, road);
-        if (valid_lane_ecs(adjusted_next, road) && lane_connected(lane, adjusted_next, road)) {
-            next_lane = adjusted_next;
-        }
-    }
-    int interchange_source_lane = has_next ? interchange_source_outer_lane_ecs(lane, next_lane, road) : -1;
-    bool interchange_dedicated = has_next && valid_lane_ecs(interchange_source_lane, road) && lane != interchange_source_lane;
-    if (interchange_dedicated) {
-        int prep_lane = adjacent_lane_toward_specific_lane_ecs(lane, interchange_source_lane, road);
-        if (prep_lane >= 0 && prep_lane < road.num_lanes) {
-            target_lane = prep_lane;
-        }
-    } else if (has_next && turn_requires_dedicated_lane_ecs(turn) && !lane_legal_for_turn_ecs(lane, turn, road)) {
-        int prep_lane = adjacent_lane_toward_turn_lane_ecs(lane, turn, road);
-        if (prep_lane >= 0 && prep_lane < road.num_lanes) {
-            target_lane = prep_lane;
-        }
-    }
-    if (target_lane < 0) {
-        if (next_lane == ll) target_lane = ll;
-        else if (next_lane == rr) target_lane = rr;
-    }
-    if (target_lane >= 0) {
-        find_lane_neighbors_ecs(i, target_lane, ecs, road, grid, max_entities, human ? 150.0f : 125.0f, nullptr, fg, fv, rg, rv);
-        perception.target_front_gap[i] = fg;
-        perception.target_front_speed[i] = fv;
-        perception.target_rear_gap[i] = rg;
-        perception.target_rear_speed[i] = rv;
-    } else {
-        perception.target_front_gap[i] = 1.0e9f;
-        perception.target_front_speed[i] = 0.0f;
-        perception.target_rear_gap[i] = 1.0e9f;
-        perception.target_rear_speed[i] = 0.0f;
-    }
-    if (metrics != nullptr) {
-        bool front_hit = perception.front_gap[i] < 1.0e8f;
-        bool lane_hit = perception.target_front_gap[i] < 1.0e8f || perception.target_rear_gap[i] < 1.0e8f;
-        if (front_hit) AVABM_METRIC_ADD(metrics, METRIC_SENSOR_FRONT_HIT, 1.0f);
-        if (front_hit || lane_hit) AVABM_METRIC_ADD(metrics, METRIC_SENSOR_DETECTION, 1.0f);
-    }
-    AVABM_ACTIVE_LOOP_END()
-}
-__global__ void clear_reservation_system(int* reservation_table, int total_slots) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < total_slots) {
-        reservation_table[i] = RESERVATION_FREE;
-    }
-}
+if (!skip_initial_tail_repair) { int repaired_pos = repair_route_pos_unless_missed_exit_tail_ecs(lane, rid, rpos, road); if (repaired_pos >= 0) { rpos = repaired_pos; ecs.route_pos[i] = repaired_pos; } } if (route_len <= 0 || rpos < 0 || rpos >= route_len) { perception.front_gap[i] = 1.0e9f; perception.front_speed[i] = 0.0f; perception.front_s[i] = 1.0e9f;
+perception.front_length[i] = 0.0f; perception.front_lane[i] = -1; perception.target_front_gap[i] = 1.0e9f; perception.target_front_speed[i] = 0.0f; perception.target_rear_gap[i] = 1.0e9f; perception.target_rear_speed[i] = 0.0f; continue; } int next_lane = route_next_lane_for_vehicle_ecs(i, ecs, road); rpos = ecs.route_pos[i];
+bool human = ecs.driver_type[i] == HUMAN; find_front_on_route_ecs(i,lane,next_lane,ecs,road,grid,max_entities,human ? 170.0f : 150.0f,nullptr,perception.front_gap[i],perception.front_speed[i],perception.front_s[i],perception.front_length[i],perception.front_lane[i]); int ll = geometric_left_neighbor_ecs(lane, road);
+int rr = geometric_right_neighbor_ecs(lane, road); float fg, fv, rg, rv; int target_lane = -1; int turn = TURN_STRAIGHT; bool has_next = next_lane >= 0 && next_lane < road.num_lanes && lane_connected(lane, next_lane, road); if (has_next) { int route_turn = (rpos >= 0 && rpos < route_len) ? road.route_turns[ro0 + rpos] : TURN_STRAIGHT;
+turn = effective_turn_code_ecs(lane, next_lane, route_turn, road); int adjusted_next = interchange_receiving_outer_lane_ecs(lane, next_lane, road); adjusted_next = receiving_lane_for_turn_ecs(adjusted_next, turn, road); adjusted_next = interchange_receiving_outer_lane_ecs(lane, adjusted_next, road);
+if (valid_lane_ecs(adjusted_next, road) && lane_connected(lane, adjusted_next, road)) { next_lane = adjusted_next; } } int interchange_source_lane = has_next ? interchange_source_outer_lane_ecs(lane, next_lane, road) : -1; bool interchange_dedicated = has_next && valid_lane_ecs(interchange_source_lane, road) && lane != interchange_source_lane;
+if (interchange_dedicated) { int prep_lane = adjacent_lane_toward_specific_lane_ecs(lane, interchange_source_lane, road); if (prep_lane >= 0 && prep_lane < road.num_lanes) { target_lane = prep_lane; } } else if (has_next && turn_requires_dedicated_lane_ecs(turn) && !lane_legal_for_turn_ecs(lane, turn, road)) {
+int prep_lane = adjacent_lane_toward_turn_lane_ecs(lane, turn, road); if (prep_lane >= 0 && prep_lane < road.num_lanes) { target_lane = prep_lane; } } if (target_lane < 0) { if (next_lane == ll) target_lane = ll; else if (next_lane == rr) target_lane = rr; } if (target_lane >= 0) {
+find_lane_neighbors_ecs(i,target_lane,ecs,road,grid,max_entities,human ? 150.0f : 125.0f,nullptr,fg,fv,rg,rv); perception.target_front_gap[i] = fg; perception.target_front_speed[i] = fv; perception.target_rear_gap[i] = rg; perception.target_rear_speed[i] = rv; } else { perception.target_front_gap[i] = 1.0e9f; perception.target_front_speed[i] = 0.0f;
+perception.target_rear_gap[i] = 1.0e9f; perception.target_rear_speed[i] = 0.0f; } if (metrics != nullptr) { bool front_hit = perception.front_gap[i] < 1.0e8f; bool lane_hit = perception.target_front_gap[i] < 1.0e8f || perception.target_rear_gap[i] < 1.0e8f; if (front_hit) AVABM_METRIC_ADD(metrics, METRIC_SENSOR_FRONT_HIT, 1.0f);
+if (front_hit || lane_hit) AVABM_METRIC_ADD(metrics, METRIC_SENSOR_DETECTION, 1.0f); } AVABM_ACTIVE_LOOP_END()} __global__ void clear_reservation_system(int* reservation_table,int total_slots) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < total_slots) { reservation_table[i] = RESERVATION_FREE; } }

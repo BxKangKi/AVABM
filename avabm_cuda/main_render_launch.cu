@@ -1,591 +1,119 @@
 #ifndef AVABM_PART_SKIP_COMMON
 #include "main_common.cuh"
 #endif
-static cudaGraphicsResource* g_render_resource = nullptr;
-static int g_render_textured_cars = 0;
-__global__ void render_textured_body_system_kernel(RenderVertex* out, ECSArrays ecs, int max_entities) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= max_entities) return;
-    int base = i * RENDER_BODY_VERTS_PER_VEHICLE;
-    if (ecs.alive[i] != ENTITY_ALIVE) {
-        RenderVertex z = {
-            0, 0, 0, 0, 0, 0, 1
-        };
-        for (int k = 0; k < RENDER_BODY_VERTS_PER_VEHICLE; ++k) out[base + k] = z;
-        return;
-    }
-    write_render_textured_quad(out, base, ecs.x[i], ecs.y[i], ecs.heading[i], fmaxf(ecs.length[i] * 1.06f, 2.0f),
-            fmaxf(ecs.width[i] * 1.18f, 1.0f), ecs.driver_type[i], indicator_state_ecs(i, ecs),
-            ecs.turn_signal_time != nullptr ? ecs.turn_signal_time[i] : 0.0f);
-}
-__global__ void render_body_system_kernel(RenderVertex* out, ECSArrays ecs, int max_entities) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= max_entities) return;
-    int base = i * RENDER_BODY_VERTS_PER_VEHICLE;
-    if (ecs.alive[i] != ENTITY_ALIVE) {
-        RenderVertex z = {
-            0, 0, 0, 0, 0, 0, 1
-        };
-        for (int k = 0; k < RENDER_BODY_VERTS_PER_VEHICLE; ++k) out[base + k] = z;
-        return;
-    }
-    float r = ecs.driver_type[i] == AV ? 0.55f : 1.00f;
-    float g = ecs.driver_type[i] == AV ? 0.84f : 1.00f;
-    float b = ecs.driver_type[i] == AV ? 1.00f : 1.00f;
-    int sig = indicator_state_ecs(i, ecs);
-    float sig_time = ecs.turn_signal_time != nullptr ? ecs.turn_signal_time[i] : 0.0f;
-    if (sig != INDICATOR_NONE && fmodf(fmaxf(sig_time, 0.0f) * 2.25f, 1.0f) < 0.55f) {
-        r = 1.00f;
-        g = 0.72f;
-        b = 0.08f;
-    }
-    write_render_quad(out, base, ecs.x[i], ecs.y[i], ecs.heading[i], fmaxf(ecs.length[i], 2.0f), fmaxf(ecs.width[i], 1.0f), r, g,
-            b, 1.0f);
-}
-__global__ void render_system_kernel(RenderVertex* out, ECSArrays ecs, int max_entities) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= max_entities) return;
-    int base = i * RENDER_FULL_VERTS_PER_VEHICLE;
-    if (ecs.alive[i] != ENTITY_ALIVE) {
-        RenderVertex z = {
-            0, 0, 0, 0, 0, 0, 1
-        };
-        for (int k = 0; k < RENDER_FULL_VERTS_PER_VEHICLE; ++k) out[base + k] = z;
-        return;
-    }
-    float cx = ecs.x[i];
-    float cy = ecs.y[i];
-    float h = ecs.heading[i];
-    float L = fmaxf(ecs.length[i], 2.0f);
-    float W = fmaxf(ecs.width[i], 1.0f);
-    float r = ecs.driver_type[i] == AV ? 0.55f : 1.00f;
-    float g = ecs.driver_type[i] == AV ? 0.84f : 1.00f;
-    float b = ecs.driver_type[i] == AV ? 1.00f : 1.00f;
-    int sig = indicator_state_ecs(i, ecs);
-    float sig_time = ecs.turn_signal_time != nullptr ? ecs.turn_signal_time[i] : 0.0f;
-    if (sig != INDICATOR_NONE && fmodf(fmaxf(sig_time, 0.0f) * 2.25f, 1.0f) < 0.55f) {
-        r = 1.00f;
-        g = 0.72f;
-        b = 0.08f;
-    }
-    write_render_quad(out, base, cx, cy, h, L, W, r, g, b, 1.0f);
-    float fx = cosf(h);
-    float fy = sinf(h);
-    float sx = -fy;
-    float sy = fx;
-    float wheelbase = vehicle_wheelbase_from_length(L);
-    float front_off = 0.5f * wheelbase;
-    float rear_off = -0.5f * wheelbase;
-    float lateral = 0.38f * W;
-    float wheel_L = clampf_cuda(0.16f * L, 0.55f, 0.82f);
-    float wheel_W = clampf_cuda(0.15f * W, 0.20f, 0.32f);
-    float wr = 0.04f;
-    float wg = 0.04f;
-    float wb = 0.04f;
-    float raw_steer = (ecs.steer_angle != nullptr) ? ecs.steer_angle[i] : 0.0f;
-    float steer = clampf_cuda(raw_steer, -(ecs.driver_type[i] == HUMAN ? MAX_STEER_HUMAN : MAX_STEER_AV),
-            (ecs.driver_type[i] == HUMAN ? MAX_STEER_HUMAN : MAX_STEER_AV));
-    float front_h = wrap_pi(h + steer);
-    float rear_h = h;
-    float flx = cx + fx * front_off + sx * lateral;
-    float fly = cy + fy * front_off + sy * lateral;
-    float frx = cx + fx * front_off - sx * lateral;
-    float fry = cy + fy * front_off - sy * lateral;
-    float rlx = cx + fx * rear_off + sx * lateral;
-    float rly = cy + fy * rear_off + sy * lateral;
-    float rrx = cx + fx * rear_off - sx * lateral;
-    float rry = cy + fy * rear_off - sy * lateral;
-    write_render_quad(out, base + 6, flx, fly, front_h, wheel_L, wheel_W, wr, wg, wb, 1.0f);
-    write_render_quad(out, base + 12, frx, fry, front_h, wheel_L, wheel_W, wr, wg, wb, 1.0f);
-    write_render_quad(out, base + 18, rlx, rly, rear_h, wheel_L, wheel_W, wr, wg, wb, 1.0f);
-    write_render_quad(out, base + 24, rrx, rry, rear_h, wheel_L, wheel_W, wr, wg, wb, 1.0f);
-}
-__global__ void render_textured_body_dense_system_kernel(RenderVertex* out, ECSArrays ecs, int max_entities, const int* active_ids,
-        const int* active_count, int* render_count) {
-    AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) bool emit = (ecs.alive[i] == ENTITY_ALIVE);
-    int slot = avabm_warp_append_slot(emit, render_count);
-    if (!emit || slot < 0 || slot >= max_entities) continue;
-    int base = slot * RENDER_BODY_VERTS_PER_VEHICLE;
-    write_render_textured_quad(out, base, ecs.x[i], ecs.y[i], ecs.heading[i], fmaxf(ecs.length[i] * 1.06f, 2.0f),
-            fmaxf(ecs.width[i] * 1.18f, 1.0f), ecs.driver_type[i], indicator_state_ecs(i, ecs),
-            ecs.turn_signal_time != nullptr ? ecs.turn_signal_time[i] : 0.0f);
-    AVABM_ACTIVE_LOOP_END()
-}
-__global__ void render_body_dense_system_kernel(RenderVertex* out, ECSArrays ecs, int max_entities, const int* active_ids,
-        const int* active_count, int* render_count) {
-    AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) bool emit = (ecs.alive[i] == ENTITY_ALIVE);
-    int slot = avabm_warp_append_slot(emit, render_count);
-    if (!emit || slot < 0 || slot >= max_entities) continue;
-    int base = slot * RENDER_BODY_VERTS_PER_VEHICLE;
-    float r = ecs.driver_type[i] == AV ? 0.55f : 1.00f;
-    float g = ecs.driver_type[i] == AV ? 0.84f : 1.00f;
-    float b = ecs.driver_type[i] == AV ? 1.00f : 1.00f;
-    int sig = indicator_state_ecs(i, ecs);
-    float sig_time = ecs.turn_signal_time != nullptr ? ecs.turn_signal_time[i] : 0.0f;
-    if (sig != INDICATOR_NONE && fmodf(fmaxf(sig_time, 0.0f) * 2.25f, 1.0f) < 0.55f) {
-        r = 1.00f;
-        g = 0.72f;
-        b = 0.08f;
-    }
-    write_render_quad(out, base, ecs.x[i], ecs.y[i], ecs.heading[i], fmaxf(ecs.length[i], 2.0f), fmaxf(ecs.width[i], 1.0f), r, g,
-            b, 1.0f);
-    AVABM_ACTIVE_LOOP_END()
-}
-__global__ void render_dense_system_kernel(RenderVertex* out, ECSArrays ecs, int max_entities, const int* active_ids,
-        const int* active_count, int* render_count) {
-    AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) bool emit = (ecs.alive[i] == ENTITY_ALIVE);
-    int slot = avabm_warp_append_slot(emit, render_count);
-    if (!emit || slot < 0 || slot >= max_entities) continue;
-    int base = slot * RENDER_FULL_VERTS_PER_VEHICLE;
-    float cx = ecs.x[i];
-    float cy = ecs.y[i];
-    float h = ecs.heading[i];
-    float L = fmaxf(ecs.length[i], 2.0f);
-    float W = fmaxf(ecs.width[i], 1.0f);
-    float r = ecs.driver_type[i] == AV ? 0.55f : 1.00f;
-    float g = ecs.driver_type[i] == AV ? 0.84f : 1.00f;
-    float b = ecs.driver_type[i] == AV ? 1.00f : 1.00f;
-    int sig = indicator_state_ecs(i, ecs);
-    float sig_time = ecs.turn_signal_time != nullptr ? ecs.turn_signal_time[i] : 0.0f;
-    if (sig != INDICATOR_NONE && fmodf(fmaxf(sig_time, 0.0f) * 2.25f, 1.0f) < 0.55f) {
-        r = 1.00f;
-        g = 0.72f;
-        b = 0.08f;
-    }
-    write_render_quad(out, base, cx, cy, h, L, W, r, g, b, 1.0f);
-    float fx = cosf(h);
-    float fy = sinf(h);
-    float sx = -fy;
-    float sy = fx;
-    float wheelbase = vehicle_wheelbase_from_length(L);
-    float front_off = 0.5f * wheelbase;
-    float rear_off = -0.5f * wheelbase;
-    float lateral = 0.38f * W;
-    float wheel_L = clampf_cuda(0.16f * L, 0.55f, 0.82f);
-    float wheel_W = clampf_cuda(0.15f * W, 0.20f, 0.32f);
-    float wr = 0.04f;
-    float wg = 0.04f;
-    float wb = 0.04f;
-    float raw_steer = (ecs.steer_angle != nullptr) ? ecs.steer_angle[i] : 0.0f;
-    float steer = clampf_cuda(raw_steer, -(ecs.driver_type[i] == HUMAN ? MAX_STEER_HUMAN : MAX_STEER_AV),
-            (ecs.driver_type[i] == HUMAN ? MAX_STEER_HUMAN : MAX_STEER_AV));
-    float front_h = wrap_pi(h + steer);
-    float rear_h = h;
-    float flx = cx + fx * front_off + sx * lateral;
-    float fly = cy + fy * front_off + sy * lateral;
-    float frx = cx + fx * front_off - sx * lateral;
-    float fry = cy + fy * front_off - sy * lateral;
-    float rlx = cx + fx * rear_off + sx * lateral;
-    float rly = cy + fy * rear_off + sy * lateral;
-    float rrx = cx + fx * rear_off - sx * lateral;
-    float rry = cy + fy * rear_off - sy * lateral;
-    write_render_quad(out, base + 6, flx, fly, front_h, wheel_L, wheel_W, wr, wg, wb, 1.0f);
-    write_render_quad(out, base + 12, frx, fry, front_h, wheel_L, wheel_W, wr, wg, wb, 1.0f);
-    write_render_quad(out, base + 18, rlx, rly, rear_h, wheel_L, wheel_W, wr, wg, wb, 1.0f);
-    write_render_quad(out, base + 24, rrx, rry, rear_h, wheel_L, wheel_W, wr, wg, wb, 1.0f);
-    AVABM_ACTIVE_LOOP_END()
-}
-AVABM_DINLINE void render_interpolated_pose_ecs(ECSArrays prev, ECSArrays curr, int i, float alpha, float& cx, float& cy, float& h,
-        float& steer) {
-    alpha = clampf_cuda(alpha, 0.0f, 1.0f);
-    cx = curr.x[i];
-    cy = curr.y[i];
-    h = curr.heading[i];
-    steer = curr.steer_angle != nullptr ? curr.steer_angle[i] : 0.0f;
-    bool has_prev = prev.alive != nullptr && prev.x != nullptr && prev.y != nullptr && prev.heading != nullptr &&
-            prev.alive[i] == ENTITY_ALIVE;
-    if (!has_prev) return;
-    float px = prev.x[i];
-    float py = prev.y[i];
-    float ph = prev.heading[i];
-    float ps = prev.steer_angle != nullptr ? prev.steer_angle[i] : steer;
-    float dx = cx - px;
-    float dy = cy - py;
-    float d2 = dx * dx + dy * dy;
-    if (!isfinite(d2) || d2 > 10000.0f) return;
-    cx = px + dx * alpha;
-    cy = py + dy * alpha;
-    h = wrap_pi(ph + wrap_pi(h - ph) * alpha);
-    steer = ps + (steer - ps) * alpha;
-}
-__global__ void render_textured_body_interpolated_full_draw_kernel(RenderVertex* out, ECSArrays prev, ECSArrays curr,
-        int max_entities, const int* active_ids, const int* active_count, int* render_count, float alpha) {
-    AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) bool emit = (curr.alive[i] == ENTITY_ALIVE);
-    int slot = avabm_warp_append_slot(emit, render_count);
-    if (!emit || slot < 0 || slot >= max_entities) continue;
-    int base = slot * RENDER_BODY_VERTS_PER_VEHICLE;
-    float cx, cy, h, steer;
-    render_interpolated_pose_ecs(prev, curr, i, alpha, cx, cy, h, steer);
-    write_render_textured_quad(out, base, cx, cy, h, fmaxf(curr.length[i] * 1.06f, 2.0f), fmaxf(curr.width[i] * 1.18f, 1.0f),
-            curr.driver_type[i], indicator_state_ecs(i, curr), curr.turn_signal_time != nullptr ? curr.turn_signal_time[i] : 0.0f);
-    AVABM_ACTIVE_LOOP_END()
-}
-__global__ void render_body_interpolated_full_draw_kernel(RenderVertex* out, ECSArrays prev, ECSArrays curr, int max_entities,
-        const int* active_ids, const int* active_count, int* render_count, float alpha) {
-    AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) bool emit = (curr.alive[i] == ENTITY_ALIVE);
-    int slot = avabm_warp_append_slot(emit, render_count);
-    if (!emit || slot < 0 || slot >= max_entities) continue;
-    int base = slot * RENDER_BODY_VERTS_PER_VEHICLE;
-    float cx, cy, h, steer;
-    render_interpolated_pose_ecs(prev, curr, i, alpha, cx, cy, h, steer);
-    float r = curr.driver_type[i] == AV ? 0.55f : 1.00f;
-    float g = curr.driver_type[i] == AV ? 0.84f : 1.00f;
-    float b = curr.driver_type[i] == AV ? 1.00f : 1.00f;
-    int sig = indicator_state_ecs(i, curr);
-    float sig_time = curr.turn_signal_time != nullptr ? curr.turn_signal_time[i] : 0.0f;
-    if (sig != INDICATOR_NONE && fmodf(fmaxf(sig_time, 0.0f) * 2.25f, 1.0f) < 0.55f) {
-        r = 1.00f;
-        g = 0.72f;
-        b = 0.08f;
-    }
-    write_render_quad(out, base, cx, cy, h, fmaxf(curr.length[i], 2.0f), fmaxf(curr.width[i], 1.0f), r, g, b, 1.0f);
-    AVABM_ACTIVE_LOOP_END()
-}
-__global__ void render_interpolated_full_draw_kernel(RenderVertex* out, ECSArrays prev, ECSArrays curr, int max_entities,
-        const int* active_ids, const int* active_count, int* render_count, float alpha) {
-    AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) bool emit = (curr.alive[i] == ENTITY_ALIVE);
-    int slot = avabm_warp_append_slot(emit, render_count);
-    if (!emit || slot < 0 || slot >= max_entities) continue;
-    int base = slot * RENDER_FULL_VERTS_PER_VEHICLE;
-    float cx, cy, h, steer;
-    render_interpolated_pose_ecs(prev, curr, i, alpha, cx, cy, h, steer);
-    float L = fmaxf(curr.length[i], 2.0f);
-    float W = fmaxf(curr.width[i], 1.0f);
-    float r = curr.driver_type[i] == AV ? 0.55f : 1.00f;
-    float g = curr.driver_type[i] == AV ? 0.84f : 1.00f;
-    float b = curr.driver_type[i] == AV ? 1.00f : 1.00f;
-    int sig = indicator_state_ecs(i, curr);
-    float sig_time = curr.turn_signal_time != nullptr ? curr.turn_signal_time[i] : 0.0f;
-    if (sig != INDICATOR_NONE && fmodf(fmaxf(sig_time, 0.0f) * 2.25f, 1.0f) < 0.55f) {
-        r = 1.00f;
-        g = 0.72f;
-        b = 0.08f;
-    }
-    write_render_quad(out, base, cx, cy, h, L, W, r, g, b, 1.0f);
-    float fx = cosf(h);
-    float fy = sinf(h);
-    float sx = -fy;
-    float sy = fx;
-    float wheelbase = vehicle_wheelbase_from_length(L);
-    float front_off = 0.5f * wheelbase;
-    float rear_off = -0.5f * wheelbase;
-    float lateral = 0.38f * W;
-    float wheel_L = clampf_cuda(0.16f * L, 0.55f, 0.82f);
-    float wheel_W = clampf_cuda(0.15f * W, 0.20f, 0.32f);
-    float wr = 0.04f;
-    float wg = 0.04f;
-    float wb = 0.04f;
-    steer = clampf_cuda(steer, -(curr.driver_type[i] == HUMAN ? MAX_STEER_HUMAN : MAX_STEER_AV),
-            (curr.driver_type[i] == HUMAN ? MAX_STEER_HUMAN : MAX_STEER_AV));
-    float front_h = wrap_pi(h + steer);
-    float rear_h = h;
-    float flx = cx + fx * front_off + sx * lateral;
-    float fly = cy + fy * front_off + sy * lateral;
-    float frx = cx + fx * front_off - sx * lateral;
-    float fry = cy + fy * front_off - sy * lateral;
-    float rlx = cx + fx * rear_off + sx * lateral;
-    float rly = cy + fy * rear_off + sy * lateral;
-    float rrx = cx + fx * rear_off - sx * lateral;
-    float rry = cy + fy * rear_off - sy * lateral;
-    write_render_quad(out, base + 6, flx, fly, front_h, wheel_L, wheel_W, wr, wg, wb, 1.0f);
-    write_render_quad(out, base + 12, frx, fry, front_h, wheel_L, wheel_W, wr, wg, wb, 1.0f);
-    write_render_quad(out, base + 18, rlx, rly, rear_h, wheel_L, wheel_W, wr, wg, wb, 1.0f);
-    write_render_quad(out, base + 24, rrx, rry, rear_h, wheel_L, wheel_W, wr, wg, wb, 1.0f);
-    AVABM_ACTIVE_LOOP_END()
-}
-__global__ void clear_render_tail_system_kernel(RenderVertex* out, const int* render_count, const int* previous_render_count,
-        int max_entities, int verts_per_vehicle, int force_full_tail_clear) {
-    if (out == nullptr || render_count == nullptr || max_entities <= 0 || verts_per_vehicle <= 0) return;
-    int count = *render_count;
-    if (count < 0) count = 0;
-    if (count > max_entities) count = max_entities;
-    int end_count = max_entities;
-    if (force_full_tail_clear == 0 && previous_render_count != nullptr) {
-        end_count = *previous_render_count;
-    }
-    if (end_count < 0) end_count = 0;
-    if (end_count > max_entities) end_count = max_entities;
-    if (end_count <= count) return;
-    int total_tail_vertices = (end_count - count) * verts_per_vehicle;
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride = blockDim.x * gridDim.x;
-    RenderVertex z = {
-        0, 0, 0, 0, 0, 0, 1
-    };
-    RenderVertex* tail = out + count * verts_per_vehicle;
-    for (int k = tid; k < total_tail_vertices; k += stride) {
-        tail[k] = z;
-    }
-}
-__global__ void remember_render_count_system_kernel(const int* render_count, int* previous_render_count, int max_entities) {
-    if (render_count == nullptr || previous_render_count == nullptr) return;
-    int count = *render_count;
-    if (count < 0) count = 0;
-    if (count > max_entities) count = max_entities;
-    *previous_render_count = count;
-}
-extern "C" void register_render_vbo_cuda(unsigned int vbo) {
-    if (g_render_resource != nullptr) {
-        cudaGraphicsUnregisterResource(g_render_resource);
-        g_render_resource = nullptr;
-    }
-    cudaGraphicsGLRegisterBuffer(&g_render_resource, vbo, cudaGraphicsRegisterFlagsWriteDiscard);
-}
-extern "C" void set_vehicle_texture_render_cuda(int enabled) {
-    g_render_textured_cars = enabled != 0 ? 1 : 0;
-}
-extern "C" void launch_render_vbo_cuda_ecs(ECSArrays ecs, int max_entities, const int* active_ids, const int* active_count,
-        int* render_count, int* previous_render_count, cudaStream_t stream, int clear_tail_for_full_draw) {
-    if (g_render_resource == nullptr || max_entities <= 0 || render_count == nullptr) return;
-    cudaGraphicsMapResources(1, &g_render_resource, stream);
-    RenderVertex* dev_ptr = nullptr;
-    size_t size = 0;
-    cudaGraphicsResourceGetMappedPointer((void**)&dev_ptr, &size, g_render_resource);
-    if (dev_ptr != nullptr) {
-        cudaMemsetAsync(render_count, 0, sizeof(int), stream);
-        int threads = 256;
-        int entity_blocks = (max_entities + threads - 1) / threads;
-        int active_blocks = entity_blocks < AVABM_ACTIVE_ENTITY_KERNEL_BLOCKS ? entity_blocks : AVABM_ACTIVE_ENTITY_KERNEL_BLOCKS;
-        if (active_blocks < 1) active_blocks = 1;
-        size_t full_needed = (size_t)max_entities * (size_t)RENDER_FULL_VERTS_PER_VEHICLE * sizeof(RenderVertex);
-        size_t body_needed = (size_t)max_entities * (size_t)RENDER_BODY_VERTS_PER_VEHICLE * sizeof(RenderVertex);
-        if (g_render_textured_cars != 0 && size >= body_needed) {
-            render_textured_body_dense_system_kernel<<<active_blocks, threads, 0,
-                    stream>>>(dev_ptr, ecs, max_entities, active_ids, active_count, render_count);
-            if (clear_tail_for_full_draw != 0) {
-                clear_render_tail_system_kernel<<<active_blocks, threads, 0,
-                        stream>>>(dev_ptr, render_count, previous_render_count, max_entities, RENDER_BODY_VERTS_PER_VEHICLE,
-                        previous_render_count == nullptr ? 1 : 0);
-                remember_render_count_system_kernel<<<1, 1, 0, stream>>>(render_count, previous_render_count, max_entities);
-            }
-        } else if (size >= full_needed) {
-            render_dense_system_kernel<<<active_blocks, threads, 0,
-                    stream>>>(dev_ptr, ecs, max_entities, active_ids, active_count, render_count);
-            if (clear_tail_for_full_draw != 0) {
-                clear_render_tail_system_kernel<<<active_blocks, threads, 0,
-                        stream>>>(dev_ptr, render_count, previous_render_count, max_entities, RENDER_FULL_VERTS_PER_VEHICLE,
-                        previous_render_count == nullptr ? 1 : 0);
-                remember_render_count_system_kernel<<<1, 1, 0, stream>>>(render_count, previous_render_count, max_entities);
-            }
-        } else if (size >= body_needed) {
-            render_body_dense_system_kernel<<<active_blocks, threads, 0,
-                    stream>>>(dev_ptr, ecs, max_entities, active_ids, active_count, render_count);
-            if (clear_tail_for_full_draw != 0) {
-                clear_render_tail_system_kernel<<<active_blocks, threads, 0,
-                        stream>>>(dev_ptr, render_count, previous_render_count, max_entities, RENDER_BODY_VERTS_PER_VEHICLE,
-                        previous_render_count == nullptr ? 1 : 0);
-                remember_render_count_system_kernel<<<1, 1, 0, stream>>>(render_count, previous_render_count, max_entities);
-            }
-        }
-    }
-    cudaGraphicsUnmapResources(1, &g_render_resource, stream);
-}
-extern "C" void launch_render_vbo_interpolated_cuda_ecs(ECSArrays prev_ecs, ECSArrays curr_ecs, int max_entities,
-        const int* active_ids, const int* active_count, int* render_count, int* previous_render_count, cudaStream_t stream,
-        int clear_tail_for_full_draw, float alpha) {
-    if (g_render_resource == nullptr || max_entities <= 0 || render_count == nullptr) return;
-    cudaGraphicsMapResources(1, &g_render_resource, stream);
-    RenderVertex* dev_ptr = nullptr;
-    size_t size = 0;
-    cudaGraphicsResourceGetMappedPointer((void**)&dev_ptr, &size, g_render_resource);
-    if (dev_ptr != nullptr) {
-        cudaMemsetAsync(render_count, 0, sizeof(int), stream);
-        int threads = 256;
-        int entity_blocks = (max_entities + threads - 1) / threads;
-        int scan_blocks = entity_blocks < AVABM_ACTIVE_ENTITY_KERNEL_BLOCKS ? entity_blocks : AVABM_ACTIVE_ENTITY_KERNEL_BLOCKS;
-        if (scan_blocks < 1) scan_blocks = 1;
-        size_t full_needed = (size_t)max_entities * (size_t)RENDER_FULL_VERTS_PER_VEHICLE * sizeof(RenderVertex);
-        size_t body_needed = (size_t)max_entities * (size_t)RENDER_BODY_VERTS_PER_VEHICLE * sizeof(RenderVertex);
-        if (g_render_textured_cars != 0 && size >= body_needed) {
-            render_textured_body_interpolated_full_draw_kernel<<<scan_blocks, threads, 0,
-                    stream>>>(dev_ptr, prev_ecs, curr_ecs, max_entities, active_ids, active_count, render_count, alpha);
-            if (clear_tail_for_full_draw != 0) {
-                clear_render_tail_system_kernel<<<scan_blocks, threads, 0,
-                        stream>>>(dev_ptr, render_count, previous_render_count, max_entities, RENDER_BODY_VERTS_PER_VEHICLE,
-                        previous_render_count == nullptr ? 1 : 0);
-                remember_render_count_system_kernel<<<1, 1, 0, stream>>>(render_count, previous_render_count, max_entities);
-            }
-        } else if (size >= full_needed) {
-            render_interpolated_full_draw_kernel<<<scan_blocks, threads, 0,
-                    stream>>>(dev_ptr, prev_ecs, curr_ecs, max_entities, active_ids, active_count, render_count, alpha);
-            if (clear_tail_for_full_draw != 0) {
-                clear_render_tail_system_kernel<<<scan_blocks, threads, 0,
-                        stream>>>(dev_ptr, render_count, previous_render_count, max_entities, RENDER_FULL_VERTS_PER_VEHICLE,
-                        previous_render_count == nullptr ? 1 : 0);
-                remember_render_count_system_kernel<<<1, 1, 0, stream>>>(render_count, previous_render_count, max_entities);
-            }
-        } else if (size >= body_needed) {
-            render_body_interpolated_full_draw_kernel<<<scan_blocks, threads, 0,
-                    stream>>>(dev_ptr, prev_ecs, curr_ecs, max_entities, active_ids, active_count, render_count, alpha);
-            if (clear_tail_for_full_draw != 0) {
-                clear_render_tail_system_kernel<<<scan_blocks, threads, 0,
-                        stream>>>(dev_ptr, render_count, previous_render_count, max_entities, RENDER_BODY_VERTS_PER_VEHICLE,
-                        previous_render_count == nullptr ? 1 : 0);
-                remember_render_count_system_kernel<<<1, 1, 0, stream>>>(render_count, previous_render_count, max_entities);
-            }
-        }
-    }
-    cudaGraphicsUnmapResources(1, &g_render_resource, stream);
-}
-extern "C" void unregister_render_vbo_cuda() {
-    if (g_render_resource != nullptr) {
-        cudaGraphicsUnregisterResource(g_render_resource);
-        g_render_resource = nullptr;
-    }
-}
-extern "C" void launch_step_cuda_ecs(ECSArrays ecs, RoadNetwork road, Signals signals, SpatialGrid grid, SpawnConfig spawn,
-        PerceptionSoA perception, DecisionSoA decision, int* reservation_table, uint32_t* rng_state, float* metrics,
-        int* active_ids, int* active_count, int* lane_active_ids, int* lane_active_count, int* connector_active_ids,
-        int* connector_active_count, int initial_grid_valid, float current_time, float dt, int max_entities, int step_index,
-        cudaStream_t stream) {
-    if (max_entities <= 0 || road.num_lanes <= 0) return;
-    if (grid.cell_size <= 0.1f || grid.width <= 0 || grid.height <= 0) return;
-    if (dt <= 0.0f || dt > 0.5f) return;
-    int threads = 256;
-    int entity_blocks = (max_entities + threads - 1) / threads;
-    int active_blocks = entity_blocks < AVABM_ACTIVE_ENTITY_KERNEL_BLOCKS ? entity_blocks : AVABM_ACTIVE_ENTITY_KERNEL_BLOCKS;
-    if (active_blocks < 1) active_blocks = 1;
-    int world_cells = grid.width * grid.height;
-    int spawn_blocks = (spawn.num_spawn_points + threads - 1) / threads;
-    const bool fast_physics = (AVABM_FAST_PHYSICS_MODE != 0);
-    const bool do_route_repair = (!fast_physics) || avabm_due_interval_ecs(step_index, AVABM_ROUTE_REPAIR_INTERVAL);
-    const bool do_spawn_overlap = (!fast_physics) || avabm_due_interval_ecs(step_index, AVABM_SPAWN_OVERLAP_INTERVAL);
-    const bool do_priority = (!fast_physics) || avabm_due_interval_ecs(step_index, AVABM_PRIORITY_INTERVAL);
-    const bool do_local_avoidance = (!fast_physics) || avabm_due_interval_ecs(step_index, AVABM_LOCAL_AVOIDANCE_INTERVAL);
-    const bool do_front_clear = (!fast_physics) || avabm_due_interval_ecs(step_index, AVABM_FRONT_CLEAR_INTERVAL);
-    const bool do_contact = (!fast_physics) || avabm_due_interval_ecs(step_index, AVABM_CONTACT_INTERVAL);
-    const bool expensive_metrics_enabled = (AVABM_EXPENSIVE_SAFETY_METRICS_ENABLED != 0);
+
+static cudaGraphicsResource* g_render_resource = nullptr; static int g_render_textured_cars = 0; __global__ void render_textured_body_system_kernel(RenderVertex* out,ECSArrays ecs,int max_entities) {
+int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= max_entities) return; int base = i * RENDER_BODY_VERTS_PER_VEHICLE; if (ecs.alive[i] != ENTITY_ALIVE) { RenderVertex z = { 0, 0, 0, 0, 0, 0, 1 }; for (int k = 0; k < RENDER_BODY_VERTS_PER_VEHICLE; ++k) out[base + k] = z; return; }
+write_render_textured_quad(out,base,ecs.x[i],ecs.y[i],ecs.heading[i],fmaxf(ecs.length[i] * 1.06f, 2.0f),fmaxf(ecs.width[i] * 1.18f, 1.0f),ecs.driver_type[i],indicator_state_ecs(i, ecs),ecs.turn_signal_time != nullptr ? ecs.turn_signal_time[i] : 0.0f); } __global__ void render_body_system_kernel(RenderVertex* out,ECSArrays ecs,int max_entities) {
+int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= max_entities) return; int base = i * RENDER_BODY_VERTS_PER_VEHICLE; if (ecs.alive[i] != ENTITY_ALIVE) { RenderVertex z = { 0, 0, 0, 0, 0, 0, 1 }; for (int k = 0; k < RENDER_BODY_VERTS_PER_VEHICLE; ++k) out[base + k] = z; return; } float r = ecs.driver_type[i] == AV ? 0.55f : 1.00f;
+float g = ecs.driver_type[i] == AV ? 0.84f : 1.00f; float b = ecs.driver_type[i] == AV ? 1.00f : 1.00f; int sig = indicator_state_ecs(i, ecs); float sig_time = ecs.turn_signal_time != nullptr ? ecs.turn_signal_time[i] : 0.0f; if (sig != INDICATOR_NONE && fmodf(fmaxf(sig_time, 0.0f) * 2.25f, 1.0f) < 0.55f) { r = 1.00f; g = 0.72f; b = 0.08f; }
+write_render_quad(out,base,ecs.x[i],ecs.y[i],ecs.heading[i],fmaxf(ecs.length[i], 2.0f),fmaxf(ecs.width[i], 1.0f),r,g,b,1.0f); } __global__ void render_system_kernel(RenderVertex* out,ECSArrays ecs,int max_entities) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= max_entities) return; int base = i * RENDER_FULL_VERTS_PER_VEHICLE;
+if (ecs.alive[i] != ENTITY_ALIVE) { RenderVertex z = { 0, 0, 0, 0, 0, 0, 1 }; for (int k = 0; k < RENDER_FULL_VERTS_PER_VEHICLE; ++k) out[base + k] = z; return; } float cx = ecs.x[i]; float cy = ecs.y[i]; float h = ecs.heading[i]; float L = fmaxf(ecs.length[i], 2.0f); float W = fmaxf(ecs.width[i], 1.0f); float r = ecs.driver_type[i] == AV ? 0.55f : 1.00f;
+float g = ecs.driver_type[i] == AV ? 0.84f : 1.00f; float b = ecs.driver_type[i] == AV ? 1.00f : 1.00f; int sig = indicator_state_ecs(i, ecs); float sig_time = ecs.turn_signal_time != nullptr ? ecs.turn_signal_time[i] : 0.0f; if (sig != INDICATOR_NONE && fmodf(fmaxf(sig_time, 0.0f) * 2.25f, 1.0f) < 0.55f) { r = 1.00f; g = 0.72f; b = 0.08f; }
+write_render_quad(out, base, cx, cy, h, L, W, r, g, b, 1.0f); float fx = cosf(h); float fy = sinf(h); float sx = -fy; float sy = fx; float wheelbase = vehicle_wheelbase_from_length(L); float front_off = 0.5f * wheelbase; float rear_off = -0.5f * wheelbase; float lateral = 0.38f * W; float wheel_L = clampf_cuda(0.16f * L, 0.55f, 0.82f);
+float wheel_W = clampf_cuda(0.15f * W, 0.20f, 0.32f); float wr = 0.04f; float wg = 0.04f; float wb = 0.04f; float raw_steer = (ecs.steer_angle != nullptr) ? ecs.steer_angle[i] : 0.0f; float steer = clampf_cuda(raw_steer,-(ecs.driver_type[i] == HUMAN ? MAX_STEER_HUMAN : MAX_STEER_AV),(ecs.driver_type[i] == HUMAN ? MAX_STEER_HUMAN : MAX_STEER_AV));
+float front_h = wrap_pi(h + steer); float rear_h = h; float flx = cx + fx * front_off + sx * lateral; float fly = cy + fy * front_off + sy * lateral; float frx = cx + fx * front_off - sx * lateral; float fry = cy + fy * front_off - sy * lateral; float rlx = cx + fx * rear_off + sx * lateral; float rly = cy + fy * rear_off + sy * lateral;
+float rrx = cx + fx * rear_off - sx * lateral; float rry = cy + fy * rear_off - sy * lateral; write_render_quad(out, base + 6, flx, fly, front_h, wheel_L, wheel_W, wr, wg, wb, 1.0f); write_render_quad(out, base + 12, frx, fry, front_h, wheel_L, wheel_W, wr, wg, wb, 1.0f);
+write_render_quad(out, base + 18, rlx, rly, rear_h, wheel_L, wheel_W, wr, wg, wb, 1.0f); write_render_quad(out, base + 24, rrx, rry, rear_h, wheel_L, wheel_W, wr, wg, wb, 1.0f); } __global__ void render_textured_body_dense_system_kernel(RenderVertex* out,ECSArrays ecs,int max_entities,const int* active_ids,const int* active_count,int* render_count) {
+AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) bool emit = (ecs.alive[i] == ENTITY_ALIVE); int slot = avabm_warp_append_slot(emit, render_count); if (!emit || slot < 0 || slot >= max_entities) continue; int base = slot * RENDER_BODY_VERTS_PER_VEHICLE;
+write_render_textured_quad(out,base,ecs.x[i],ecs.y[i],ecs.heading[i],fmaxf(ecs.length[i] * 1.06f, 2.0f),fmaxf(ecs.width[i] * 1.18f, 1.0f),ecs.driver_type[i],indicator_state_ecs(i, ecs),ecs.turn_signal_time != nullptr ? ecs.turn_signal_time[i] : 0.0f); AVABM_ACTIVE_LOOP_END()}
+__global__ void render_body_dense_system_kernel(RenderVertex* out,ECSArrays ecs,int max_entities,const int* active_ids,const int* active_count,int* render_count) { AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) bool emit = (ecs.alive[i] == ENTITY_ALIVE); int slot = avabm_warp_append_slot(emit, render_count);
+if (!emit || slot < 0 || slot >= max_entities) continue; int base = slot * RENDER_BODY_VERTS_PER_VEHICLE; float r = ecs.driver_type[i] == AV ? 0.55f : 1.00f; float g = ecs.driver_type[i] == AV ? 0.84f : 1.00f; float b = ecs.driver_type[i] == AV ? 1.00f : 1.00f; int sig = indicator_state_ecs(i, ecs);
+float sig_time = ecs.turn_signal_time != nullptr ? ecs.turn_signal_time[i] : 0.0f; if (sig != INDICATOR_NONE && fmodf(fmaxf(sig_time, 0.0f) * 2.25f, 1.0f) < 0.55f) { r = 1.00f; g = 0.72f; b = 0.08f; } write_render_quad(out,base,ecs.x[i],ecs.y[i],ecs.heading[i],fmaxf(ecs.length[i], 2.0f),fmaxf(ecs.width[i], 1.0f),r,g,b,1.0f); AVABM_ACTIVE_LOOP_END()}
+__global__ void render_dense_system_kernel(RenderVertex* out,ECSArrays ecs,int max_entities,const int* active_ids,const int* active_count,int* render_count) { AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) bool emit = (ecs.alive[i] == ENTITY_ALIVE); int slot = avabm_warp_append_slot(emit, render_count);
+if (!emit || slot < 0 || slot >= max_entities) continue; int base = slot * RENDER_FULL_VERTS_PER_VEHICLE; float cx = ecs.x[i]; float cy = ecs.y[i]; float h = ecs.heading[i]; float L = fmaxf(ecs.length[i], 2.0f); float W = fmaxf(ecs.width[i], 1.0f); float r = ecs.driver_type[i] == AV ? 0.55f : 1.00f; float g = ecs.driver_type[i] == AV ? 0.84f : 1.00f;
+float b = ecs.driver_type[i] == AV ? 1.00f : 1.00f; int sig = indicator_state_ecs(i, ecs); float sig_time = ecs.turn_signal_time != nullptr ? ecs.turn_signal_time[i] : 0.0f; if (sig != INDICATOR_NONE && fmodf(fmaxf(sig_time, 0.0f) * 2.25f, 1.0f) < 0.55f) { r = 1.00f; g = 0.72f; b = 0.08f; } write_render_quad(out, base, cx, cy, h, L, W, r, g, b, 1.0f);
+float fx = cosf(h); float fy = sinf(h); float sx = -fy; float sy = fx; float wheelbase = vehicle_wheelbase_from_length(L); float front_off = 0.5f * wheelbase; float rear_off = -0.5f * wheelbase; float lateral = 0.38f * W; float wheel_L = clampf_cuda(0.16f * L, 0.55f, 0.82f); float wheel_W = clampf_cuda(0.15f * W, 0.20f, 0.32f); float wr = 0.04f;
+float wg = 0.04f; float wb = 0.04f; float raw_steer = (ecs.steer_angle != nullptr) ? ecs.steer_angle[i] : 0.0f; float steer = clampf_cuda(raw_steer,-(ecs.driver_type[i] == HUMAN ? MAX_STEER_HUMAN : MAX_STEER_AV),(ecs.driver_type[i] == HUMAN ? MAX_STEER_HUMAN : MAX_STEER_AV)); float front_h = wrap_pi(h + steer); float rear_h = h;
+float flx = cx + fx * front_off + sx * lateral; float fly = cy + fy * front_off + sy * lateral; float frx = cx + fx * front_off - sx * lateral; float fry = cy + fy * front_off - sy * lateral; float rlx = cx + fx * rear_off + sx * lateral; float rly = cy + fy * rear_off + sy * lateral; float rrx = cx + fx * rear_off - sx * lateral;
+float rry = cy + fy * rear_off - sy * lateral; write_render_quad(out, base + 6, flx, fly, front_h, wheel_L, wheel_W, wr, wg, wb, 1.0f); write_render_quad(out, base + 12, frx, fry, front_h, wheel_L, wheel_W, wr, wg, wb, 1.0f); write_render_quad(out, base + 18, rlx, rly, rear_h, wheel_L, wheel_W, wr, wg, wb, 1.0f);
+write_render_quad(out, base + 24, rrx, rry, rear_h, wheel_L, wheel_W, wr, wg, wb, 1.0f); AVABM_ACTIVE_LOOP_END()} AVABM_DINLINE void render_interpolated_pose_ecs(ECSArrays prev,ECSArrays curr,int i,float alpha,float& cx,float& cy,float& h,float& steer) { alpha = clampf_cuda(alpha, 0.0f, 1.0f); cx = curr.x[i]; cy = curr.y[i]; h = curr.heading[i];
+steer = curr.steer_angle != nullptr ? curr.steer_angle[i] : 0.0f; bool has_prev = prev.alive != nullptr && prev.x != nullptr && prev.y != nullptr && prev.heading != nullptr && prev.alive[i] == ENTITY_ALIVE; if (!has_prev) return; float px = prev.x[i]; float py = prev.y[i]; float ph = prev.heading[i];
+float ps = prev.steer_angle != nullptr ? prev.steer_angle[i] : steer; float dx = cx - px; float dy = cy - py; float d2 = dx * dx + dy * dy; if (!isfinite(d2) || d2 > 10000.0f) return; cx = px + dx * alpha; cy = py + dy * alpha; h = wrap_pi(ph + wrap_pi(h - ph) * alpha); steer = ps + (steer - ps) * alpha; }
+__global__ void render_textured_body_interpolated_full_draw_kernel(RenderVertex* out,ECSArrays prev,ECSArrays curr,int max_entities,const int* active_ids,const int* active_count,int* render_count,float alpha) { AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) bool emit = (curr.alive[i] == ENTITY_ALIVE);
+int slot = avabm_warp_append_slot(emit, render_count); if (!emit || slot < 0 || slot >= max_entities) continue; int base = slot * RENDER_BODY_VERTS_PER_VEHICLE; float cx, cy, h, steer; render_interpolated_pose_ecs(prev, curr, i, alpha, cx, cy, h, steer);
+write_render_textured_quad(out,base,cx,cy,h,fmaxf(curr.length[i] * 1.06f, 2.0f),fmaxf(curr.width[i] * 1.18f, 1.0f),curr.driver_type[i],indicator_state_ecs(i, curr),curr.turn_signal_time != nullptr ? curr.turn_signal_time[i] : 0.0f); AVABM_ACTIVE_LOOP_END()}
+__global__ void render_body_interpolated_full_draw_kernel(RenderVertex* out,ECSArrays prev,ECSArrays curr,int max_entities,const int* active_ids,const int* active_count,int* render_count,float alpha) { AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) bool emit = (curr.alive[i] == ENTITY_ALIVE);
+int slot = avabm_warp_append_slot(emit, render_count); if (!emit || slot < 0 || slot >= max_entities) continue; int base = slot * RENDER_BODY_VERTS_PER_VEHICLE; float cx, cy, h, steer; render_interpolated_pose_ecs(prev, curr, i, alpha, cx, cy, h, steer); float r = curr.driver_type[i] == AV ? 0.55f : 1.00f; float g = curr.driver_type[i] == AV ? 0.84f : 1.00f;
+float b = curr.driver_type[i] == AV ? 1.00f : 1.00f; int sig = indicator_state_ecs(i, curr); float sig_time = curr.turn_signal_time != nullptr ? curr.turn_signal_time[i] : 0.0f; if (sig != INDICATOR_NONE && fmodf(fmaxf(sig_time, 0.0f) * 2.25f, 1.0f) < 0.55f) { r = 1.00f; g = 0.72f; b = 0.08f; }
+write_render_quad(out,base,cx,cy,h,fmaxf(curr.length[i], 2.0f),fmaxf(curr.width[i], 1.0f),r,g,b,1.0f); AVABM_ACTIVE_LOOP_END()} __global__ void render_interpolated_full_draw_kernel(RenderVertex* out,ECSArrays prev,ECSArrays curr,int max_entities,const int* active_ids,const int* active_count,int* render_count,float alpha) {
+AVABM_ACTIVE_LOOP_BEGIN(max_entities, active_ids, active_count) bool emit = (curr.alive[i] == ENTITY_ALIVE); int slot = avabm_warp_append_slot(emit, render_count); if (!emit || slot < 0 || slot >= max_entities) continue; int base = slot * RENDER_FULL_VERTS_PER_VEHICLE; float cx, cy, h, steer;
+render_interpolated_pose_ecs(prev, curr, i, alpha, cx, cy, h, steer); float L = fmaxf(curr.length[i], 2.0f); float W = fmaxf(curr.width[i], 1.0f); float r = curr.driver_type[i] == AV ? 0.55f : 1.00f; float g = curr.driver_type[i] == AV ? 0.84f : 1.00f; float b = curr.driver_type[i] == AV ? 1.00f : 1.00f; int sig = indicator_state_ecs(i, curr);
+float sig_time = curr.turn_signal_time != nullptr ? curr.turn_signal_time[i] : 0.0f; if (sig != INDICATOR_NONE && fmodf(fmaxf(sig_time, 0.0f) * 2.25f, 1.0f) < 0.55f) { r = 1.00f; g = 0.72f; b = 0.08f; } write_render_quad(out, base, cx, cy, h, L, W, r, g, b, 1.0f); float fx = cosf(h); float fy = sinf(h); float sx = -fy; float sy = fx;
+float wheelbase = vehicle_wheelbase_from_length(L); float front_off = 0.5f * wheelbase; float rear_off = -0.5f * wheelbase; float lateral = 0.38f * W; float wheel_L = clampf_cuda(0.16f * L, 0.55f, 0.82f); float wheel_W = clampf_cuda(0.15f * W, 0.20f, 0.32f); float wr = 0.04f; float wg = 0.04f; float wb = 0.04f;
+steer = clampf_cuda(steer,-(curr.driver_type[i] == HUMAN ? MAX_STEER_HUMAN : MAX_STEER_AV),(curr.driver_type[i] == HUMAN ? MAX_STEER_HUMAN : MAX_STEER_AV)); float front_h = wrap_pi(h + steer); float rear_h = h; float flx = cx + fx * front_off + sx * lateral; float fly = cy + fy * front_off + sy * lateral; float frx = cx + fx * front_off - sx * lateral;
+float fry = cy + fy * front_off - sy * lateral; float rlx = cx + fx * rear_off + sx * lateral; float rly = cy + fy * rear_off + sy * lateral; float rrx = cx + fx * rear_off - sx * lateral; float rry = cy + fy * rear_off - sy * lateral; write_render_quad(out, base + 6, flx, fly, front_h, wheel_L, wheel_W, wr, wg, wb, 1.0f);
+write_render_quad(out, base + 12, frx, fry, front_h, wheel_L, wheel_W, wr, wg, wb, 1.0f); write_render_quad(out, base + 18, rlx, rly, rear_h, wheel_L, wheel_W, wr, wg, wb, 1.0f); write_render_quad(out, base + 24, rrx, rry, rear_h, wheel_L, wheel_W, wr, wg, wb, 1.0f); AVABM_ACTIVE_LOOP_END()}
+__global__ void clear_render_tail_system_kernel(RenderVertex* out,const int* render_count,const int* previous_render_count,int max_entities,int verts_per_vehicle,int force_full_tail_clear) { if (out == nullptr || render_count == nullptr || max_entities <= 0 || verts_per_vehicle <= 0) return; int count = *render_count; if (count < 0) count = 0;
+if (count > max_entities) count = max_entities; int end_count = max_entities; if (force_full_tail_clear == 0 && previous_render_count != nullptr) { end_count = *previous_render_count; } if (end_count < 0) end_count = 0; if (end_count > max_entities) end_count = max_entities; if (end_count <= count) return;
+int total_tail_vertices = (end_count - count) * verts_per_vehicle; int tid = blockIdx.x * blockDim.x + threadIdx.x; int stride = blockDim.x * gridDim.x; RenderVertex z = { 0, 0, 0, 0, 0, 0, 1 }; RenderVertex* tail = out + count * verts_per_vehicle; for (int k = tid; k < total_tail_vertices; k += stride) { tail[k] = z; } }
+__global__ void remember_render_count_system_kernel(const int* render_count,int* previous_render_count,int max_entities) { if (render_count == nullptr || previous_render_count == nullptr) return; int count = *render_count; if (count < 0) count = 0; if (count > max_entities) count = max_entities; *previous_render_count = count; }
+extern "C" void register_render_vbo_cuda(unsigned int vbo) { if (g_render_resource != nullptr) { cudaGraphicsUnregisterResource(g_render_resource); g_render_resource = nullptr; } cudaGraphicsGLRegisterBuffer(&g_render_resource,vbo,cudaGraphicsRegisterFlagsWriteDiscard); } extern "C" void set_vehicle_texture_render_cuda(int enabled) {
+g_render_textured_cars = enabled != 0 ? 1 : 0; } extern "C" void launch_render_vbo_cuda_ecs(ECSArrays ecs,int max_entities,const int* active_ids,const int* active_count,int* render_count,int* previous_render_count,cudaStream_t stream,int clear_tail_for_full_draw) { if (g_render_resource == nullptr || max_entities <= 0 || render_count == nullptr) return;
+cudaGraphicsMapResources(1, &g_render_resource, stream); RenderVertex* dev_ptr = nullptr; size_t size = 0; cudaGraphicsResourceGetMappedPointer((void**)&dev_ptr,&size,g_render_resource); if (dev_ptr != nullptr) { cudaMemsetAsync(render_count, 0, sizeof(int), stream); int threads = 256; int entity_blocks = (max_entities + threads - 1) / threads;
+int active_blocks = entity_blocks < AVABM_ACTIVE_ENTITY_KERNEL_BLOCKS ? entity_blocks : AVABM_ACTIVE_ENTITY_KERNEL_BLOCKS; if (active_blocks < 1) active_blocks = 1; size_t full_needed = (size_t)max_entities * (size_t)RENDER_FULL_VERTS_PER_VEHICLE * sizeof(RenderVertex);
+size_t body_needed = (size_t)max_entities * (size_t)RENDER_BODY_VERTS_PER_VEHICLE * sizeof(RenderVertex); if (g_render_textured_cars != 0 && size >= body_needed) { render_textured_body_dense_system_kernel<<<active_blocks, threads, 0, stream>>>(dev_ptr,ecs,max_entities,active_ids,active_count,render_count); if (clear_tail_for_full_draw != 0) {
+clear_render_tail_system_kernel<<<active_blocks, threads, 0, stream>>>(dev_ptr,render_count,previous_render_count,max_entities,RENDER_BODY_VERTS_PER_VEHICLE,previous_render_count == nullptr ? 1 : 0); remember_render_count_system_kernel<<<1, 1, 0, stream>>>(render_count,previous_render_count,max_entities); } } else if (size >= full_needed) {
+render_dense_system_kernel<<<active_blocks, threads, 0, stream>>>(dev_ptr,ecs,max_entities,active_ids,active_count,render_count); if (clear_tail_for_full_draw != 0) {
+clear_render_tail_system_kernel<<<active_blocks, threads, 0, stream>>>(dev_ptr,render_count,previous_render_count,max_entities,RENDER_FULL_VERTS_PER_VEHICLE,previous_render_count == nullptr ? 1 : 0); remember_render_count_system_kernel<<<1, 1, 0, stream>>>(render_count,previous_render_count,max_entities); } } else if (size >= body_needed) {
+render_body_dense_system_kernel<<<active_blocks, threads, 0, stream>>>(dev_ptr,ecs,max_entities,active_ids,active_count,render_count); if (clear_tail_for_full_draw != 0) {
+clear_render_tail_system_kernel<<<active_blocks, threads, 0, stream>>>(dev_ptr,render_count,previous_render_count,max_entities,RENDER_BODY_VERTS_PER_VEHICLE,previous_render_count == nullptr ? 1 : 0); remember_render_count_system_kernel<<<1, 1, 0, stream>>>(render_count,previous_render_count,max_entities); } } }
+cudaGraphicsUnmapResources(1, &g_render_resource, stream); } extern "C" void launch_render_vbo_interpolated_cuda_ecs(ECSArrays prev_ecs,ECSArrays curr_ecs,int max_entities,const int* active_ids,const int* active_count,int* render_count,int* previous_render_count,cudaStream_t stream,int clear_tail_for_full_draw,float alpha) {
+if (g_render_resource == nullptr || max_entities <= 0 || render_count == nullptr) return; cudaGraphicsMapResources(1, &g_render_resource, stream); RenderVertex* dev_ptr = nullptr; size_t size = 0; cudaGraphicsResourceGetMappedPointer((void**)&dev_ptr,&size,g_render_resource); if (dev_ptr != nullptr) { cudaMemsetAsync(render_count, 0, sizeof(int), stream);
+int threads = 256; int entity_blocks = (max_entities + threads - 1) / threads; int scan_blocks = entity_blocks < AVABM_ACTIVE_ENTITY_KERNEL_BLOCKS ? entity_blocks : AVABM_ACTIVE_ENTITY_KERNEL_BLOCKS; if (scan_blocks < 1) scan_blocks = 1; size_t full_needed = (size_t)max_entities * (size_t)RENDER_FULL_VERTS_PER_VEHICLE * sizeof(RenderVertex);
+size_t body_needed = (size_t)max_entities * (size_t)RENDER_BODY_VERTS_PER_VEHICLE * sizeof(RenderVertex); if (g_render_textured_cars != 0 && size >= body_needed) { render_textured_body_interpolated_full_draw_kernel<<<scan_blocks, threads, 0, stream>>>(dev_ptr,prev_ecs,curr_ecs,max_entities,active_ids,active_count,render_count,alpha);
+if (clear_tail_for_full_draw != 0) { clear_render_tail_system_kernel<<<scan_blocks, threads, 0, stream>>>(dev_ptr,render_count,previous_render_count,max_entities,RENDER_BODY_VERTS_PER_VEHICLE,previous_render_count == nullptr ? 1 : 0); remember_render_count_system_kernel<<<1, 1, 0, stream>>>(render_count,previous_render_count,max_entities); }
+} else if (size >= full_needed) { render_interpolated_full_draw_kernel<<<scan_blocks, threads, 0, stream>>>(dev_ptr,prev_ecs,curr_ecs,max_entities,active_ids,active_count,render_count,alpha); if (clear_tail_for_full_draw != 0) {
+clear_render_tail_system_kernel<<<scan_blocks, threads, 0, stream>>>(dev_ptr,render_count,previous_render_count,max_entities,RENDER_FULL_VERTS_PER_VEHICLE,previous_render_count == nullptr ? 1 : 0); remember_render_count_system_kernel<<<1, 1, 0, stream>>>(render_count,previous_render_count,max_entities); } } else if (size >= body_needed) {
+render_body_interpolated_full_draw_kernel<<<scan_blocks, threads, 0, stream>>>(dev_ptr,prev_ecs,curr_ecs,max_entities,active_ids,active_count,render_count,alpha); if (clear_tail_for_full_draw != 0) {
+clear_render_tail_system_kernel<<<scan_blocks, threads, 0, stream>>>(dev_ptr,render_count,previous_render_count,max_entities,RENDER_BODY_VERTS_PER_VEHICLE,previous_render_count == nullptr ? 1 : 0); remember_render_count_system_kernel<<<1, 1, 0, stream>>>(render_count,previous_render_count,max_entities); } } }
+cudaGraphicsUnmapResources(1, &g_render_resource, stream); } extern "C" void unregister_render_vbo_cuda() { if (g_render_resource != nullptr) { cudaGraphicsUnregisterResource(g_render_resource); g_render_resource = nullptr; } }
+extern "C" void launch_step_cuda_ecs(ECSArrays ecs,RoadNetwork road,Signals signals,SpatialGrid grid,SpawnConfig spawn,PerceptionSoA perception,DecisionSoA decision,int* reservation_table,uint32_t* rng_state,float* metrics,int* active_ids,int* active_count,int* lane_active_ids,int* lane_active_count,int* connector_active_ids,int* connector_active_count,int initial_grid_valid,float current_time,float dt,int max_entities,int step_index,cudaStream_t stream) {
+if (max_entities <= 0 || road.num_lanes <= 0) return; if (grid.cell_size <= 0.1f || grid.width <= 0 || grid.height <= 0) return; if (dt <= 0.0f || dt > 0.5f) return; int threads = 256; int entity_blocks = (max_entities + threads - 1) / threads;
+int active_blocks = entity_blocks < AVABM_ACTIVE_ENTITY_KERNEL_BLOCKS ? entity_blocks : AVABM_ACTIVE_ENTITY_KERNEL_BLOCKS; if (active_blocks < 1) active_blocks = 1; int world_cells = grid.width * grid.height; int spawn_blocks = (spawn.num_spawn_points + threads - 1) / threads; const bool fast_physics = (AVABM_FAST_PHYSICS_MODE != 0);
+const bool do_route_repair = (!fast_physics) || avabm_due_interval_ecs(step_index, AVABM_ROUTE_REPAIR_INTERVAL); const bool do_spawn_overlap = (!fast_physics) || avabm_due_interval_ecs(step_index, AVABM_SPAWN_OVERLAP_INTERVAL); const bool do_priority = (!fast_physics) || avabm_due_interval_ecs(step_index, AVABM_PRIORITY_INTERVAL);
+const bool do_local_avoidance = (!fast_physics) || avabm_due_interval_ecs(step_index, AVABM_LOCAL_AVOIDANCE_INTERVAL); const bool do_front_clear = (!fast_physics) || avabm_due_interval_ecs(step_index, AVABM_FRONT_CLEAR_INTERVAL); const bool do_contact = (!fast_physics) || avabm_due_interval_ecs(step_index, AVABM_CONTACT_INTERVAL);
+const bool expensive_metrics_enabled = (AVABM_EXPENSIVE_SAFETY_METRICS_ENABLED != 0);
 #if AVABM_METRICS_MODE == 0
-    const bool any_metrics_enabled = false;
+const bool any_metrics_enabled = false;
 #else
-    const bool any_metrics_enabled = true;
+const bool any_metrics_enabled = true;
 #endif
-    const bool do_collision = expensive_metrics_enabled && any_metrics_enabled && ((!fast_physics) ||
-            avabm_due_interval_ecs(step_index, AVABM_COLLISION_INTERVAL));
-    const bool do_safety_metrics = expensive_metrics_enabled && any_metrics_enabled && ((!fast_physics) ||
-            avabm_due_interval_ecs(step_index, AVABM_SAFETY_METRICS_INTERVAL));
-    const bool do_stats = any_metrics_enabled && ((!fast_physics) || avabm_due_interval_ecs(step_index, AVABM_STATS_INTERVAL));
+const bool do_collision = expensive_metrics_enabled && any_metrics_enabled && ((!fast_physics) || avabm_due_interval_ecs(step_index, AVABM_COLLISION_INTERVAL)); const bool do_safety_metrics = expensive_metrics_enabled && any_metrics_enabled && ((!fast_physics) || avabm_due_interval_ecs(step_index, AVABM_SAFETY_METRICS_INTERVAL));
+const bool do_stats = any_metrics_enabled && ((!fast_physics) || avabm_due_interval_ecs(step_index, AVABM_STATS_INTERVAL));
 #if AVABM_INCREMENTAL_ACTIVE_LIST
-    const bool do_full_active_compact = (step_index <= 0) || avabm_due_interval_ecs(step_index, AVABM_ACTIVE_FULL_COMPACT_INTERVAL);
+const bool do_full_active_compact = (step_index <= 0) || avabm_due_interval_ecs(step_index, AVABM_ACTIVE_FULL_COMPACT_INTERVAL);
 #else
-    const bool do_full_active_compact = true;
+const bool do_full_active_compact = true;
 #endif
-    if (any_metrics_enabled) {
-        avabm_clear_float_zero_async(metrics + 6, METRICS_SIZE - 6, stream);
-    }
-    if (do_full_active_compact) {
-        avabm_rebuild_active_list_async(ecs, active_ids, active_count, max_entities, threads, entity_blocks, stream);
-    }
-    int total_slots = (reservation_table != nullptr && road.num_nodes > 0) ? road.num_nodes * RES_HORIZON_SLOTS : 0;
-    if (total_slots > 0) {
-        avabm_clear_int_async(reservation_table, total_slots, RESERVATION_FREE, stream);
-    }
-    if (initial_grid_valid == 0) {
-        avabm_begin_grid_rebuild_async(grid, world_cells, stream);
-        spatial_hash_build_system<<<active_blocks, threads, 0, stream>>>(ecs, grid, max_entities, active_ids, active_count);
-    }
-    if (spawn.num_spawn_points > 0) {
-        spawn_system_kernel<<<spawn_blocks, threads, 0,
-                stream>>>(ecs, road, grid, spawn, rng_state, metrics, reservation_table,
-                reservation_table != nullptr ? total_slots : 0, current_time, dt, max_entities, step_index, active_ids,
-                active_count);
-    }
-    if (total_slots > 0) {
-        avabm_clear_int_async(reservation_table, total_slots, RESERVATION_FREE, stream);
-    }
+if (any_metrics_enabled) { avabm_clear_float_zero_async(metrics + 6, METRICS_SIZE - 6, stream); } if (do_full_active_compact) { avabm_rebuild_active_list_async(ecs,active_ids,active_count,max_entities,threads,entity_blocks,stream); } int total_slots = (reservation_table != nullptr && road.num_nodes > 0) ? road.num_nodes * RES_HORIZON_SLOTS : 0;
+if (total_slots > 0) { avabm_clear_int_async(reservation_table,total_slots,RESERVATION_FREE,stream); } if (initial_grid_valid == 0) { avabm_begin_grid_rebuild_async(grid, world_cells, stream); spatial_hash_build_system<<<active_blocks, threads, 0, stream>>>(ecs,grid,max_entities,active_ids,active_count); } if (spawn.num_spawn_points > 0) {
+spawn_system_kernel<<<spawn_blocks, threads, 0, stream>>>(ecs,road,grid,spawn,rng_state,metrics,reservation_table,reservation_table != nullptr ? total_slots : 0,current_time,dt,max_entities,step_index,active_ids,active_count); } if (total_slots > 0) { avabm_clear_int_async(reservation_table,total_slots,RESERVATION_FREE,stream); }
 #if AVABM_INCREMENTAL_ACTIVE_LIST
-    avabm_rebuild_active_archetypes_async(ecs, active_ids, active_count, lane_active_ids, lane_active_count, connector_active_ids,
-            connector_active_count, max_entities, threads, active_blocks, stream);
+avabm_rebuild_active_archetypes_async(ecs,active_ids,active_count,lane_active_ids,lane_active_count,connector_active_ids,connector_active_count,max_entities,threads,active_blocks,stream);
 #else
-    avabm_rebuild_active_all_archetypes_async(ecs, active_ids, active_count, lane_active_ids, lane_active_count,
-            connector_active_ids, connector_active_count, max_entities, threads, entity_blocks, stream);
+avabm_rebuild_active_all_archetypes_async(ecs,active_ids,active_count,lane_active_ids,lane_active_count,connector_active_ids,connector_active_count,max_entities,threads,entity_blocks,stream);
 #endif
-    if (do_spawn_overlap) {
-        avabm_begin_grid_rebuild_async(grid, world_cells, stream);
-        spatial_hash_build_system<<<active_blocks, threads, 0, stream>>>(ecs, grid, max_entities, active_ids, active_count);
-        resolve_spawn_overlap_system_kernel<<<active_blocks, threads, 0,
-                stream>>>(ecs, road, grid, spawn, metrics, current_time, dt, max_entities, active_ids, active_count);
-    }
-    bool reuse_persistent_grid_for_perception = false;
+if (do_spawn_overlap) { avabm_begin_grid_rebuild_async(grid, world_cells, stream); spatial_hash_build_system<<<active_blocks, threads, 0, stream>>>(ecs,grid,max_entities,active_ids,active_count); resolve_spawn_overlap_system_kernel<<<active_blocks, threads, 0, stream>>>(ecs,road,grid,spawn,metrics,current_time,dt,max_entities,active_ids,active_count); }
+bool reuse_persistent_grid_for_perception = false;
 #if AVABM_ECS_PERSISTENT_PERCEPTION_GRID_REUSE && AVABM_FAST_PHYSICS_MODE && AVABM_SPAWN_GRID_INSERT_FASTPATH
-    reuse_persistent_grid_for_perception = (initial_grid_valid != 0) && !do_spawn_overlap && !do_route_repair;
+reuse_persistent_grid_for_perception = (initial_grid_valid != 0) && !do_spawn_overlap && !do_route_repair;
 #endif
-    if (!reuse_persistent_grid_for_perception) {
-        avabm_begin_grid_rebuild_async(grid, world_cells, stream);
-        spatial_hash_build_system<<<active_blocks, threads, 0, stream>>>(ecs, grid, max_entities, active_ids, active_count);
-    }
-    if (do_route_repair) {
-        route_lane_repair_system_kernel<<<active_blocks, threads, 0,
-                stream>>>(ecs, road, metrics, dt, max_entities, active_ids, active_count);
-        avabm_begin_grid_rebuild_async(grid, world_cells, stream);
-        spatial_hash_build_system<<<active_blocks, threads, 0, stream>>>(ecs, grid, max_entities, active_ids, active_count);
-    }
+if (!reuse_persistent_grid_for_perception) { avabm_begin_grid_rebuild_async(grid, world_cells, stream); spatial_hash_build_system<<<active_blocks, threads, 0, stream>>>(ecs,grid,max_entities,active_ids,active_count); } if (do_route_repair) {
+route_lane_repair_system_kernel<<<active_blocks, threads, 0, stream>>>(ecs,road,metrics,dt,max_entities,active_ids,active_count); avabm_begin_grid_rebuild_async(grid, world_cells, stream); spatial_hash_build_system<<<active_blocks, threads, 0, stream>>>(ecs,grid,max_entities,active_ids,active_count); }
 #if AVABM_LANE_HASH_GRID_ENABLED
-    avabm_begin_lane_grid_rebuild_async(grid, road.num_lanes, stream);
-    lane_hash_build_system<<<active_blocks, threads, 0,
-            stream>>>(ecs, road, grid, max_entities, lane_active_ids, lane_active_count);
+avabm_begin_lane_grid_rebuild_async(grid, road.num_lanes, stream); lane_hash_build_system<<<active_blocks, threads, 0, stream>>>(ecs,road,grid,max_entities,lane_active_ids,lane_active_count);
 #endif
-    turn_signal_system_kernel<<<active_blocks, threads, 0,
-            stream>>>(ecs, decision, road, metrics, dt, max_entities, active_ids, active_count);
-    perception_system_kernel<<<active_blocks, threads, 0,
-            stream>>>(ecs, road, grid, perception, metrics, max_entities, active_ids, active_count);
-    decision_system_kernel<<<active_blocks, threads, 0,
-            stream>>>(ecs, road, signals, grid, perception, decision, reservation_table, metrics, current_time, dt, max_entities,
-            lane_active_ids, lane_active_count);
-    if (do_priority && reservation_table != nullptr && road.num_nodes > 0) {
-        int node_blocks = (road.num_nodes + threads - 1) / threads;
-        clear_intersection_priority_gate_kernel<<<node_blocks, threads, 0, stream>>>(reservation_table, road.num_nodes);
-        mark_intersection_occupancy_kernel<<<active_blocks, threads, 0,
-                stream>>>(ecs, road, reservation_table, max_entities, connector_active_ids, connector_active_count);
-        select_intersection_priority_candidates_kernel<<<active_blocks, threads, 0,
-                stream>>>(ecs, road, signals, decision, perception, reservation_table, metrics, current_time, dt, max_entities,
-                lane_active_ids, lane_active_count);
-        apply_intersection_priority_gate_kernel<<<active_blocks, threads, 0,
-                stream>>>(ecs, road, signals, decision, grid, perception, reservation_table, metrics, current_time, dt,
-                max_entities, lane_active_ids, lane_active_count);
-    }
-    if (do_local_avoidance) {
-        local_obstacle_avoidance_system_kernel<<<active_blocks, threads, 0,
-                stream>>>(ecs, road, grid, perception, decision, metrics, current_time, dt, max_entities, lane_active_ids,
-                lane_active_count);
-    }
-    if (do_front_clear) {
-        front_clear_must_go_system_kernel<<<active_blocks, threads, 0,
-                stream>>>(ecs, road, signals, grid, perception, decision, metrics, current_time, dt, max_entities, lane_active_ids,
-                lane_active_count);
-    }
-    lane_change_system_kernel<<<active_blocks, threads, 0,
-            stream>>>(ecs, decision, road, dt, max_entities, lane_active_ids, lane_active_count);
-    motion_system_kernel<<<active_blocks, threads, 0,
-            stream>>>(ecs, decision, road, perception, metrics, current_time, dt, max_entities, lane_active_ids, lane_active_count);
-    connector_enter_system_kernel<<<active_blocks, threads, 0,
-            stream>>>(ecs, decision, road, grid, metrics, current_time, dt, max_entities, lane_active_ids, lane_active_count);
-    avabm_rebuild_active_archetypes_async(ecs, active_ids, active_count, lane_active_ids, lane_active_count, connector_active_ids,
-            connector_active_count, max_entities, threads, active_blocks, stream);
-    avabm_begin_grid_rebuild_async(grid, world_cells, stream);
-    spatial_hash_build_system<<<active_blocks, threads, 0, stream>>>(ecs, grid, max_entities, active_ids, active_count);
-    connector_motion_system_kernel<<<active_blocks, threads, 0,
-            stream>>>(ecs, road, grid, metrics, current_time, dt, max_entities, connector_active_ids, connector_active_count);
-    avabm_begin_grid_rebuild_async(grid, world_cells, stream);
-    spatial_hash_build_system<<<active_blocks, threads, 0, stream>>>(ecs, grid, max_entities, active_ids, active_count);
-    if (do_contact) {
-        for (int contact_pass = 0; contact_pass < CONTACT_RESOLVE_PASSES; ++contact_pass) {
-            contact_resolve_system_kernel<<<active_blocks, threads, 0,
-                    stream>>>(ecs, road, grid, metrics, current_time, dt, max_entities, active_ids, active_count);
-            avabm_begin_grid_rebuild_async(grid, world_cells, stream);
-            spatial_hash_build_system<<<active_blocks, threads, 0, stream>>>(ecs, grid, max_entities, active_ids, active_count);
-        }
-    }
-    if (do_collision) {
-        collision_system_kernel<<<active_blocks, threads, 0,
-                stream>>>(ecs, grid, metrics, dt, max_entities, active_ids, active_count);
-    }
-    if (do_safety_metrics) {
-        safety_metrics_system_kernel<<<active_blocks, threads, 0,
-                stream>>>(ecs, grid, metrics, max_entities, active_ids, active_count);
-    }
-    if (do_stats) {
-        stats_system_kernel<<<active_blocks, threads, 0,
-                stream>>>(ecs, road, perception, decision, metrics, dt, max_entities, active_ids, active_count);
-    }
-}
+turn_signal_system_kernel<<<active_blocks, threads, 0, stream>>>(ecs,decision,road,metrics,dt,max_entities,active_ids,active_count); perception_system_kernel<<<active_blocks, threads, 0, stream>>>(ecs,road,grid,perception,metrics,max_entities,active_ids,active_count);
+decision_system_kernel<<<active_blocks, threads, 0, stream>>>(ecs,road,signals,grid,perception,decision,reservation_table,metrics,current_time,dt,max_entities,lane_active_ids,lane_active_count); if (do_priority && reservation_table != nullptr && road.num_nodes > 0) { int node_blocks = (road.num_nodes + threads - 1) / threads;
+clear_intersection_priority_gate_kernel<<<node_blocks, threads, 0, stream>>>(reservation_table,road.num_nodes); mark_intersection_occupancy_kernel<<<active_blocks, threads, 0, stream>>>(ecs,road,reservation_table,max_entities,connector_active_ids,connector_active_count);
+select_intersection_priority_candidates_kernel<<<active_blocks, threads, 0, stream>>>(ecs,road,signals,decision,perception,reservation_table,metrics,current_time,dt,max_entities,lane_active_ids,lane_active_count);
+apply_intersection_priority_gate_kernel<<<active_blocks, threads, 0, stream>>>(ecs,road,signals,decision,grid,perception,reservation_table,metrics,current_time,dt,max_entities,lane_active_ids,lane_active_count); } if (do_local_avoidance) {
+local_obstacle_avoidance_system_kernel<<<active_blocks, threads, 0, stream>>>(ecs,road,grid,perception,decision,metrics,current_time,dt,max_entities,lane_active_ids,lane_active_count); } if (do_front_clear) {
+front_clear_must_go_system_kernel<<<active_blocks, threads, 0, stream>>>(ecs,road,signals,grid,perception,decision,metrics,current_time,dt,max_entities,lane_active_ids,lane_active_count); } lane_change_system_kernel<<<active_blocks, threads, 0, stream>>>(ecs,decision,road,dt,max_entities,lane_active_ids,lane_active_count);
+motion_system_kernel<<<active_blocks, threads, 0, stream>>>(ecs,decision,road,perception,metrics,current_time,dt,max_entities,lane_active_ids,lane_active_count); connector_enter_system_kernel<<<active_blocks, threads, 0, stream>>>(ecs,decision,road,grid,metrics,current_time,dt,max_entities,lane_active_ids,lane_active_count);
+avabm_rebuild_active_archetypes_async(ecs,active_ids,active_count,lane_active_ids,lane_active_count,connector_active_ids,connector_active_count,max_entities,threads,active_blocks,stream); avabm_begin_grid_rebuild_async(grid, world_cells, stream); spatial_hash_build_system<<<active_blocks, threads, 0, stream>>>(ecs,grid,max_entities,active_ids,active_count);
+connector_motion_system_kernel<<<active_blocks, threads, 0, stream>>>(ecs,road,grid,metrics,current_time,dt,max_entities,connector_active_ids,connector_active_count); avabm_begin_grid_rebuild_async(grid, world_cells, stream); spatial_hash_build_system<<<active_blocks, threads, 0, stream>>>(ecs,grid,max_entities,active_ids,active_count); if (do_contact) {
+for (int contact_pass = 0; contact_pass < CONTACT_RESOLVE_PASSES; ++contact_pass) { contact_resolve_system_kernel<<<active_blocks, threads, 0, stream>>>(ecs,road,grid,metrics,current_time,dt,max_entities,active_ids,active_count); avabm_begin_grid_rebuild_async(grid, world_cells, stream);
+spatial_hash_build_system<<<active_blocks, threads, 0, stream>>>(ecs,grid,max_entities,active_ids,active_count); } } if (do_collision) { collision_system_kernel<<<active_blocks, threads, 0, stream>>>(ecs,grid,metrics,dt,max_entities,active_ids,active_count); } if (do_safety_metrics) {
+safety_metrics_system_kernel<<<active_blocks, threads, 0, stream>>>(ecs,grid,metrics,max_entities,active_ids,active_count); } if (do_stats) { stats_system_kernel<<<active_blocks, threads, 0, stream>>>(ecs,road,perception,decision,metrics,dt,max_entities,active_ids,active_count); } }
