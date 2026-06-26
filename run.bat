@@ -84,6 +84,13 @@ if not defined MSVC_STRICT_TOOLSET set "MSVC_STRICT_TOOLSET=1"
 if not defined MSVC_VCVARS64_BAT if defined VCVARS64_BAT set "MSVC_VCVARS64_BAT=%VCVARS64_BAT%"
 if not defined MSVC_VCVARS64_BAT set "MSVC_VCVARS64_BAT="
 
+if not defined BENCHMARK_STEPS set "BENCHMARK_STEPS=10000"
+if not defined BENCHMARK_WARMUP_STEPS set "BENCHMARK_WARMUP_STEPS=1000"
+if not defined BENCHMARK_BATCH_STEPS set "BENCHMARK_BATCH_STEPS=16384"
+if not defined BENCHMARK_MAX_AGENTS set "BENCHMARK_MAX_AGENTS=240000"
+if not defined BENCHMARK_OUTPUT_DIR set "BENCHMARK_OUTPUT_DIR=data/results"
+if not defined SUMO_BENCHMARK_RUNNER set "SUMO_BENCHMARK_RUNNER=auto"
+
 if not exist "%BUILD_HELPER%" (
     echo [Error] Missing CUDA build helper: %BUILD_HELPER%
     set "AVABM_EXIT_CODE=1"
@@ -100,7 +107,7 @@ if "%~1"=="6" goto :cmd_build_cpu
 if "%~1"=="7" goto :cmd_rebuild
 if "%~1"=="8" goto :cmd_hardclean
 if "%~1"=="9" goto :cmd_status
-if "%~1"=="11" goto :cmd_benchmark
+if "%~1"=="11" goto :cmd_benchmark_menu
 if "%~1"=="0" goto :finish
 if /I "%~1"=="q" goto :finish
 if /I "%~1"=="exit" goto :finish
@@ -132,6 +139,15 @@ if /I "%~1"=="cleanall" goto :cmd_hardclean
 if /I "%~1"=="clean-all" goto :cmd_hardclean
 if /I "%~1"=="status" goto :cmd_status
 if /I "%~1"=="check" goto :cmd_status
+if /I "%~1"=="benchmark-menu" goto :cmd_benchmark_menu
+if /I "%~1"=="bench-menu" goto :cmd_benchmark_menu
+if /I "%~1"=="benchmark-select" goto :cmd_benchmark_menu
+if /I "%~1"=="bench-select" goto :cmd_benchmark_menu
+if /I "%~1"=="benchmark-architectures" goto :cmd_benchmark_menu
+if /I "%~1"=="benchmark" if /I "%~2"=="menu" goto :cmd_benchmark_menu
+if /I "%~1"=="benchmark" if /I "%~2"=="select" goto :cmd_benchmark_menu
+if /I "%~1"=="bench" if /I "%~2"=="menu" goto :cmd_benchmark_menu
+if /I "%~1"=="bench" if /I "%~2"=="select" goto :cmd_benchmark_menu
 if /I "%~1"=="benchmark" goto :cmd_benchmark
 if /I "%~1"=="bench" goto :cmd_benchmark
 if /I "%~1"=="benchmark-cpu" goto :cmd_benchmark
@@ -163,7 +179,7 @@ echo 7. Clean rebuild CUDA
 echo 8. Hard clean + rebuild CUDA
 echo 9. CUDA build status
 echo 10. Exit
-echo 11. Benchmark - CPU/CUDA/SUMO throughput comparison
+echo 11. Benchmark selector - choose CPU/CUDA/SUMO architecture(s)
 echo.
 set "CHOICE="
 set /p "CHOICE=Select [1-11]: "
@@ -177,7 +193,7 @@ if "%MENU_CHOICE%"=="6" goto :cmd_build_cpu
 if "%MENU_CHOICE%"=="7" goto :cmd_rebuild
 if "%MENU_CHOICE%"=="8" goto :cmd_hardclean
 if "%MENU_CHOICE%"=="9" goto :cmd_status
-if "%MENU_CHOICE%"=="11" goto :cmd_benchmark
+if "%MENU_CHOICE%"=="11" goto :cmd_benchmark_menu
 if "%MENU_CHOICE%"=="10" goto :finish
 if "%MENU_CHOICE%"=="0" goto :finish
 if /I "%MENU_CHOICE%"=="q" goto :finish
@@ -206,9 +222,9 @@ if /I "%MENU_CHOICE%"=="cleanall" goto :cmd_hardclean
 if /I "%MENU_CHOICE%"=="clean-all" goto :cmd_hardclean
 if /I "%MENU_CHOICE%"=="status" goto :cmd_status
 if /I "%MENU_CHOICE%"=="check" goto :cmd_status
-if /I "%MENU_CHOICE%"=="benchmark" goto :cmd_benchmark
-if /I "%MENU_CHOICE%"=="bench" goto :cmd_benchmark
-if /I "%MENU_CHOICE%"=="sumo" goto :cmd_benchmark
+if /I "%MENU_CHOICE%"=="benchmark" goto :cmd_benchmark_menu
+if /I "%MENU_CHOICE%"=="bench" goto :cmd_benchmark_menu
+if /I "%MENU_CHOICE%"=="sumo" goto :cmd_benchmark_menu
 echo [Warning] Invalid selection: %CHOICE%
 goto :menu
 
@@ -274,6 +290,189 @@ if errorlevel 1 (
 set "AVABM_EXIT_CODE=%ERRORLEVEL%"
 goto :finish
 
+:cmd_benchmark_menu
+call :prepare_benchmark_menu
+if errorlevel 2 (
+    set "AVABM_EXIT_CODE=0"
+    goto :finish
+)
+if errorlevel 1 (
+    set "AVABM_EXIT_CODE=1"
+    goto :finish
+)
+goto :cmd_benchmark
+
+:prepare_benchmark_menu
+set "BENCHMARK_MENU_ORDER="
+set "BENCHMARK_MENU_ARGS="
+set "BENCHMARK_MENU_CHOICE="
+:benchmark_menu_arch
+cls
+echo.
+echo =======================================================
+echo AVABM Benchmark Architecture Selector
+echo =======================================================
+echo Choose which architecture/backend to benchmark.
+echo.
+echo 1. CPU only                 ^(C++ CPU backend^)
+echo 2. GPU only                 ^(CUDA backend^)
+echo 3. SUMO only                ^(SUMO baseline^)
+echo 4. CPU + GPU                ^(AVABM internal comparison^)
+echo 5. GPU + SUMO               ^(recommended for SUMO baseline^)
+echo 6. CPU + SUMO
+echo 7. CPU + GPU + SUMO         ^(all three^)
+echo 8. Custom order/subset      ^(example: cuda,sumo^)
+echo 0. Cancel
+echo.
+set /p "BENCHMARK_MENU_CHOICE=Select [1-8,0]: "
+set "BENCHMARK_MENU_CHOICE=%BENCHMARK_MENU_CHOICE: =%"
+set "BENCHMARK_MENU_CHOICE=%BENCHMARK_MENU_CHOICE:"=%"
+if "%BENCHMARK_MENU_CHOICE%"=="" goto :benchmark_menu_arch
+if "%BENCHMARK_MENU_CHOICE%"=="0" exit /b 2
+if /I "%BENCHMARK_MENU_CHOICE%"=="q" exit /b 2
+if /I "%BENCHMARK_MENU_CHOICE%"=="exit" exit /b 2
+if "%BENCHMARK_MENU_CHOICE%"=="1" set "BENCHMARK_MENU_ORDER=cpu"
+if /I "%BENCHMARK_MENU_CHOICE%"=="cpu" set "BENCHMARK_MENU_ORDER=cpu"
+if "%BENCHMARK_MENU_CHOICE%"=="2" set "BENCHMARK_MENU_ORDER=cuda"
+if /I "%BENCHMARK_MENU_CHOICE%"=="gpu" set "BENCHMARK_MENU_ORDER=cuda"
+if /I "%BENCHMARK_MENU_CHOICE%"=="cuda" set "BENCHMARK_MENU_ORDER=cuda"
+if "%BENCHMARK_MENU_CHOICE%"=="3" set "BENCHMARK_MENU_ORDER=sumo"
+if /I "%BENCHMARK_MENU_CHOICE%"=="sumo" set "BENCHMARK_MENU_ORDER=sumo"
+if "%BENCHMARK_MENU_CHOICE%"=="4" set "BENCHMARK_MENU_ORDER=cpu,cuda"
+if /I "%BENCHMARK_MENU_CHOICE%"=="both" set "BENCHMARK_MENU_ORDER=cpu,cuda"
+if "%BENCHMARK_MENU_CHOICE%"=="5" set "BENCHMARK_MENU_ORDER=cuda,sumo"
+if /I "%BENCHMARK_MENU_CHOICE%"=="gpu+sumo" set "BENCHMARK_MENU_ORDER=cuda,sumo"
+if /I "%BENCHMARK_MENU_CHOICE%"=="cuda+sumo" set "BENCHMARK_MENU_ORDER=cuda,sumo"
+if /I "%BENCHMARK_MENU_CHOICE%"=="gpu-sumo" set "BENCHMARK_MENU_ORDER=cuda,sumo"
+if /I "%BENCHMARK_MENU_CHOICE%"=="cuda-sumo" set "BENCHMARK_MENU_ORDER=cuda,sumo"
+if "%BENCHMARK_MENU_CHOICE%"=="6" set "BENCHMARK_MENU_ORDER=cpu,sumo"
+if /I "%BENCHMARK_MENU_CHOICE%"=="cpu+sumo" set "BENCHMARK_MENU_ORDER=cpu,sumo"
+if /I "%BENCHMARK_MENU_CHOICE%"=="cpu-sumo" set "BENCHMARK_MENU_ORDER=cpu,sumo"
+if "%BENCHMARK_MENU_CHOICE%"=="7" set "BENCHMARK_MENU_ORDER=cpu,cuda,sumo"
+if /I "%BENCHMARK_MENU_CHOICE%"=="all" set "BENCHMARK_MENU_ORDER=cpu,cuda,sumo"
+if /I "%BENCHMARK_MENU_CHOICE%"=="compare" set "BENCHMARK_MENU_ORDER=cpu,cuda,sumo"
+if "%BENCHMARK_MENU_CHOICE%"=="8" goto :benchmark_menu_custom_order
+if /I "%BENCHMARK_MENU_CHOICE%"=="custom" goto :benchmark_menu_custom_order
+if defined BENCHMARK_MENU_ORDER goto :benchmark_menu_after_arch
+echo.
+echo [Warning] Invalid benchmark architecture selection: %BENCHMARK_MENU_CHOICE%
+pause
+goto :benchmark_menu_arch
+
+:benchmark_menu_custom_order
+echo.
+echo Enter comma-separated backends in run order.
+echo Valid names: cpu, cuda, gpu, sumo. Example: cuda,sumo
+set "BENCHMARK_MENU_ORDER="
+set /p "BENCHMARK_MENU_ORDER=Order: "
+set "BENCHMARK_MENU_ORDER=%BENCHMARK_MENU_ORDER: =,%"
+set "BENCHMARK_MENU_ORDER=%BENCHMARK_MENU_ORDER:"=%"
+if not defined BENCHMARK_MENU_ORDER goto :benchmark_menu_arch
+
+:benchmark_menu_after_arch
+call :benchmark_menu_load
+if errorlevel 2 exit /b 2
+if errorlevel 1 exit /b 1
+set "ORIGINAL_ARGS=benchmark --benchmark-order=%BENCHMARK_MENU_ORDER%%BENCHMARK_MENU_ARGS%"
+echo.
+echo [Info] Benchmark order: %BENCHMARK_MENU_ORDER%
+if defined BENCHMARK_MENU_ARGS echo [Info] Extra args:%BENCHMARK_MENU_ARGS%
+if not defined BENCHMARK_MENU_ARGS echo [Info] Extra args: ^(none^)
+echo.
+exit /b 0
+
+:benchmark_menu_load
+set "BENCHMARK_MENU_LOAD="
+echo.
+echo -------------------------------------------------------
+echo Benchmark load / spawn setting
+echo -------------------------------------------------------
+echo 1. Use config/default demand
+echo 2. 20 vehicles/sec total spawn target
+echo 3. 50 vehicles/sec total spawn target
+echo 4. 100 vehicles/sec total spawn target
+echo 5. 200 vehicles/sec total spawn target
+echo 6. Custom vehicles/sec total spawn target
+echo 7. Custom total spawned vehicles during timed benchmark
+echo 8. Custom vehicles/sec per spawn point
+echo 0. Cancel
+echo.
+set /p "BENCHMARK_MENU_LOAD=Select [1-8,0, Enter=1]: "
+set "BENCHMARK_MENU_LOAD=%BENCHMARK_MENU_LOAD: =%"
+set "BENCHMARK_MENU_LOAD=%BENCHMARK_MENU_LOAD:"=%"
+if "%BENCHMARK_MENU_LOAD%"=="" set "BENCHMARK_MENU_LOAD=1"
+if "%BENCHMARK_MENU_LOAD%"=="0" exit /b 2
+if /I "%BENCHMARK_MENU_LOAD%"=="q" exit /b 2
+if "%BENCHMARK_MENU_LOAD%"=="1" goto :benchmark_menu_optional
+if "%BENCHMARK_MENU_LOAD%"=="2" set "BENCHMARK_MENU_ARGS=%BENCHMARK_MENU_ARGS% --benchmark-spawn-vps=20"
+if "%BENCHMARK_MENU_LOAD%"=="3" set "BENCHMARK_MENU_ARGS=%BENCHMARK_MENU_ARGS% --benchmark-spawn-vps=50"
+if "%BENCHMARK_MENU_LOAD%"=="4" set "BENCHMARK_MENU_ARGS=%BENCHMARK_MENU_ARGS% --benchmark-spawn-vps=100"
+if "%BENCHMARK_MENU_LOAD%"=="5" set "BENCHMARK_MENU_ARGS=%BENCHMARK_MENU_ARGS% --benchmark-spawn-vps=200"
+if "%BENCHMARK_MENU_LOAD%"=="6" goto :benchmark_menu_custom_vps
+if "%BENCHMARK_MENU_LOAD%"=="7" goto :benchmark_menu_custom_total
+if "%BENCHMARK_MENU_LOAD%"=="8" goto :benchmark_menu_custom_per_point
+if "%BENCHMARK_MENU_LOAD%"=="2" goto :benchmark_menu_optional
+if "%BENCHMARK_MENU_LOAD%"=="3" goto :benchmark_menu_optional
+if "%BENCHMARK_MENU_LOAD%"=="4" goto :benchmark_menu_optional
+if "%BENCHMARK_MENU_LOAD%"=="5" goto :benchmark_menu_optional
+echo [Warning] Invalid load selection: %BENCHMARK_MENU_LOAD%
+goto :benchmark_menu_load
+
+:benchmark_menu_custom_vps
+set "BENCHMARK_MENU_VALUE="
+set /p "BENCHMARK_MENU_VALUE=Total spawn VPS: "
+set "BENCHMARK_MENU_VALUE=%BENCHMARK_MENU_VALUE: =%"
+set "BENCHMARK_MENU_VALUE=%BENCHMARK_MENU_VALUE:"=%"
+if not defined BENCHMARK_MENU_VALUE goto :benchmark_menu_load
+set "BENCHMARK_MENU_ARGS=%BENCHMARK_MENU_ARGS% --benchmark-spawn-vps=%BENCHMARK_MENU_VALUE%"
+goto :benchmark_menu_optional
+
+:benchmark_menu_custom_total
+set "BENCHMARK_MENU_VALUE="
+set /p "BENCHMARK_MENU_VALUE=Total spawned vehicles during timed benchmark: "
+set "BENCHMARK_MENU_VALUE=%BENCHMARK_MENU_VALUE: =%"
+set "BENCHMARK_MENU_VALUE=%BENCHMARK_MENU_VALUE:"=%"
+if not defined BENCHMARK_MENU_VALUE goto :benchmark_menu_load
+set "BENCHMARK_MENU_ARGS=%BENCHMARK_MENU_ARGS% --benchmark-spawn-total=%BENCHMARK_MENU_VALUE%"
+goto :benchmark_menu_optional
+
+:benchmark_menu_custom_per_point
+set "BENCHMARK_MENU_VALUE="
+set /p "BENCHMARK_MENU_VALUE=Spawn VPS per spawn point: "
+set "BENCHMARK_MENU_VALUE=%BENCHMARK_MENU_VALUE: =%"
+set "BENCHMARK_MENU_VALUE=%BENCHMARK_MENU_VALUE:"=%"
+if not defined BENCHMARK_MENU_VALUE goto :benchmark_menu_load
+set "BENCHMARK_MENU_ARGS=%BENCHMARK_MENU_ARGS% --benchmark-spawn-per-point-vps=%BENCHMARK_MENU_VALUE%"
+goto :benchmark_menu_optional
+
+:benchmark_menu_optional
+echo.
+echo Optional overrides. Press Enter to keep config.txt value.
+set "BENCHMARK_MENU_STEPS="
+set /p "BENCHMARK_MENU_STEPS=Timed steps [current %BENCHMARK_STEPS%]: "
+set "BENCHMARK_MENU_STEPS=%BENCHMARK_MENU_STEPS: =%"
+set "BENCHMARK_MENU_STEPS=%BENCHMARK_MENU_STEPS:"=%"
+if defined BENCHMARK_MENU_STEPS set "BENCHMARK_MENU_ARGS=%BENCHMARK_MENU_ARGS% --benchmark-steps=%BENCHMARK_MENU_STEPS%"
+set "BENCHMARK_MENU_WARMUP="
+set /p "BENCHMARK_MENU_WARMUP=Warmup steps [current %BENCHMARK_WARMUP_STEPS%]: "
+set "BENCHMARK_MENU_WARMUP=%BENCHMARK_MENU_WARMUP: =%"
+set "BENCHMARK_MENU_WARMUP=%BENCHMARK_MENU_WARMUP:"=%"
+if defined BENCHMARK_MENU_WARMUP set "BENCHMARK_MENU_ARGS=%BENCHMARK_MENU_ARGS% --benchmark-warmup-steps=%BENCHMARK_MENU_WARMUP%"
+set "BENCHMARK_MENU_MAX_AGENTS="
+set /p "BENCHMARK_MENU_MAX_AGENTS=Max agents [current %BENCHMARK_MAX_AGENTS%]: "
+set "BENCHMARK_MENU_MAX_AGENTS=%BENCHMARK_MENU_MAX_AGENTS: =%"
+set "BENCHMARK_MENU_MAX_AGENTS=%BENCHMARK_MENU_MAX_AGENTS:"=%"
+if defined BENCHMARK_MENU_MAX_AGENTS set "BENCHMARK_MENU_ARGS=%BENCHMARK_MENU_ARGS% --benchmark-max-agents=%BENCHMARK_MENU_MAX_AGENTS%"
+echo(%BENCHMARK_MENU_ORDER% | findstr /I /C:"sumo" >nul 2>nul
+if errorlevel 1 goto :benchmark_menu_done
+set "BENCHMARK_MENU_SUMO_RUNNER="
+set /p "BENCHMARK_MENU_SUMO_RUNNER=SUMO runner [auto/libsumo/cli, current %SUMO_BENCHMARK_RUNNER%]: "
+set "BENCHMARK_MENU_SUMO_RUNNER=%BENCHMARK_MENU_SUMO_RUNNER: =%"
+set "BENCHMARK_MENU_SUMO_RUNNER=%BENCHMARK_MENU_SUMO_RUNNER:"=%"
+if defined BENCHMARK_MENU_SUMO_RUNNER set "BENCHMARK_MENU_ARGS=%BENCHMARK_MENU_ARGS% --sumo-runner=%BENCHMARK_MENU_SUMO_RUNNER%"
+:benchmark_menu_done
+exit /b 0
+
 :detect_benchmark_order
 set "BENCHMARK_LAUNCH_ORDER=both"
 echo(%ORIGINAL_ARGS% | findstr /I /C:"benchmark sumo" /C:"benchmark-sumo" /C:"bench-sumo" /C:"--benchmark-sumo" /C:"--bench-sumo" /C:"--benchmark-order=sumo" /C:"--benchmark-backend=sumo" /C:"--benchmark-backends=sumo" >nul 2>nul
@@ -282,13 +481,13 @@ echo(%ORIGINAL_ARGS% | findstr /I /C:"benchmark cpu" /C:"benchmark-cpu" /C:"benc
 if not errorlevel 1 set "BENCHMARK_LAUNCH_ORDER=cpu"
 echo(%ORIGINAL_ARGS% | findstr /I /C:"benchmark gpu" /C:"benchmark cuda" /C:"benchmark-gpu" /C:"benchmark-cuda" /C:"bench-gpu" /C:"bench-cuda" /C:"--benchmark-gpu" /C:"--benchmark-cuda" /C:"--bench-gpu" /C:"--bench-cuda" /C:"--gpu" /C:"--cuda" /C:"--cuda-strict" /C:"--backend=cuda" /C:"--backend=cuda_strict" /C:"--benchmark-backend=gpu" /C:"--benchmark-backend=cuda" /C:"--benchmark-backends=gpu" /C:"--benchmark-backends=cuda" /C:"--benchmark-order=gpu" /C:"--benchmark-order=cuda" >nul 2>nul
 if not errorlevel 1 set "BENCHMARK_LAUNCH_ORDER=cuda"
-echo(%ORIGINAL_ARGS% | findstr /I /C:"benchmark cpu-sumo" /C:"benchmark cpu+sumo" /C:"--benchmark-order=cpu,sumo" /C:"--benchmark-backends=cpu,sumo" >nul 2>nul
+echo(%ORIGINAL_ARGS% | findstr /I /C:"benchmark cpu-sumo" /C:"benchmark cpu+sumo" /C:"--benchmark-order=cpu,sumo" /C:"--benchmark-order=sumo,cpu" /C:"--benchmark-backends=cpu,sumo" /C:"--benchmark-backends=sumo,cpu" >nul 2>nul
 if not errorlevel 1 set "BENCHMARK_LAUNCH_ORDER=cpu"
-echo(%ORIGINAL_ARGS% | findstr /I /C:"benchmark gpu-sumo" /C:"benchmark cuda-sumo" /C:"benchmark gpu+sumo" /C:"benchmark cuda+sumo" /C:"--benchmark-order=cuda,sumo" /C:"--benchmark-order=gpu,sumo" /C:"--benchmark-backends=cuda,sumo" /C:"--benchmark-backends=gpu,sumo" >nul 2>nul
+echo(%ORIGINAL_ARGS% | findstr /I /C:"benchmark gpu-sumo" /C:"benchmark cuda-sumo" /C:"benchmark gpu+sumo" /C:"benchmark cuda+sumo" /C:"--benchmark-order=cuda,sumo" /C:"--benchmark-order=gpu,sumo" /C:"--benchmark-order=sumo,cuda" /C:"--benchmark-order=sumo,gpu" /C:"--benchmark-backends=cuda,sumo" /C:"--benchmark-backends=gpu,sumo" /C:"--benchmark-backends=sumo,cuda" /C:"--benchmark-backends=sumo,gpu" >nul 2>nul
 if not errorlevel 1 set "BENCHMARK_LAUNCH_ORDER=cuda"
-echo(%ORIGINAL_ARGS% | findstr /I /C:"benchmark both" /C:"--benchmark-order=cpu,cuda" /C:"--benchmark-order=cuda,cpu" /C:"--benchmark-backends=cpu,cuda" /C:"--benchmark-backends=cuda,cpu" >nul 2>nul
+echo(%ORIGINAL_ARGS% | findstr /I /C:"benchmark both" /C:"--benchmark-order=cpu,cuda" /C:"--benchmark-order=cuda,cpu" /C:"--benchmark-order=cpu,gpu" /C:"--benchmark-order=gpu,cpu" /C:"--benchmark-backends=cpu,cuda" /C:"--benchmark-backends=cuda,cpu" /C:"--benchmark-backends=cpu,gpu" /C:"--benchmark-backends=gpu,cpu" >nul 2>nul
 if not errorlevel 1 set "BENCHMARK_LAUNCH_ORDER=both"
-echo(%ORIGINAL_ARGS% | findstr /I /C:"benchmark all" /C:"benchmark compare" /C:"--benchmark-order=cpu,cuda,sumo" /C:"--benchmark-order=cuda,cpu,sumo" /C:"--benchmark-backends=cpu,cuda,sumo" /C:"--benchmark-backends=cuda,cpu,sumo" >nul 2>nul
+echo(%ORIGINAL_ARGS% | findstr /I /C:"benchmark all" /C:"benchmark compare" /C:"--benchmark-order=cpu,cuda,sumo" /C:"--benchmark-order=cpu,sumo,cuda" /C:"--benchmark-order=cuda,cpu,sumo" /C:"--benchmark-order=cuda,sumo,cpu" /C:"--benchmark-order=sumo,cpu,cuda" /C:"--benchmark-order=sumo,cuda,cpu" /C:"--benchmark-order=cpu,gpu,sumo" /C:"--benchmark-order=cpu,sumo,gpu" /C:"--benchmark-order=gpu,cpu,sumo" /C:"--benchmark-order=gpu,sumo,cpu" /C:"--benchmark-order=sumo,cpu,gpu" /C:"--benchmark-order=sumo,gpu,cpu" /C:"--benchmark-backends=cpu,cuda,sumo" /C:"--benchmark-backends=cpu,sumo,cuda" /C:"--benchmark-backends=cuda,cpu,sumo" /C:"--benchmark-backends=cuda,sumo,cpu" /C:"--benchmark-backends=sumo,cpu,cuda" /C:"--benchmark-backends=sumo,cuda,cpu" >nul 2>nul
 if not errorlevel 1 set "BENCHMARK_LAUNCH_ORDER=both"
 exit /b 0
 

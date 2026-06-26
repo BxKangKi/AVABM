@@ -321,3 +321,48 @@ when they are not on `PATH` or discoverable through `SUMO_HOME/bin`.
 SUMO export files are written under `data/results/sumo_baseline/`, and the usual
 `benchmark_summary.json` / `benchmark_summary.csv` include the SUMO row and CUDA
 versus SUMO speedups when both are run.
+
+### Benchmark architecture selectors
+
+Windows:
+
+```bat
+benchmark.bat
+```
+
+Linux/macOS:
+
+```bash
+./benchmark.sh
+```
+
+The same selector is also available from the main launcher menu as option `11`,
+or directly with:
+
+```bat
+run.bat benchmark-menu
+run.bat benchmark select
+```
+
+```bash
+./run.sh benchmark-menu
+./run.sh benchmark select
+```
+
+The selector supports CPU only, CUDA/GPU only, SUMO only, CPU+GPU, GPU+SUMO,
+CPU+SUMO, and CPU+GPU+SUMO. It also asks for the benchmark spawn load, timed
+steps, warmup steps, max agents, and SUMO runner when SUMO is included.
+
+Command-line mode still works for repeatable runs:
+
+```bat
+benchmark.bat gpu --benchmark-spawn-vps=100 --benchmark-max-agents=300000
+benchmark.bat --benchmark-order=cuda,sumo --benchmark-spawn-vps=200 --sumo-runner=cli
+benchmark.bat all --benchmark-spawn-vps=200 --benchmark-max-agents=500000
+```
+
+```bash
+./benchmark.sh gpu --benchmark-spawn-vps=100 --benchmark-max-agents=300000
+./benchmark.sh --benchmark-order=cuda,sumo --benchmark-spawn-vps=200 --sumo-runner=cli
+./benchmark.sh all --benchmark-spawn-vps=200 --benchmark-max-agents=500000
+```

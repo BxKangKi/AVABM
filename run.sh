@@ -411,6 +411,215 @@ launch_mode() {
   esac
 }
 
+
+normalize_benchmark_order() {
+  local raw token low out canon
+  raw="${1:-}"
+  raw="${raw// /,}"
+  raw="${raw//\"/}"
+  raw="${raw//\'/}"
+  out=""
+  IFS=',' read -r -a _avabm_order_tokens <<< "$raw"
+  for token in "${_avabm_order_tokens[@]}"; do
+    low="${token,,}"
+    low="${low//[[:space:]]/}"
+    [ -n "$low" ] || continue
+    case "$low" in
+      cpu|cpp|cpp_cpu|c++)
+        canon="cpu"
+        case ",$out," in *",$canon,"*) ;; *) out="${out:+$out,}$canon" ;; esac
+        ;;
+      gpu|cuda|cuda_strict|cuda-strict)
+        canon="cuda"
+        case ",$out," in *",$canon,"*) ;; *) out="${out:+$out,}$canon" ;; esac
+        ;;
+      sumo|sumo_cli|sumo-cli|baseline|sumo-baseline)
+        canon="sumo"
+        case ",$out," in *",$canon,"*) ;; *) out="${out:+$out,}$canon" ;; esac
+        ;;
+      both)
+        for canon in cpu cuda; do
+          case ",$out," in *",$canon,"*) ;; *) out="${out:+$out,}$canon" ;; esac
+        done
+        ;;
+      all|compare)
+        for canon in cpu cuda sumo; do
+          case ",$out," in *",$canon,"*) ;; *) out="${out:+$out,}$canon" ;; esac
+        done
+        ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+benchmark_selector() {
+  local choice order low load value steps warmup max_agents sumo_runner
+  BENCHMARK_MENU_ORDER=""
+  BENCHMARK_MENU_ARGS=()
+
+  while true; do
+    if [ -t 1 ]; then clear || true; fi
+    echo
+    echo "======================================================="
+    echo "AVABM Benchmark Architecture Selector"
+    echo "======================================================="
+    echo "Choose which architecture/backend to benchmark."
+    echo
+    echo "1. CPU only                 (C++ CPU backend)"
+    echo "2. GPU only                 (CUDA backend)"
+    echo "3. SUMO only                (SUMO baseline)"
+    echo "4. CPU + GPU                (AVABM internal comparison)"
+    echo "5. GPU + SUMO               (recommended for SUMO baseline)"
+    echo "6. CPU + SUMO"
+    echo "7. CPU + GPU + SUMO         (all three)"
+    echo "8. Custom order/subset      (example: cuda,sumo)"
+    echo "0. Cancel"
+    echo
+    read -r -p "Select [1-8,0]: " choice
+    choice="${choice// /}"
+    choice="${choice//\"/}"
+    low="${choice,,}"
+    case "$low" in
+      0|q|quit|exit) return 2 ;;
+      1|cpu) order="cpu" ;;
+      2|gpu|cuda) order="cuda" ;;
+      3|sumo) order="sumo" ;;
+      4|both|cpu+gpu|cpu-gpu|cpu+cuda|cpu-cuda) order="cpu,cuda" ;;
+      5|gpu+sumo|cuda+sumo|gpu-sumo|cuda-sumo|sumo+gpu|sumo+cuda|sumo-gpu|sumo-cuda) order="cuda,sumo" ;;
+      6|cpu+sumo|cpu-sumo|sumo+cpu|sumo-cpu) order="cpu,sumo" ;;
+      7|all|compare) order="cpu,cuda,sumo" ;;
+      8|custom)
+        echo
+        echo "Enter comma-separated backends in run order."
+        echo "Valid names: cpu, cuda, gpu, sumo. Example: cuda,sumo"
+        read -r -p "Order: " value
+        order="$(normalize_benchmark_order "$value")"
+        if [ -z "$order" ]; then
+          echo "[Warning] No valid benchmark backend was entered."
+          read -r -p "Press Enter to retry..." _
+          continue
+        fi
+        ;;
+      *)
+        echo "[Warning] Invalid benchmark architecture selection: $choice"
+        read -r -p "Press Enter to retry..." _
+        continue
+        ;;
+    esac
+    BENCHMARK_MENU_ORDER="$order"
+    break
+  done
+
+  while true; do
+    echo
+    echo "-------------------------------------------------------"
+    echo "Benchmark load / spawn setting"
+    echo "-------------------------------------------------------"
+    echo "1. Use config/default demand"
+    echo "2. 20 vehicles/sec total spawn target"
+    echo "3. 50 vehicles/sec total spawn target"
+    echo "4. 100 vehicles/sec total spawn target"
+    echo "5. 200 vehicles/sec total spawn target"
+    echo "6. Custom vehicles/sec total spawn target"
+    echo "7. Custom total spawned vehicles during timed benchmark"
+    echo "8. Custom vehicles/sec per spawn point"
+    echo "0. Cancel"
+    echo
+    read -r -p "Select [1-8,0, Enter=1]: " load
+    load="${load// /}"
+    load="${load//\"/}"
+    [ -n "$load" ] || load="1"
+    case "${load,,}" in
+      0|q|quit|exit) return 2 ;;
+      1) ;;
+      2) BENCHMARK_MENU_ARGS+=("--benchmark-spawn-vps=20") ;;
+      3) BENCHMARK_MENU_ARGS+=("--benchmark-spawn-vps=50") ;;
+      4) BENCHMARK_MENU_ARGS+=("--benchmark-spawn-vps=100") ;;
+      5) BENCHMARK_MENU_ARGS+=("--benchmark-spawn-vps=200") ;;
+      6)
+        read -r -p "Total spawn VPS: " value
+        value="${value// /}"
+        value="${value//\"/}"
+        [ -n "$value" ] || continue
+        BENCHMARK_MENU_ARGS+=("--benchmark-spawn-vps=$value")
+        ;;
+      7)
+        read -r -p "Total spawned vehicles during timed benchmark: " value
+        value="${value// /}"
+        value="${value//\"/}"
+        [ -n "$value" ] || continue
+        BENCHMARK_MENU_ARGS+=("--benchmark-spawn-total=$value")
+        ;;
+      8)
+        read -r -p "Spawn VPS per spawn point: " value
+        value="${value// /}"
+        value="${value//\"/}"
+        [ -n "$value" ] || continue
+        BENCHMARK_MENU_ARGS+=("--benchmark-spawn-per-point-vps=$value")
+        ;;
+      *)
+        echo "[Warning] Invalid load selection: $load"
+        continue
+        ;;
+    esac
+    break
+  done
+
+  echo
+  echo "Optional overrides. Press Enter to keep config.txt value."
+  read -r -p "Timed steps [current ${BENCHMARK_STEPS:-10000}]: " steps
+  steps="${steps// /}"
+  steps="${steps//\"/}"
+  if [ -n "$steps" ]; then BENCHMARK_MENU_ARGS+=("--benchmark-steps=$steps"); fi
+
+  read -r -p "Warmup steps [current ${BENCHMARK_WARMUP_STEPS:-1000}]: " warmup
+  warmup="${warmup// /}"
+  warmup="${warmup//\"/}"
+  if [ -n "$warmup" ]; then BENCHMARK_MENU_ARGS+=("--benchmark-warmup-steps=$warmup"); fi
+
+  read -r -p "Max agents [current ${BENCHMARK_MAX_AGENTS:-240000}]: " max_agents
+  max_agents="${max_agents// /}"
+  max_agents="${max_agents//\"/}"
+  if [ -n "$max_agents" ]; then BENCHMARK_MENU_ARGS+=("--benchmark-max-agents=$max_agents"); fi
+
+  case ",$BENCHMARK_MENU_ORDER," in
+    *",sumo,"*)
+      read -r -p "SUMO runner [auto/libsumo/cli, current ${SUMO_BENCHMARK_RUNNER:-auto}]: " sumo_runner
+      sumo_runner="${sumo_runner// /}"
+      sumo_runner="${sumo_runner//\"/}"
+      if [ -n "$sumo_runner" ]; then BENCHMARK_MENU_ARGS+=("--sumo-runner=$sumo_runner"); fi
+      ;;
+  esac
+
+  echo
+  echo "[Info] Benchmark order: $BENCHMARK_MENU_ORDER"
+  if [ "${#BENCHMARK_MENU_ARGS[@]}" -gt 0 ]; then
+    echo "[Info] Extra args: ${BENCHMARK_MENU_ARGS[*]}"
+  else
+    echo "[Info] Extra args: (none)"
+  fi
+  echo
+  return 0
+}
+
+run_benchmark_selector() {
+  local rc
+  if benchmark_selector; then
+    rc=0
+  else
+    rc=$?
+  fi
+  if [ "$rc" -eq 2 ]; then
+    echo "[Info] Benchmark selection cancelled."
+    return 0
+  fi
+  if [ "$rc" -ne 0 ]; then
+    return "$rc"
+  fi
+  ensure_benchmark_backends_built "benchmark" "--benchmark-order=$BENCHMARK_MENU_ORDER" "${BENCHMARK_MENU_ARGS[@]}"
+  launch_mode benchmark "--benchmark-order=$BENCHMARK_MENU_ORDER" "${BENCHMARK_MENU_ARGS[@]}"
+}
+
 show_menu() {
   echo
   echo "======================================================="
@@ -426,7 +635,7 @@ show_menu() {
   echo "8. Hard clean + rebuild CUDA"
   echo "9. CUDA build status"
   echo "10. Exit"
-  echo "11. Benchmark - CPU/CUDA/SUMO throughput comparison"
+  echo "11. Benchmark selector - choose CPU/CUDA/SUMO architecture(s)"
   echo
   printf 'Select [1-11]: '
 }
@@ -447,7 +656,7 @@ if [ -z "$cmd" ]; then
     8|h|H|hardclean|Hardclean|cleanall|clean-all) set -- hardclean ;;
     9|s|S|status|Status|check|Check) set -- status ;;
     10|0|q|Q|exit|Exit) exit 0 ;;
-    11|bench|Bench|benchmark|Benchmark) set -- benchmark ;;
+    11|bench|Bench|benchmark|Benchmark) set -- benchmark-menu ;;
     *) echo "[Error] Invalid selection: $choice" >&2; exit 1 ;;
   esac
   cmd="$1"
@@ -487,7 +696,22 @@ case "$cmd" in
     activate_conda
     "$PYTHON_COMMAND" "$BUILD_HELPER" status
     ;;
-  11|bench|benchmark|benchmark-cpu|bench-cpu|benchmark-gpu|benchmark-cuda|bench-gpu|bench-cuda)
+  11|benchmark-menu|bench-menu|benchmark-select|bench-select|benchmark-architectures|bench-architectures)
+    run_benchmark_selector
+    ;;
+  bench|benchmark)
+    case "${1:-}" in
+      menu|select|architectures|architecture-selector|arch-selector)
+        shift || true
+        run_benchmark_selector
+        ;;
+      *)
+        ensure_benchmark_backends_built "$cmd" "$@"
+        launch_mode benchmark "$cmd" "$@"
+        ;;
+    esac
+    ;;
+  benchmark-cpu|bench-cpu|benchmark-gpu|benchmark-cuda|bench-gpu|bench-cuda|benchmark-sumo|bench-sumo)
     ensure_benchmark_backends_built "$cmd" "$@"
     launch_mode benchmark "$cmd" "$@"
     ;;
