@@ -6,6 +6,7 @@ import json
 import csv
 import shutil
 import subprocess
+import shlex
 import queue
 import ctypes
 import threading
@@ -91,6 +92,21 @@ if any(a in _cli_args for a in ("--benchmark-gpu", "--benchmark-cuda", "--bench-
     _CLI_CONFIG_OVERRIDES["BENCHMARK_ORDER"] = "cuda"
     _CLI_CONFIG_OVERRIDES["HEADLESS_MODE"] = "1"
     _CLI_CONFIG_OVERRIDES["SIM_HEADLESS"] = "1"
+if any(a in _cli_args for a in ("--benchmark-sumo", "--bench-sumo", "benchmark-sumo", "bench-sumo")):
+    _CLI_CONFIG_OVERRIDES["BENCHMARK_MODE"] = "1"
+    _CLI_CONFIG_OVERRIDES["BENCHMARK_ORDER"] = "sumo"
+    _CLI_CONFIG_OVERRIDES["HEADLESS_MODE"] = "1"
+    _CLI_CONFIG_OVERRIDES["SIM_HEADLESS"] = "1"
+if any(a in _cli_args for a in ("--with-sumo", "--benchmark-with-sumo", "--include-sumo")):
+    _CLI_CONFIG_OVERRIDES["BENCHMARK_MODE"] = "1"
+    _CLI_CONFIG_OVERRIDES["BENCHMARK_INCLUDE_SUMO"] = "1"
+    _CLI_CONFIG_OVERRIDES["HEADLESS_MODE"] = "1"
+    _CLI_CONFIG_OVERRIDES["SIM_HEADLESS"] = "1"
+if "--sumo-benchmark-child" in _cli_args:
+    _CLI_CONFIG_OVERRIDES["SUMO_BENCHMARK_CHILD"] = "1"
+    _CLI_CONFIG_OVERRIDES["BENCHMARK_CHILD"] = "1"
+    _CLI_CONFIG_OVERRIDES["HEADLESS_MODE"] = "1"
+    _CLI_CONFIG_OVERRIDES["SIM_HEADLESS"] = "1"
 if "--benchmark-child" in _cli_args:
     _CLI_CONFIG_OVERRIDES["BENCHMARK_CHILD"] = "1"
     _CLI_CONFIG_OVERRIDES["HEADLESS_MODE"] = "1"
@@ -99,12 +115,40 @@ for _cli_key in (
     "BENCHMARK_STEPS", "BENCHMARK_ORDER", "BENCHMARK_BACKEND", "BENCHMARK_BACKENDS",
     "BENCHMARK_FIXED_SPAWN", "BENCHMARK_WARMUP_STEPS", "BENCHMARK_BATCH_STEPS",
     "BENCHMARK_CPU_WORKERS", "BENCHMARK_OUTPUT_DIR", "BENCHMARK_SAVE_CHILD_METRICS",
+    "BENCHMARK_SPAWN_SCALE", "BENCHMARK_SPAWN_VPS", "BENCHMARK_SPAWN_TOTAL",
+    "BENCHMARK_SPAWN_PER_POINT_VPS", "BENCHMARK_MAX_AGENTS", "BENCHMARK_OPTIMIZE_GPU",
+    "BENCHMARK_GPU_TURBO", "BENCHMARK_STATS_INTERVAL",
+    "BENCHMARK_INCLUDE_SUMO",
+    "SUMO_BENCHMARK_CHILD", "SUMO_BENCHMARK_RUNNER", "SUMO_BINARY", "SUMO_NETCONVERT_BINARY",
+    "SUMO_BENCHMARK_WORK_DIR", "SUMO_BENCHMARK_KEEP_FILES", "SUMO_BENCHMARK_REUSE_FILES",
+    "SUMO_BENCHMARK_SIGNAL_MODE", "SUMO_BENCHMARK_TIME_TO_TELEPORT", "SUMO_BENCHMARK_IGNORE_ROUTE_ERRORS",
+    "SUMO_BENCHMARK_NO_WARNINGS", "SUMO_BENCHMARK_EXTRA_ARGS", "SUMO_BENCHMARK_WRITE_TRIPINFO",
     "SIMULATION_MAX_STEPS",
 ):
     _cli_val = _cli_value(_cli_key)
     if _cli_val is not None:
         _CLI_CONFIG_OVERRIDES[_cli_key] = str(_cli_val)
 _benchmark_cli_backend = _cli_value("benchmark-backend", None)
+for _alias_name, _target_key in (
+    ("spawn-vps", "BENCHMARK_SPAWN_VPS"),
+    ("spawn-total", "BENCHMARK_SPAWN_TOTAL"),
+    ("spawn-scale", "BENCHMARK_SPAWN_SCALE"),
+    ("spawn-per-point-vps", "BENCHMARK_SPAWN_PER_POINT_VPS"),
+    ("benchmark-spawn-count", "BENCHMARK_SPAWN_TOTAL"),
+    ("benchmark-spawn-num", "BENCHMARK_SPAWN_TOTAL"),
+    ("benchmark-spawn-n", "BENCHMARK_SPAWN_TOTAL"),
+    ("benchmark-max-active", "BENCHMARK_MAX_AGENTS"),
+    ("benchmark-max-agents", "BENCHMARK_MAX_AGENTS"),
+    ("sumo-runner", "SUMO_BENCHMARK_RUNNER"),
+    ("benchmark-sumo-runner", "SUMO_BENCHMARK_RUNNER"),
+    ("sumo-binary", "SUMO_BINARY"),
+    ("sumo-netconvert", "SUMO_NETCONVERT_BINARY"),
+    ("sumo-netconvert-binary", "SUMO_NETCONVERT_BINARY"),
+    ("sumo-work-dir", "SUMO_BENCHMARK_WORK_DIR"),
+):
+    _alias_val = _cli_value(_alias_name, None)
+    if _alias_val is not None:
+        _CLI_CONFIG_OVERRIDES[_target_key] = str(_alias_val)
 if _benchmark_cli_backend is None:
     _benchmark_cli_backend = _cli_value("benchmark-backends", None)
 if _benchmark_cli_backend is not None:
@@ -116,7 +160,15 @@ for _i, _arg in enumerate([str(a).strip().lower() for a in sys.argv[1:]]):
             _CLI_CONFIG_OVERRIDES["BENCHMARK_ORDER"] = "cpu"
         elif _next in {"gpu", "cuda", "cuda_strict", "cuda-strict"}:
             _CLI_CONFIG_OVERRIDES["BENCHMARK_ORDER"] = "cuda"
-        elif _next in {"both", "all", "compare", "cpu,cuda", "cuda,cpu"}:
+        elif _next in {"sumo", "sumo_cli", "sumo-cli", "baseline", "sumo-baseline"}:
+            _CLI_CONFIG_OVERRIDES["BENCHMARK_ORDER"] = "sumo"
+        elif _next in {"gpu+sumo", "cuda+sumo", "gpu-sumo", "cuda-sumo", "sumo+gpu", "sumo+cuda", "sumo-gpu", "sumo-cuda"}:
+            _CLI_CONFIG_OVERRIDES["BENCHMARK_ORDER"] = "cuda,sumo"
+        elif _next in {"cpu+sumo", "cpu-sumo", "sumo+cpu", "sumo-cpu"}:
+            _CLI_CONFIG_OVERRIDES["BENCHMARK_ORDER"] = "cpu,sumo"
+        elif _next in {"both", "cpu,cuda", "cuda,cpu"}:
+            _CLI_CONFIG_OVERRIDES["BENCHMARK_ORDER"] = _next
+        elif _next in {"all", "compare", "cpu,cuda,sumo", "cuda,cpu,sumo", "sumo,cuda,cpu", "sumo,cpu,cuda"}:
             _CLI_CONFIG_OVERRIDES["BENCHMARK_ORDER"] = _next
 if ("BENCHMARK_MODE" in _CLI_CONFIG_OVERRIDES) and ("BENCHMARK_ORDER" not in _CLI_CONFIG_OVERRIDES):
     _backend_arg = _cli_value("backend", None)
@@ -125,6 +177,8 @@ if ("BENCHMARK_MODE" in _CLI_CONFIG_OVERRIDES) and ("BENCHMARK_ORDER" not in _CL
     elif ("--gpu" in _cli_args or "--cuda" in _cli_args or "--cuda-strict" in _cli_args
           or str(_backend_arg or "").strip().lower() in {"gpu", "cuda", "cuda_strict", "cuda-strict"}):
         _CLI_CONFIG_OVERRIDES["BENCHMARK_ORDER"] = "cuda"
+    elif ("--sumo" in _cli_args or str(_backend_arg or "").strip().lower() in {"sumo", "sumo_cli", "sumo-cli", "baseline"}):
+        _CLI_CONFIG_OVERRIDES["BENCHMARK_ORDER"] = "sumo"
 if "BENCHMARK_BACKENDS" in _CLI_CONFIG_OVERRIDES and "BENCHMARK_ORDER" not in _CLI_CONFIG_OVERRIDES:
     _CLI_CONFIG_OVERRIDES["BENCHMARK_ORDER"] = _CLI_CONFIG_OVERRIDES["BENCHMARK_BACKENDS"]
 if "BENCHMARK_BACKEND" in _CLI_CONFIG_OVERRIDES and "BENCHMARK_ORDER" not in _CLI_CONFIG_OVERRIDES:
@@ -190,6 +244,15 @@ def cfg_float(name, default=0.0):
         return float(value)
     except Exception:
         return float(default)
+
+def cfg_optional_float(name, default=None):
+    value = cfg_optional(name, None)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except Exception:
+        return default
 ROAD_GPKG = cfg("ROAD_GPKG", "data/road_links.gpkg")
 SPAWN_GPKG = cfg("SPAWN_GPKG", "data/spawn_points.gpkg")
 SIGNAL_GPKG = cfg("SIGNAL_GPKG", "data/signals.gpkg")
@@ -425,6 +488,28 @@ BENCHMARK_BATCH_STEPS = max(1, cfg_int("BENCHMARK_BATCH_STEPS", cfg_int("TURBO_B
 BENCHMARK_CPU_WORKERS = max(0, cfg_int("BENCHMARK_CPU_WORKERS", 0))
 BENCHMARK_OUTPUT_DIR = Path(cfg("BENCHMARK_OUTPUT_DIR", "data/results"))
 BENCHMARK_SAVE_CHILD_METRICS = cfg_bool("BENCHMARK_SAVE_CHILD_METRICS", False)
+BENCHMARK_SPAWN_SCALE = max(0.0, cfg_float("BENCHMARK_SPAWN_SCALE", 1.0))
+BENCHMARK_SPAWN_VPS = cfg_optional_float("BENCHMARK_SPAWN_VPS", None)
+BENCHMARK_SPAWN_TOTAL = cfg_optional_float("BENCHMARK_SPAWN_TOTAL", None)
+BENCHMARK_SPAWN_PER_POINT_VPS = cfg_optional_float("BENCHMARK_SPAWN_PER_POINT_VPS", None)
+BENCHMARK_MAX_AGENTS = max(0, cfg_int("BENCHMARK_MAX_AGENTS", 0))
+BENCHMARK_OPTIMIZE_GPU = cfg_bool("BENCHMARK_OPTIMIZE_GPU", True)
+BENCHMARK_GPU_TURBO = cfg_bool("BENCHMARK_GPU_TURBO", True)
+BENCHMARK_STATS_INTERVAL = max(1, cfg_int("BENCHMARK_STATS_INTERVAL", CUDA_STATS_INTERVAL))
+BENCHMARK_INCLUDE_SUMO = cfg_bool("BENCHMARK_INCLUDE_SUMO", False)
+SUMO_BENCHMARK_CHILD = cfg_bool("SUMO_BENCHMARK_CHILD", False) or str(os.environ.get("AVABM_SUMO_BENCHMARK_CHILD", "")).strip().lower() in {"1", "true", "yes", "on"}
+SUMO_BENCHMARK_RUNNER = str(cfg("SUMO_BENCHMARK_RUNNER", "auto")).strip().lower()
+SUMO_BINARY = str(cfg("SUMO_BINARY", "auto")).strip()
+SUMO_NETCONVERT_BINARY = str(cfg("SUMO_NETCONVERT_BINARY", "auto")).strip()
+SUMO_BENCHMARK_WORK_DIR = Path(cfg("SUMO_BENCHMARK_WORK_DIR", "data/results/sumo_baseline"))
+SUMO_BENCHMARK_KEEP_FILES = cfg_bool("SUMO_BENCHMARK_KEEP_FILES", True)
+SUMO_BENCHMARK_REUSE_FILES = cfg_bool("SUMO_BENCHMARK_REUSE_FILES", False)
+SUMO_BENCHMARK_SIGNAL_MODE = str(cfg("SUMO_BENCHMARK_SIGNAL_MODE", "priority")).strip().lower()
+SUMO_BENCHMARK_TIME_TO_TELEPORT = cfg_float("SUMO_BENCHMARK_TIME_TO_TELEPORT", -1.0)
+SUMO_BENCHMARK_IGNORE_ROUTE_ERRORS = cfg_bool("SUMO_BENCHMARK_IGNORE_ROUTE_ERRORS", True)
+SUMO_BENCHMARK_NO_WARNINGS = cfg_bool("SUMO_BENCHMARK_NO_WARNINGS", True)
+SUMO_BENCHMARK_EXTRA_ARGS = str(cfg("SUMO_BENCHMARK_EXTRA_ARGS", "")).strip()
+SUMO_BENCHMARK_WRITE_TRIPINFO = cfg_bool("SUMO_BENCHMARK_WRITE_TRIPINFO", False)
 SIMULATION_MAX_STEPS = max(0, cfg_int("SIMULATION_MAX_STEPS", BENCHMARK_STEPS if BENCHMARK_CHILD else 0))
 SECTION_STATS_ENABLED = cfg_bool("SECTION_STATS_ENABLED", True)
 if HEADLESS_MODE and TURBO_DISABLE_SECTION_STATS:
@@ -5431,6 +5516,743 @@ def _tail_text(text, max_lines=80):
     return "\n".join(lines[-int(max_lines):])
 
 
+def _xml_attr(value):
+    from xml.sax.saxutils import escape
+    return escape(str(value), {'"': '&quot;'})
+
+
+def _split_extra_args(text):
+    text = str(text or '').strip()
+    if not text:
+        return []
+    try:
+        return shlex.split(text, posix=(os.name != 'nt'))
+    except Exception:
+        return text.split()
+
+
+def _resolve_sumo_executable(config_value, candidates):
+    value = str(config_value or 'auto').strip()
+    search = []
+    if value and value.lower() not in {'auto', 'none', 'null'}:
+        search.append(value)
+    sumo_home = os.environ.get('SUMO_HOME')
+    if sumo_home:
+        bin_dir = Path(sumo_home) / 'bin'
+        for name in candidates:
+            search.append(str(bin_dir / name))
+            if os.name == 'nt' and not str(name).lower().endswith('.exe'):
+                search.append(str(bin_dir / (name + '.exe')))
+    for name in candidates:
+        search.append(name)
+        if os.name == 'nt' and not str(name).lower().endswith('.exe'):
+            search.append(name + '.exe')
+    seen = set()
+    for item in search:
+        item = str(item).strip().strip('"')
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        p = Path(item)
+        if p.is_file():
+            return str(p)
+        found = shutil.which(item)
+        if found:
+            return found
+    return None
+
+
+def _sumo_runner_allowed(runner):
+    runner = str(runner or 'auto').strip().lower()
+    if runner in {'', 'auto', 'libsumo', 'cli'}:
+        return runner or 'auto'
+    print(f"[SUMO] Unsupported SUMO_BENCHMARK_RUNNER={runner!r}; using auto.")
+    return 'auto'
+
+
+def _apply_benchmark_demand_overrides(demand_np, steps, dt, num_spawn_points, *, log_prefix='[Benchmark]'):
+    demand_np = np.asarray(demand_np, dtype=np.float32).copy()
+    base_vps = float(np.sum(demand_np))
+    target_vps = _benchmark_spawn_target_vps(steps, dt)
+    per_point_vps = BENCHMARK_SPAWN_PER_POINT_VPS if BENCHMARK_SPAWN_PER_POINT_VPS is not None and BENCHMARK_SPAWN_PER_POINT_VPS >= 0.0 else None
+    applied = 'default'
+    if per_point_vps is not None:
+        demand_np[:] = float(per_point_vps)
+        applied = 'per_point_vps'
+    elif target_vps is not None and target_vps > 0.0:
+        if base_vps > 1.0e-9:
+            demand_np *= float(target_vps) / base_vps
+        elif int(num_spawn_points) > 0:
+            demand_np[:] = float(target_vps) / float(num_spawn_points)
+        applied = 'target_total_vps'
+    elif abs(float(BENCHMARK_SPAWN_SCALE) - 1.0) > 1.0e-9:
+        demand_np *= float(BENCHMARK_SPAWN_SCALE)
+        applied = 'scale'
+    if applied != 'default':
+        print(
+            log_prefix, 'spawn override |',
+            'mode:', applied,
+            'base_total_vps:', float(base_vps),
+            'target_total_vps:', float(np.sum(demand_np)),
+            'scale:', float(BENCHMARK_SPAWN_SCALE),
+            'per_point_vps:', per_point_vps,
+        )
+    return as_contig_f32(demand_np), applied, base_vps
+
+
+def _build_benchmark_scenario_data_for_sumo():
+    """Prepare the same Python-side network/routes/spawn tables used by AVABM benchmark.
+
+    This function intentionally avoids importing the AVABM CPU/CUDA extension modules.
+    It only uses the existing Python preprocessing pipeline and route cache.
+    """
+    print('[SUMO] prepare network/routes/demand from AVABM inputs')
+    nodes, links, lanes, network_crs = build_graph_and_lanes(ROAD_GPKG, layer=GPKG_LAYER)
+    G, link_to_lanes, left_np, right_np = build_static_network(nodes, links, lanes)
+    _bend_join_adjusted = apply_same_source_bend_join_geometry(nodes, links, lanes, link_to_lanes)
+    if _bend_join_adjusted:
+        G, link_to_lanes, left_np, right_np = build_static_network(nodes, links, lanes)
+    _taper_adjusted = apply_lane_drop_taper_geometry(nodes, links, lanes, link_to_lanes)
+    if _taper_adjusted:
+        G, link_to_lanes, left_np, right_np = build_static_network(nodes, links, lanes)
+    _gain_taper_adjusted = apply_lane_gain_taper_geometry(nodes, links, lanes, link_to_lanes)
+    if _gain_taper_adjusted:
+        G, link_to_lanes, left_np, right_np = build_static_network(nodes, links, lanes)
+    _interchange_adjusted = apply_interchange_outer_edge_geometry(nodes, links, lanes, link_to_lanes)
+    if _interchange_adjusted:
+        G, link_to_lanes, left_np, right_np = build_static_network(nodes, links, lanes)
+    print('[SUMO] network nodes:', len(nodes), 'links:', len(links), 'lanes:', len(lanes), 'crs:', network_crs)
+    spawn_records, spawn_crs = load_spawn_records(SPAWN_GPKG, layer=SPAWN_GPKG_LAYER, label='Spawn')
+    origin_nodes, destination_nodes, spawn_nodes, node_spawn_profiles = match_spawn_records(nodes, spawn_records, spawn_crs, network_crs)
+    if not spawn_nodes:
+        raise RuntimeError('No spawn nodes.')
+    if not origin_nodes:
+        raise RuntimeError('No origin-capable spawn nodes. Check SPWNTYPE values.')
+    if not destination_nodes:
+        raise RuntimeError('No destination-capable spawn nodes. Check SPWNTYPE values.')
+    for nid in spawn_nodes:
+        nodes[int(nid)]['spawn'] = True
+        nodes[int(nid)]['spawn_origin'] = int(nid) in origin_nodes
+        nodes[int(nid)]['spawn_destination'] = int(nid) in destination_nodes
+    route_offsets_np, route_lanes_np, route_turns_np = make_routes_ready_cached(
+        G=G,
+        nodes=nodes,
+        links=links,
+        lanes=lanes,
+        link_to_lanes=link_to_lanes,
+        origin_nodes=origin_nodes,
+        destination_nodes=destination_nodes,
+        gpkg_path=ROAD_GPKG,
+        network_crs=network_crs,
+        num_routes=NUM_ROUTES,
+    )
+    validate_route_arrays(route_offsets_np, route_lanes_np, route_turns_np, len(lanes))
+    valid_route_count = int(len(route_offsets_np) - 1)
+    print('[SUMO] valid routes:', valid_route_count, 'route lane elements:', len(route_lanes_np))
+    routes_by_first_lane = {}
+    for rid in range(valid_route_count):
+        off0 = int(route_offsets_np[rid])
+        off1 = int(route_offsets_np[rid + 1])
+        if off1 <= off0:
+            continue
+        first_lane = int(route_lanes_np[off0])
+        if 0 <= first_lane < len(lanes):
+            routes_by_first_lane.setdefault(first_lane, []).append(rid)
+    spawn_lane_np, spawn_route_np, spawn_route_choice_counts = build_spawn_route_slots(
+        routes_by_first_lane,
+        ROUTE_SEED,
+        SPAWN_ROUTE_CHOICES_PER_LANE,
+    )
+    if len(spawn_lane_np) <= 0:
+        raise RuntimeError('No spawn lanes from routes.')
+    lane_road_width = np.zeros(len(lanes), dtype=np.float32)
+    lane_count_dir = np.ones(len(lanes), dtype=np.float32)
+    for lane in lanes:
+        lid = int(lane['lane_id'])
+        link = links[int(lane['link_id'])]
+        lane_road_width[lid] = float(link['width'])
+        lane_count_dir[lid] = max(1.0, float(link['lane_count']))
+    spawn_group_slots = {}
+    spawn_node_slots = {}
+    for i, lid in enumerate(spawn_lane_np):
+        lane = lanes[int(lid)]
+        origin_node = int(lane['from_node'])
+        link_id = int(lane['link_id'])
+        spawn_group_slots.setdefault((origin_node, link_id), []).append(int(i))
+        spawn_node_slots.setdefault(origin_node, []).append(int(i))
+    split_spawn_group_demand = bool(SPAWN_MULTI_LANE_BALANCE or SPAWN_ROUTE_CHOICES_PER_LANE > 1)
+    demand_np = np.zeros(int(len(spawn_lane_np)), dtype=np.float32)
+    for slots in spawn_group_slots.values():
+        if not slots:
+            continue
+        ref_lid = int(spawn_lane_np[int(slots[0])])
+        width = max(1.0, float(lane_road_width[ref_lid]))
+        lanes_here = max(1.0, float(lane_count_dir[ref_lid]))
+        width_mult = math.exp(SPAWN_WIDTH_EXP_K * (width / max(SPAWN_REF_WIDTH, 1.0) - 1.0))
+        width_mult = min(width_mult, SPAWN_MAX_MULT)
+        lane_mult = lanes_here ** SPAWN_LANE_POWER
+        group_rate = BASE_VPS * width_mult * lane_mult
+        per_lane_rate = group_rate / max(1, len(slots)) if split_spawn_group_demand else group_rate
+        for i in slots:
+            demand_np[int(i)] = float(per_lane_rate)
+    total_vps = float(np.sum(demand_np))
+    if total_vps > MAX_TOTAL_VPS and total_vps > 1.0e-9:
+        demand_np *= MAX_TOTAL_VPS / total_vps
+    demand_np, demand_mode, benchmark_base_vps = _apply_benchmark_demand_overrides(
+        demand_np,
+        BENCHMARK_STEPS,
+        DT,
+        len(spawn_lane_np),
+        log_prefix='[SUMO]',
+    )
+    if not (BENCHMARK_CHILD and BENCHMARK_FIXED_SPAWN):
+        print('[SUMO] note: SPWNxx profile export is not expanded into time-varying SUMO flows; using constant slot demand.')
+    link_to_lane_order = {}
+    for link_id, group in link_to_lanes.items():
+        for idx, lane in enumerate(group):
+            link_to_lane_order[int(lane['lane_id'])] = int(idx)
+    return {
+        'nodes': nodes,
+        'links': links,
+        'lanes': lanes,
+        'link_to_lanes': link_to_lanes,
+        'link_to_lane_order': link_to_lane_order,
+        'route_offsets': as_contig_i32(route_offsets_np),
+        'route_lanes': as_contig_i32(route_lanes_np),
+        'route_turns': as_contig_i32(route_turns_np),
+        'spawn_lane': as_contig_i32(spawn_lane_np),
+        'spawn_route': as_contig_i32(spawn_route_np),
+        'demand_vps': as_contig_f32(demand_np),
+        'valid_route_count': valid_route_count,
+        'num_spawn_points': int(len(spawn_lane_np)),
+        'total_spawn_vps': float(np.sum(demand_np)),
+        'benchmark_base_vps': float(benchmark_base_vps),
+        'demand_mode': demand_mode,
+        'network_crs': str(network_crs),
+        'spawn_route_choice_counts': spawn_route_choice_counts,
+    }
+
+
+def _write_sumo_plain_network_files(scenario, work_dir):
+    work_dir = _project_resolve(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    nodes_path = work_dir / 'avabm_benchmark.nod.xml'
+    edges_path = work_dir / 'avabm_benchmark.edg.xml'
+    net_path = work_dir / 'avabm_benchmark.net.xml'
+    signal_mode = str(SUMO_BENCHMARK_SIGNAL_MODE or 'priority').strip().lower()
+    signal_nodes = set()
+    if signal_mode in {'tls', 'traffic_light', 'traffic-light', 'auto_tls', 'auto-tls'}:
+        try:
+            signal_points, signal_crs = load_points(SIGNAL_GPKG, layer=SIGNAL_GPKG_LAYER, label='Signal')
+            signal_records = build_signal_records(scenario['nodes'], scenario['lanes'], signal_points, signal_crs, scenario.get('network_crs'))
+            signal_nodes = {int(r.get('node', -1)) for r in signal_records if int(r.get('node', -1)) >= 0}
+        except Exception as e:
+            print('[SUMO] signal export skipped:', e)
+            signal_nodes = set()
+    with nodes_path.open('w', encoding='utf-8', newline='') as f:
+        f.write('<?xml version="1.0" encoding="UTF-8"?>\n<nodes>\n')
+        for n in scenario['nodes']:
+            nid = int(n['node_id'])
+            geom = n['geometry']
+            node_type = 'traffic_light' if nid in signal_nodes else 'priority'
+            f.write(f'  <node id="n{nid}" x="{float(geom.x):.3f}" y="{float(geom.y):.3f}" type="{node_type}"/>\n')
+        f.write('</nodes>\n')
+    with edges_path.open('w', encoding='utf-8', newline='') as f:
+        f.write('<?xml version="1.0" encoding="UTF-8"?>\n<edges>\n')
+        for link in scenario['links']:
+            link_id = int(link['link_id'])
+            geom = link.get('geometry')
+            coords = list(geom.coords) if geom is not None else []
+            shape = ' '.join(f'{float(x):.3f},{float(y):.3f}' for x, y in coords)
+            priority = max(1, min(99, int(round(float(link.get('lane_count', 1)) + float(link.get('speed_mps', 13.9)) / 4.0))))
+            f.write(
+                f'  <edge id="e{link_id}" from="n{int(link["from_node"])}" to="n{int(link["to_node"])}" '
+                f'priority="{priority}" numLanes="{max(1, int(link.get("lane_count", 1)))}" '
+                f'speed="{max(0.1, float(link.get("speed_mps", 13.9))):.3f}" shape="{_xml_attr(shape)}"/>\n'
+            )
+        f.write('</edges>\n')
+    return nodes_path, edges_path, net_path
+
+
+def _run_netconvert_for_sumo(nodes_path, edges_path, net_path, netconvert_binary):
+    cmd = [
+        str(netconvert_binary),
+        '--node-files', str(nodes_path),
+        '--edge-files', str(edges_path),
+        '--output-file', str(net_path),
+        '--no-turnarounds', 'true',
+        '--offset.disable-normalization', 'true',
+    ]
+    if SUMO_BENCHMARK_NO_WARNINGS:
+        cmd.extend(['--no-warnings', 'true'])
+    print('[SUMO] netconvert:', ' '.join(str(x) for x in cmd))
+    started = time.perf_counter()
+    proc = subprocess.run(cmd, cwd=str(PROJECT_DIR), text=True, capture_output=True)
+    elapsed = time.perf_counter() - started
+    output = (proc.stdout or '') + ('\n' if proc.stdout and proc.stderr else '') + (proc.stderr or '')
+    if proc.returncode != 0:
+        raise RuntimeError('netconvert failed with return_code=' + str(proc.returncode) + '\n' + _tail_text(output, 80))
+    if output.strip():
+        print(_tail_text(output, 20))
+    return float(elapsed), output
+
+
+def _route_edges_for_sumo_route(route_id, route_offsets, route_lanes, lanes):
+    off0 = int(route_offsets[int(route_id)])
+    off1 = int(route_offsets[int(route_id) + 1])
+    edges = []
+    last = None
+    for lane_id in route_lanes[off0:off1]:
+        lane = lanes[int(lane_id)]
+        link_id = int(lane['link_id'])
+        if link_id != last:
+            edges.append(link_id)
+            last = link_id
+    return edges
+
+
+def _write_sumo_routes_file(scenario, work_dir, total_duration_seconds):
+    work_dir = _project_resolve(work_dir)
+    routes_path = work_dir / 'avabm_benchmark.rou.xml'
+    route_offsets = scenario['route_offsets']
+    route_lanes = scenario['route_lanes']
+    lanes = scenario['lanes']
+    spawn_lane = scenario['spawn_lane']
+    spawn_route = scenario['spawn_route']
+    demand_vps = scenario['demand_vps']
+    link_to_lane_order = scenario['link_to_lane_order']
+    used_routes = sorted({int(r) for r in spawn_route.tolist() if 0 <= int(r) < int(scenario['valid_route_count'])})
+    written_routes = 0
+    written_flows = 0
+    with routes_path.open('w', encoding='utf-8', newline='') as f:
+        f.write('<?xml version="1.0" encoding="UTF-8"?>\n<routes>\n')
+        f.write('  <vType id="avabm_car" vClass="passenger" length="4.5" minGap="2.5" accel="2.6" decel="4.5" sigma="0.5" maxSpeed="55.56"/>\n')
+        route_edge_cache = {}
+        for rid in used_routes:
+            edges = _route_edges_for_sumo_route(rid, route_offsets, route_lanes, lanes)
+            if not edges:
+                continue
+            route_edge_cache[int(rid)] = edges
+            edge_text = ' '.join(f'e{int(e)}' for e in edges)
+            f.write(f'  <route id="r{rid}" edges="{_xml_attr(edge_text)}"/>\n')
+            written_routes += 1
+        for slot_idx, lane_id in enumerate(spawn_lane):
+            rate = float(demand_vps[int(slot_idx)])
+            if rate <= 0.0:
+                continue
+            rid = int(spawn_route[int(slot_idx)])
+            if rid not in route_edge_cache:
+                continue
+            lane = lanes[int(lane_id)]
+            depart_lane = int(link_to_lane_order.get(int(lane_id), int(lane.get('lane_index_from_right', 0))))
+            # SUMO flows are deterministic with vehsPerHour/period-style insertion; this keeps the baseline reproducible.
+            f.write(
+                f'  <flow id="f{int(slot_idx)}" type="avabm_car" route="r{rid}" begin="0.000" '
+                f'end="{float(total_duration_seconds):.3f}" vehsPerHour="{float(rate) * 3600.0:.6f}" '
+                f'departLane="{max(0, depart_lane)}" departSpeed="max"/>\n'
+            )
+            written_flows += 1
+        f.write('</routes>\n')
+    print('[SUMO] routes file:', routes_path, 'routes:', written_routes, 'flows:', written_flows)
+    return routes_path, written_routes, written_flows
+
+
+def _parse_sumo_cli_output(output_text):
+    text = str(output_text or '')
+    out = {}
+    patterns = {
+        'sumo_duration_seconds_reported': r'Duration:\s*([0-9.+\-eE]+)s',
+        'sumo_real_time_factor_reported': r'Real time factor:\s*([0-9.+\-eE]+)',
+        'sumo_ups_reported': r'UPS:\s*([0-9.+\-eE]+)',
+        'sumo_inserted_reported': r'Inserted:\s*([0-9]+)',
+        'sumo_loaded_reported': r'Loaded:\s*([0-9]+)',
+        'sumo_running_reported': r'Running:\s*([0-9]+)',
+        'sumo_waiting_reported': r'Waiting:\s*([0-9]+)',
+    }
+    for key, pat in patterns.items():
+        m = re.search(pat, text, re.IGNORECASE)
+        if not m:
+            continue
+        val = m.group(1)
+        try:
+            out[key] = float(val) if any(c in val for c in '.eE+-') else int(val)
+        except Exception:
+            out[key] = val
+    return out
+
+
+def _parse_sumo_summary_xml(summary_path, warmup_seconds, timed_steps, dt):
+    import xml.etree.ElementTree as ET
+    path = Path(summary_path)
+    if not path.exists():
+        return {}
+    samples = 0
+    active_sum = 0.0
+    active_max = 0
+    inserted_last = 0
+    ended_last = 0
+    loaded_last = 0
+    waiting_last = 0
+    timed_inserted_first = None
+    timed_ended_first = None
+    timed_inserted_last = None
+    timed_ended_last = None
+    warm = float(warmup_seconds)
+    try:
+        for _, elem in ET.iterparse(str(path), events=('end',)):
+            if elem.tag != 'step':
+                elem.clear()
+                continue
+            attrib = elem.attrib
+            t = float(attrib.get('time', '0') or 0.0)
+            running = int(float(attrib.get('running', attrib.get('runningVehicles', 0)) or 0))
+            inserted = int(float(attrib.get('inserted', 0) or 0))
+            ended = int(float(attrib.get('ended', attrib.get('arrived', 0)) or 0))
+            loaded = int(float(attrib.get('loaded', 0) or 0))
+            waiting = int(float(attrib.get('waiting', 0) or 0))
+            inserted_last = inserted
+            ended_last = ended
+            loaded_last = loaded
+            waiting_last = waiting
+            if t + 1.0e-9 >= warm:
+                if timed_inserted_first is None:
+                    timed_inserted_first = inserted
+                    timed_ended_first = ended
+                timed_inserted_last = inserted
+                timed_ended_last = ended
+                samples += 1
+                active_sum += float(running)
+                active_max = max(active_max, running)
+            elem.clear()
+    except Exception as e:
+        print('[SUMO] summary parse failed:', e)
+        return {}
+    avg_active = active_sum / float(max(1, samples)) if samples > 0 else 0.0
+    vehicle_updates = float(avg_active) * float(timed_steps)
+    spawned_timed = 0 if timed_inserted_first is None or timed_inserted_last is None else max(0, int(timed_inserted_last) - int(timed_inserted_first))
+    completed_timed = 0 if timed_ended_first is None or timed_ended_last is None else max(0, int(timed_ended_last) - int(timed_ended_first))
+    return {
+        'active_sample_sum': float(active_sum),
+        'stats_samples': int(samples),
+        'avg_active_est': float(avg_active),
+        'max_active_est': int(active_max),
+        'vehicle_updates_est': float(vehicle_updates),
+        'spawned': int(spawned_timed),
+        'completed': int(completed_timed),
+        'sumo_loaded_final': int(loaded_last),
+        'sumo_inserted_final': int(inserted_last),
+        'sumo_ended_final': int(ended_last),
+        'sumo_waiting_final': int(waiting_last),
+    }
+
+
+def _base_sumo_command(sumo_binary, net_path, routes_path, total_duration_seconds, summary_path=None, tripinfo_path=None):
+    cmd = [
+        str(sumo_binary),
+        '-n', str(net_path),
+        '-r', str(routes_path),
+        '--step-length', f'{float(DT):.9g}',
+        '--begin', '0',
+        '--end', f'{float(total_duration_seconds):.9g}',
+        '--no-step-log', 'true',
+        '--duration-log.statistics', 'true',
+        '--time-to-teleport', f'{float(SUMO_BENCHMARK_TIME_TO_TELEPORT):.9g}',
+        '--seed', str(int(SCENARIO_SEED)),
+    ]
+    if SUMO_BENCHMARK_IGNORE_ROUTE_ERRORS:
+        cmd.extend(['--ignore-route-errors', 'true'])
+    if SUMO_BENCHMARK_NO_WARNINGS:
+        cmd.extend(['--no-warnings', 'true'])
+    if summary_path is not None:
+        cmd.extend(['--summary', str(summary_path)])
+    if tripinfo_path is not None:
+        cmd.extend(['--tripinfo-output', str(tripinfo_path), '--tripinfo-output.write-unfinished', 'true'])
+    cmd.extend(_split_extra_args(SUMO_BENCHMARK_EXTRA_ARGS))
+    return cmd
+
+
+def _run_sumo_cli_benchmark(sumo_binary, net_path, routes_path, work_dir, steps, warmup_steps, total_steps):
+    summary_path = Path(work_dir) / 'sumo_summary.xml'
+    tripinfo_path = Path(work_dir) / 'sumo_tripinfo.xml' if SUMO_BENCHMARK_WRITE_TRIPINFO else None
+    total_duration_seconds = float(total_steps) * float(DT)
+    cmd = _base_sumo_command(sumo_binary, net_path, routes_path, total_duration_seconds, summary_path=summary_path, tripinfo_path=tripinfo_path)
+    print('[SUMO] cli:', ' '.join(str(x) for x in cmd))
+    started = time.perf_counter()
+    proc = subprocess.run(cmd, cwd=str(PROJECT_DIR), text=True, capture_output=True)
+    elapsed = time.perf_counter() - started
+    output = (proc.stdout or '') + ('\n' if proc.stdout and proc.stderr else '') + (proc.stderr or '')
+    parsed = _parse_sumo_cli_output(output)
+    summary_metrics = _parse_sumo_summary_xml(summary_path, float(warmup_steps) * float(DT), int(steps), float(DT))
+    wall = float(parsed.get('sumo_duration_seconds_reported', elapsed) or elapsed)
+    timed_sim_seconds = float(steps) * float(DT)
+    vehicle_updates = float(summary_metrics.get('vehicle_updates_est', 0.0) or 0.0)
+    row = {
+        'backend': 'sumo',
+        'requested_backend': 'sumo',
+        'runner': 'cli',
+        'reason': 'step_limit' if proc.returncode == 0 else 'sumo_failed',
+        'steps': int(steps),
+        'total_steps': int(total_steps),
+        'warmup_steps': int(warmup_steps),
+        'target_steps': int(steps),
+        'batch_steps': 1,
+        'dt': float(DT),
+        'sim_seconds': timed_sim_seconds,
+        'total_sim_seconds': float(total_steps) * float(DT),
+        'wall_seconds': float(wall),
+        'wall_seconds_scope': 'warmup+timed',
+        'process_wall_seconds': float(elapsed),
+        'steps_per_second': float(total_steps) / float(wall) if wall > 0.0 else 0.0,
+        'sim_seconds_per_wall_second': (float(total_steps) * float(DT)) / float(wall) if wall > 0.0 else 0.0,
+        'warmup_included_in_wall': True,
+        'sumo_binary': str(sumo_binary),
+        'sumo_net_path': str(net_path),
+        'sumo_route_path': str(routes_path),
+        'sumo_summary_path': str(summary_path),
+        'return_code': int(proc.returncode),
+        'error': '' if proc.returncode == 0 else _tail_text(output, 60),
+    }
+    row.update(parsed)
+    row.update(summary_metrics)
+    if vehicle_updates > 0.0 and wall > 0.0:
+        row['vehicle_updates_per_second'] = float(vehicle_updates) / float(wall)
+    return row, output
+
+
+def _run_sumo_libsumo_benchmark(sumo_binary, net_path, routes_path, work_dir, steps, warmup_steps, total_steps):
+    try:
+        import libsumo as traci
+    except Exception as e:
+        raise RuntimeError('libsumo import failed: ' + str(e)) from e
+    total_duration_seconds = float(total_steps) * float(DT)
+    cmd = _base_sumo_command(sumo_binary, net_path, routes_path, total_duration_seconds, summary_path=None, tripinfo_path=None)
+    # Keep libsumo quiet; Python measures the timed section directly after warmup.
+    if '--duration-log.statistics' in cmd:
+        idx = cmd.index('--duration-log.statistics')
+        if idx + 1 < len(cmd):
+            cmd[idx + 1] = 'false'
+    print('[SUMO] libsumo:', ' '.join(str(x) for x in cmd))
+    started_total = time.perf_counter()
+    try:
+        traci.start(cmd)
+    except Exception as e:
+        raise RuntimeError('libsumo.start failed: ' + str(e)) from e
+    active_sum = 0.0
+    active_max = 0
+    samples = 0
+    spawned = 0
+    completed = 0
+    timed_started = False
+    timed_wall_start = None
+    timed_wall = 0.0
+    final_active = 0
+    try:
+        for step in range(int(total_steps)):
+            if step == int(warmup_steps):
+                timed_started = True
+                timed_wall_start = time.perf_counter()
+            try:
+                traci.simulationStep()
+            except TypeError:
+                traci.simulationStep(float(step + 1) * float(DT))
+            if timed_started:
+                try:
+                    spawned += int(traci.simulation.getDepartedNumber())
+                except Exception:
+                    pass
+                try:
+                    completed += int(traci.simulation.getArrivedNumber())
+                except Exception:
+                    pass
+                if _count_due_interval_steps(int(step), 1, int(BENCHMARK_STATS_INTERVAL)) > 0:
+                    try:
+                        active = int(traci.vehicle.getIDCount())
+                    except Exception:
+                        try:
+                            active = int(traci.simulation.getMinExpectedNumber())
+                        except Exception:
+                            active = 0
+                    active_sum += float(active)
+                    active_max = max(active_max, int(active))
+                    samples += 1
+        if timed_wall_start is not None:
+            timed_wall = time.perf_counter() - timed_wall_start
+        try:
+            final_active = int(traci.vehicle.getIDCount())
+        except Exception:
+            final_active = 0
+    finally:
+        try:
+            traci.close(False)
+        except Exception:
+            try:
+                traci.close()
+            except Exception:
+                pass
+    total_wall = time.perf_counter() - started_total
+    timed_steps = int(steps)
+    timed_sim_seconds = float(timed_steps) * float(DT)
+    avg_active = float(active_sum) / float(max(1, samples)) if samples > 0 else 0.0
+    vehicle_updates = avg_active * float(timed_steps)
+    wall = max(1.0e-9, float(timed_wall))
+    return {
+        'backend': 'sumo',
+        'requested_backend': 'sumo',
+        'runner': 'libsumo',
+        'reason': 'step_limit',
+        'steps': int(timed_steps),
+        'total_steps': int(total_steps),
+        'warmup_steps': int(warmup_steps),
+        'target_steps': int(steps),
+        'batch_steps': 1,
+        'dt': float(DT),
+        'sim_seconds': timed_sim_seconds,
+        'total_sim_seconds': float(total_steps) * float(DT),
+        'wall_seconds': float(wall),
+        'wall_seconds_scope': 'timed_only',
+        'process_wall_seconds': float(total_wall),
+        'steps_per_second': float(timed_steps) / float(wall),
+        'sim_seconds_per_wall_second': float(timed_sim_seconds) / float(wall),
+        'warmup_included_in_wall': False,
+        'active_sample_sum': float(active_sum),
+        'stats_samples': int(samples),
+        'avg_active_est': float(avg_active),
+        'max_active_est': int(active_max),
+        'vehicle_updates_est': float(vehicle_updates),
+        'vehicle_updates_per_second': float(vehicle_updates) / float(wall),
+        'spawned': int(spawned),
+        'completed': int(completed),
+        'active': int(final_active),
+        'final_active': int(final_active),
+        'rejected_spawn': 0,
+        'sumo_binary': str(sumo_binary),
+        'sumo_net_path': str(net_path),
+        'sumo_route_path': str(routes_path),
+        'return_code': 0,
+        'error': '',
+    }, ''
+
+
+def run_sumo_benchmark_child():
+    """Export an AVABM benchmark scenario to SUMO and run a SUMO baseline."""
+    result_path = cfg_optional('BENCHMARK_RESULT_JSON', cfg_optional('SUMO_BENCHMARK_RESULT_JSON', None))
+    log_extra = []
+    work_dir = _project_resolve(SUMO_BENCHMARK_WORK_DIR)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    steps = int(BENCHMARK_STEPS)
+    warmup_steps = int(BENCHMARK_WARMUP_STEPS)
+    total_steps = int(steps + warmup_steps)
+    total_duration_seconds = float(total_steps) * float(DT)
+    prepare_started = time.perf_counter()
+    sumo_binary = _resolve_sumo_executable(SUMO_BINARY, ['sumo'])
+    netconvert_binary = _resolve_sumo_executable(SUMO_NETCONVERT_BINARY, ['netconvert'])
+    if not sumo_binary or not netconvert_binary:
+        missing = []
+        if not sumo_binary:
+            missing.append('sumo')
+        if not netconvert_binary:
+            missing.append('netconvert')
+        row = {
+            'backend': 'sumo',
+            'requested_backend': 'sumo',
+            'runner': str(SUMO_BENCHMARK_RUNNER),
+            'status': 'failed',
+            'reason': 'missing_sumo_binary',
+            'steps': int(steps),
+            'warmup_steps': int(warmup_steps),
+            'dt': float(DT),
+            'error': 'Missing SUMO executable(s): ' + ', '.join(missing) + '. Install SUMO and put its bin directory on PATH or set SUMO_BINARY / SUMO_NETCONVERT_BINARY in config.txt.',
+        }
+        if result_path:
+            rp = _project_resolve(result_path)
+            ensure_parent(rp)
+            rp.write_text(json.dumps(row, ensure_ascii=False, indent=2), encoding='utf-8')
+        print('[BenchmarkResult] ' + json.dumps(row, ensure_ascii=False, sort_keys=True))
+        return 2
+    try:
+        scenario = _build_benchmark_scenario_data_for_sumo()
+        nodes_path, edges_path, net_path = _write_sumo_plain_network_files(scenario, work_dir)
+        netconvert_wall, netconvert_output = _run_netconvert_for_sumo(nodes_path, edges_path, net_path, netconvert_binary)
+        log_extra.append(netconvert_output)
+        routes_path, written_routes, written_flows = _write_sumo_routes_file(scenario, work_dir, total_duration_seconds)
+        prepare_wall = time.perf_counter() - prepare_started
+        runner = _sumo_runner_allowed(SUMO_BENCHMARK_RUNNER)
+        output = ''
+        if runner in {'auto', 'libsumo'}:
+            try:
+                row, output = _run_sumo_libsumo_benchmark(sumo_binary, net_path, routes_path, work_dir, steps, warmup_steps, total_steps)
+            except Exception as e:
+                if runner == 'libsumo':
+                    raise
+                print('[SUMO] libsumo unavailable; falling back to CLI:', e)
+                row, output = _run_sumo_cli_benchmark(sumo_binary, net_path, routes_path, work_dir, steps, warmup_steps, total_steps)
+        else:
+            row, output = _run_sumo_cli_benchmark(sumo_binary, net_path, routes_path, work_dir, steps, warmup_steps, total_steps)
+        row.update({
+            'fixed_spawn': bool(BENCHMARK_FIXED_SPAWN),
+            'total_spawn_vps': float(scenario.get('total_spawn_vps', 0.0)),
+            'spawn_scale': float(BENCHMARK_SPAWN_SCALE),
+            'spawn_target_vps': None if _benchmark_spawn_target_vps(BENCHMARK_STEPS, DT) is None else float(_benchmark_spawn_target_vps(BENCHMARK_STEPS, DT)),
+            'spawn_per_point_vps': None if BENCHMARK_SPAWN_PER_POINT_VPS is None else float(BENCHMARK_SPAWN_PER_POINT_VPS),
+            'spawn_total_requested': None if BENCHMARK_SPAWN_TOTAL is None else float(BENCHMARK_SPAWN_TOTAL),
+            'num_spawn_points': int(scenario.get('num_spawn_points', 0)),
+            'valid_route_count': int(scenario.get('valid_route_count', 0)),
+            'num_lanes': int(len(scenario.get('lanes', []))),
+            'num_links': int(len(scenario.get('links', []))),
+            'num_nodes': int(len(scenario.get('nodes', []))),
+            'max_agents': 0,
+            'cpu_workers': 0,
+            'seed': int(SCENARIO_SEED),
+            'prepare_wall_seconds': float(prepare_wall),
+            'netconvert_wall_seconds': float(netconvert_wall),
+            'sumo_binary': str(sumo_binary),
+            'sumo_netconvert_binary': str(netconvert_binary),
+            'sumo_nodes_path': str(nodes_path),
+            'sumo_edges_path': str(edges_path),
+            'sumo_net_path': str(net_path),
+            'sumo_route_path': str(routes_path),
+            'sumo_routes_written': int(written_routes),
+            'sumo_flows_written': int(written_flows),
+        })
+        if int(row.get('return_code', 0)) == 0 and not row.get('error'):
+            row.setdefault('status', 'ok')
+        else:
+            row.setdefault('status', 'failed')
+        if result_path:
+            rp = _project_resolve(result_path)
+            ensure_parent(rp)
+            rp.write_text(json.dumps(row, ensure_ascii=False, indent=2), encoding='utf-8')
+        if output:
+            print(_tail_text(output, 80))
+        print('[BenchmarkResult] ' + json.dumps(row, ensure_ascii=False, sort_keys=True))
+        if not SUMO_BENCHMARK_KEEP_FILES:
+            for path in (nodes_path, edges_path, net_path, routes_path):
+                try:
+                    Path(path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+        return 0 if row.get('status') == 'ok' else 1
+    except Exception as e:
+        row = {
+            'backend': 'sumo',
+            'requested_backend': 'sumo',
+            'runner': str(SUMO_BENCHMARK_RUNNER),
+            'status': 'failed',
+            'reason': 'exception',
+            'steps': int(steps),
+            'warmup_steps': int(warmup_steps),
+            'dt': float(DT),
+            'error': str(e),
+        }
+        if result_path:
+            rp = _project_resolve(result_path)
+            ensure_parent(rp)
+            rp.write_text(json.dumps(row, ensure_ascii=False, indent=2), encoding='utf-8')
+        print('[BenchmarkResult] ' + json.dumps(row, ensure_ascii=False, sort_keys=True))
+        print('[SUMO] failed:', e)
+        return 1
+
+
 def _normalize_benchmark_order(raw):
     aliases = {
         "gpu": "cuda",
@@ -5441,21 +6263,40 @@ def _normalize_benchmark_order(raw):
         "c++": "cpu",
         "cpp": "cpu",
         "cpp_cpu": "cpu",
+        "sumo_cli": "sumo",
+        "sumo-cli": "sumo",
+        "baseline": "sumo",
+        "sumo-baseline": "sumo",
         "both": "cpu,cuda",
-        "all": "cpu,cuda",
-        "compare": "cpu,cuda",
+        "avabm": "cpu,cuda",
+        "all": "cpu,cuda,sumo",
+        "compare": "cpu,cuda,sumo",
+        "gpu-sumo": "cuda,sumo",
+        "cuda-sumo": "cuda,sumo",
+        "sumo-gpu": "cuda,sumo",
+        "sumo-cuda": "cuda,sumo",
+        "gpu+sumo": "cuda,sumo",
+        "cuda+sumo": "cuda,sumo",
+        "sumo+gpu": "cuda,sumo",
+        "sumo+cuda": "cuda,sumo",
+        "cpu-sumo": "cpu,sumo",
+        "sumo-cpu": "cpu,sumo",
+        "cpu+sumo": "cpu,sumo",
+        "sumo+cpu": "cpu,sumo",
     }
     raw_text = str(raw or "cpu,cuda").strip().lower()
     raw_text = aliases.get(raw_text, raw_text)
     parts = []
-    for token in re.split(r"[,;\s]+", raw_text):
+    for token in re.split(r"[,;+\s]+", raw_text):
         if not token:
             continue
         token = aliases.get(token, token)
-        if token in {"cpu", "cuda"} and token not in parts:
+        if token in {"cpu", "cuda", "sumo"} and token not in parts:
             parts.append(token)
     if not parts:
         parts = ["cpu", "cuda"]
+    if BENCHMARK_INCLUDE_SUMO and "sumo" not in parts:
+        parts.append("sumo")
     return parts
 
 
@@ -5476,8 +6317,15 @@ def _write_benchmark_csv(path, rows):
     fieldnames = [
         "backend", "status", "return_code", "steps", "total_steps", "warmup_steps", "target_steps",
         "batch_steps", "wall_seconds", "steps_per_second", "sim_seconds", "total_sim_seconds",
-        "sim_seconds_per_wall_second", "spawned", "completed", "active", "rejected_spawn",
-        "cpu_workers", "log_path", "error",
+        "sim_seconds_per_wall_second", "spawned", "completed", "active", "final_active",
+        "active_metric_last", "active_sample_sum", "stats_samples", "stats_samples_est",
+        "avg_active_est", "vehicle_updates_est", "vehicle_updates_per_second",
+        "rejected_spawn", "total_spawn_vps", "spawn_target_vps", "spawn_scale",
+        "spawn_per_point_vps", "max_agents", "cpu_workers", "runner", "wall_seconds_scope",
+        "process_wall_seconds", "prepare_wall_seconds", "netconvert_wall_seconds",
+        "sumo_ups_reported", "sumo_real_time_factor_reported", "sumo_inserted_reported",
+        "sumo_running_reported", "sumo_waiting_reported", "sumo_binary", "sumo_net_path",
+        "sumo_route_path", "log_path", "error",
     ]
     with open(path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -5487,18 +6335,25 @@ def _write_benchmark_csv(path, rows):
 
 
 def _print_benchmark_summary(rows, summary_json_path, summary_csv_path):
-    headers = ["backend", "status", "steps", "wall_s", "steps/s", "sim_s/s", "spawned", "done"]
+    headers = ["backend", "status", "runner", "spawn_vps", "steps", "wall_s", "scope", "steps/s", "sim_s/s", "avg_active", "final_active", "veh_upd/s", "spawned", "done", "reject"]
     table_rows = []
     for row in rows:
         table_rows.append([
             str(row.get("backend", "")),
             str(row.get("status", "")),
+            str(row.get("runner", "")),
+            f"{float(row.get('total_spawn_vps', 0.0) or 0.0):.2f}" if row.get("total_spawn_vps", "") != "" else "",
             str(row.get("steps", "")),
             f"{float(row.get('wall_seconds', 0.0) or 0.0):.3f}" if row.get("wall_seconds", "") != "" else "",
+            str(row.get("wall_seconds_scope", "")),
             f"{float(row.get('steps_per_second', 0.0) or 0.0):.1f}" if row.get("steps_per_second", "") != "" else "",
             f"{float(row.get('sim_seconds_per_wall_second', 0.0) or 0.0):.1f}" if row.get("sim_seconds_per_wall_second", "") != "" else "",
+            f"{float(row.get('avg_active_est', 0.0) or 0.0):.0f}" if row.get("avg_active_est", "") != "" else "",
+            str(row.get("final_active", row.get("active", ""))),
+            f"{float(row.get('vehicle_updates_per_second', 0.0) or 0.0):.0f}" if row.get("vehicle_updates_per_second", "") != "" else "",
             str(row.get("spawned", "")),
             str(row.get("completed", "")),
+            str(row.get("rejected_spawn", "")),
         ])
     widths = [len(h) for h in headers]
     for r in table_rows:
@@ -5519,12 +6374,41 @@ def _print_benchmark_summary(rows, summary_json_path, summary_csv_path):
         cuda_rate = float(cuda.get("steps_per_second", 0.0) or 0.0)
         if cpu_rate > 0.0 and cuda_rate > 0.0:
             print(f"[Benchmark] CUDA/CPU speedup: {cuda_rate / cpu_rate:.2f}x")
+    sumo = by_backend.get("sumo")
+    if cuda and sumo:
+        cuda_vups = float(cuda.get("vehicle_updates_per_second", 0.0) or 0.0)
+        sumo_vups = float(sumo.get("vehicle_updates_per_second", 0.0) or 0.0)
+        if cuda_vups > 0.0 and sumo_vups > 0.0:
+            print(f"[Benchmark] CUDA/SUMO vehicle-update speedup: {cuda_vups / sumo_vups:.2f}x")
+        cuda_sim_rate = float(cuda.get("sim_seconds_per_wall_second", 0.0) or 0.0)
+        sumo_sim_rate = float(sumo.get("sim_seconds_per_wall_second", 0.0) or 0.0)
+        if cuda_sim_rate > 0.0 and sumo_sim_rate > 0.0:
+            print(f"[Benchmark] CUDA/SUMO sim-rate speedup: {cuda_sim_rate / sumo_sim_rate:.2f}x")
     print(f"[Benchmark] JSON: {summary_json_path}")
     print(f"[Benchmark] CSV:  {summary_csv_path}")
 
 
+def _count_due_interval_steps(first_step, step_count, interval):
+    first_step = int(first_step)
+    step_count = int(step_count)
+    interval = max(1, int(interval))
+    if step_count <= 0:
+        return 0
+    if interval <= 1:
+        return step_count
+    last_step = first_step + step_count - 1
+    return sum(1 for s in range(first_step, last_step + 1) if s <= 0 or (s % interval) == 0)
+
+def _benchmark_spawn_target_vps(steps, dt):
+    if BENCHMARK_SPAWN_TOTAL is not None and BENCHMARK_SPAWN_TOTAL > 0.0:
+        duration = max(1.0e-9, float(steps) * float(dt))
+        return float(BENCHMARK_SPAWN_TOTAL) / duration
+    if BENCHMARK_SPAWN_VPS is not None and BENCHMARK_SPAWN_VPS > 0.0:
+        return float(BENCHMARK_SPAWN_VPS)
+    return None
+
 def run_benchmark():
-    """Run one CPU and one CUDA headless child process, then compare throughput."""
+    """Run one or more headless benchmark child processes and compare throughput."""
     output_dir = _project_resolve(BENCHMARK_OUTPUT_DIR)
     output_dir.mkdir(parents=True, exist_ok=True)
     steps = int(BENCHMARK_STEPS)
@@ -5536,6 +6420,9 @@ def run_benchmark():
     fixed_spawn = bool(BENCHMARK_FIXED_SPAWN)
     cpu_workers_for_benchmark = int(BENCHMARK_CPU_WORKERS if BENCHMARK_CPU_WORKERS > 0 else (os.cpu_count() or 1))
     cpu_workers_for_benchmark = max(1, min(cpu_workers_for_benchmark, 1024))
+    spawn_target_vps = _benchmark_spawn_target_vps(steps, DT)
+    spawn_per_point_vps = BENCHMARK_SPAWN_PER_POINT_VPS if BENCHMARK_SPAWN_PER_POINT_VPS is not None and BENCHMARK_SPAWN_PER_POINT_VPS >= 0.0 else None
+    benchmark_max_agents = int(BENCHMARK_MAX_AGENTS) if int(BENCHMARK_MAX_AGENTS) > 0 else int(MAX_AGENTS)
     print(
         "[Benchmark] mode=benchmark",
         "order=" + ",".join(order),
@@ -5544,6 +6431,10 @@ def run_benchmark():
         "batch_steps=" + str(batch_steps),
         "dt=" + str(float(DT)),
         "fixed_spawn=" + str(int(fixed_spawn)),
+        "spawn_scale=" + str(float(BENCHMARK_SPAWN_SCALE)),
+        "spawn_target_vps=" + ("none" if spawn_target_vps is None else str(float(spawn_target_vps))),
+        "spawn_per_point_vps=" + ("none" if spawn_per_point_vps is None else str(float(spawn_per_point_vps))),
+        "max_agents=" + str(int(benchmark_max_agents)),
         "cpu_workers=" + str(cpu_workers_for_benchmark),
     )
     rows = []
@@ -5551,6 +6442,101 @@ def run_benchmark():
         result_path = output_dir / f"benchmark_{run_index:02d}_{backend}.json"
         log_path = output_dir / f"benchmark_{run_index:02d}_{backend}.log"
         metrics_path = output_dir / f"benchmark_{run_index:02d}_{backend}_metrics.csv"
+        if backend == "sumo":
+            child_env = os.environ.copy()
+            child_env.update({
+                "AVABM_SUMO_BENCHMARK_CHILD": "1",
+                "SUMO_BENCHMARK_CHILD": "1",
+                "BENCHMARK_MODE": "1",
+                "BENCHMARK_CHILD": "1",
+                "BENCHMARK_BACKEND": "sumo",
+                "BENCHMARK_STEPS": str(steps),
+                "BENCHMARK_FIXED_SPAWN": "1" if fixed_spawn else "0",
+                "BENCHMARK_RESULT_JSON": str(result_path),
+                "BENCHMARK_SPAWN_SCALE": str(float(BENCHMARK_SPAWN_SCALE)),
+                "BENCHMARK_SPAWN_VPS": "" if spawn_target_vps is None else str(float(spawn_target_vps)),
+                "BENCHMARK_SPAWN_TOTAL": "",
+                "BENCHMARK_SPAWN_PER_POINT_VPS": "" if spawn_per_point_vps is None else str(float(spawn_per_point_vps)),
+                "BENCHMARK_MAX_AGENTS": str(int(benchmark_max_agents)),
+                "BENCHMARK_STATS_INTERVAL": str(int(BENCHMARK_STATS_INTERVAL)),
+                "BENCHMARK_WARMUP_STEPS": str(warmup_steps),
+                "BENCHMARK_BATCH_STEPS": str(batch_steps),
+                "SUMO_BENCHMARK_RUNNER": str(SUMO_BENCHMARK_RUNNER),
+                "SUMO_BINARY": str(SUMO_BINARY),
+                "SUMO_NETCONVERT_BINARY": str(SUMO_NETCONVERT_BINARY),
+                "SUMO_BENCHMARK_WORK_DIR": str(SUMO_BENCHMARK_WORK_DIR),
+                "SUMO_BENCHMARK_KEEP_FILES": "1" if SUMO_BENCHMARK_KEEP_FILES else "0",
+                "SUMO_BENCHMARK_REUSE_FILES": "1" if SUMO_BENCHMARK_REUSE_FILES else "0",
+                "SUMO_BENCHMARK_SIGNAL_MODE": str(SUMO_BENCHMARK_SIGNAL_MODE),
+                "SUMO_BENCHMARK_TIME_TO_TELEPORT": str(float(SUMO_BENCHMARK_TIME_TO_TELEPORT)),
+                "SUMO_BENCHMARK_IGNORE_ROUTE_ERRORS": "1" if SUMO_BENCHMARK_IGNORE_ROUTE_ERRORS else "0",
+                "SUMO_BENCHMARK_NO_WARNINGS": "1" if SUMO_BENCHMARK_NO_WARNINGS else "0",
+                "SUMO_BENCHMARK_WRITE_TRIPINFO": "1" if SUMO_BENCHMARK_WRITE_TRIPINFO else "0",
+                "SUMO_BENCHMARK_EXTRA_ARGS": str(SUMO_BENCHMARK_EXTRA_ARGS),
+                "HEADLESS_MODE": "1",
+                "SIM_HEADLESS": "1",
+                "SECTION_STATS_ENABLED": "0",
+                "TURBO_DISABLE_SECTION_STATS": "1",
+                "SCENARIO_ID": "benchmark_sumo",
+                "SPAWN_PROFILE_FIELD_PREFIX": "__AVABM_BENCHMARK_DISABLED__" if fixed_spawn else str(SPAWN_PROFILE_FIELD_PREFIX),
+            })
+            cmd = [sys.executable, str(PROJECT_DIR / "main.py"), "--sumo-benchmark-child"]
+            print(f"[Benchmark] run {run_index}/{len(order)} backend=sumo start")
+            started = time.perf_counter()
+            try:
+                proc = subprocess.run(cmd, cwd=str(PROJECT_DIR), env=child_env, text=True, capture_output=True)
+            except Exception as e:
+                elapsed = time.perf_counter() - started
+                row = {
+                    "backend": backend,
+                    "status": "failed",
+                    "return_code": "",
+                    "steps": steps,
+                    "wall_seconds": elapsed,
+                    "error": str(e),
+                    "log_path": str(log_path),
+                }
+                rows.append(row)
+                print(f"[Benchmark] backend=sumo failed to launch: {e}")
+                continue
+            output_text = (proc.stdout or "") + ("\n" if proc.stdout and proc.stderr else "") + (proc.stderr or "")
+            try:
+                log_path.write_text(output_text, encoding="utf-8")
+            except Exception as e:
+                print(f"[Benchmark] failed to write log {log_path}: {e}")
+            result = None
+            if result_path.exists():
+                try:
+                    result = json.loads(result_path.read_text(encoding="utf-8"))
+                except Exception:
+                    result = None
+            if result is None:
+                result = _extract_benchmark_result(output_text)
+            if result is None:
+                result = {}
+            status = "ok" if proc.returncode == 0 and result else "failed"
+            row = dict(result)
+            row.update({
+                "backend": "sumo",
+                "status": status,
+                "return_code": int(proc.returncode),
+                "log_path": str(log_path),
+            })
+            if status != "ok":
+                row["error"] = row.get("error") or _tail_text(output_text, 30)
+                print(f"[Benchmark] backend=sumo failed return_code={proc.returncode}")
+                tail = _tail_text(output_text, 20)
+                if tail:
+                    print(tail)
+            else:
+                print(
+                    f"[Benchmark] backend=sumo done runner={row.get('runner', '')} "
+                    f"steps={row.get('steps')} wall={float(row.get('wall_seconds', 0.0)):.3f}s "
+                    f"steps/s={float(row.get('steps_per_second', 0.0)):.1f} "
+                    f"veh_updates/s={float(row.get('vehicle_updates_per_second', 0.0) or 0.0):.0f}"
+                )
+            rows.append(row)
+            continue
         child_env = os.environ.copy()
         child_env.update({
             "AVABM_BENCHMARK_CHILD": "1",
@@ -5560,6 +6546,15 @@ def run_benchmark():
             "BENCHMARK_STEPS": str(steps),
             "BENCHMARK_FIXED_SPAWN": "1" if fixed_spawn else "0",
             "BENCHMARK_RESULT_JSON": str(result_path),
+            "BENCHMARK_SPAWN_SCALE": str(float(BENCHMARK_SPAWN_SCALE)),
+            "BENCHMARK_SPAWN_VPS": "" if spawn_target_vps is None else str(float(spawn_target_vps)),
+            "BENCHMARK_SPAWN_TOTAL": "",
+            "BENCHMARK_SPAWN_PER_POINT_VPS": "" if spawn_per_point_vps is None else str(float(spawn_per_point_vps)),
+            "BENCHMARK_MAX_AGENTS": str(int(benchmark_max_agents)),
+            "BENCHMARK_OPTIMIZE_GPU": "1" if BENCHMARK_OPTIMIZE_GPU else "0",
+            "BENCHMARK_GPU_TURBO": "1" if BENCHMARK_GPU_TURBO else "0",
+            "BENCHMARK_STATS_INTERVAL": str(int(BENCHMARK_STATS_INTERVAL)),
+            "MAX_AGENTS": str(int(benchmark_max_agents)),
             "SIMULATION_MAX_STEPS": str(steps),
             "SIMULATION_DURATION_SECONDS": str(child_duration_seconds),
             "SIM_BACKEND": "cpu" if backend == "cpu" else "cuda_strict",
@@ -5653,18 +6648,30 @@ def run_benchmark():
             print(
                 f"[Benchmark] backend={backend} done "
                 f"steps={row.get('steps')} wall={float(row.get('wall_seconds', 0.0)):.3f}s "
-                f"steps/s={float(row.get('steps_per_second', 0.0)):.1f}"
+                f"steps/s={float(row.get('steps_per_second', 0.0)):.1f} "
+                f"veh_updates/s={float(row.get('vehicle_updates_per_second', 0.0) or 0.0):.0f}"
             )
         rows.append(row)
     summary_json_path = output_dir / "benchmark_summary.json"
     summary_csv_path = output_dir / "benchmark_summary.csv"
     speedup = None
+    speedup_cuda_over_sumo_sim_rate = None
+    speedup_cuda_over_sumo_vehicle_updates = None
     by_backend = {str(r.get("backend")): r for r in rows if str(r.get("status")) == "ok"}
     if "cpu" in by_backend and "cuda" in by_backend:
         cpu_rate = float(by_backend["cpu"].get("steps_per_second", 0.0) or 0.0)
         cuda_rate = float(by_backend["cuda"].get("steps_per_second", 0.0) or 0.0)
         if cpu_rate > 0.0:
             speedup = cuda_rate / cpu_rate
+    if "cuda" in by_backend and "sumo" in by_backend:
+        cuda_sim = float(by_backend["cuda"].get("sim_seconds_per_wall_second", 0.0) or 0.0)
+        sumo_sim = float(by_backend["sumo"].get("sim_seconds_per_wall_second", 0.0) or 0.0)
+        if sumo_sim > 0.0:
+            speedup_cuda_over_sumo_sim_rate = cuda_sim / sumo_sim
+        cuda_vups = float(by_backend["cuda"].get("vehicle_updates_per_second", 0.0) or 0.0)
+        sumo_vups = float(by_backend["sumo"].get("vehicle_updates_per_second", 0.0) or 0.0)
+        if sumo_vups > 0.0:
+            speedup_cuda_over_sumo_vehicle_updates = cuda_vups / sumo_vups
     summary = {
         "mode": "benchmark",
         "steps": steps,
@@ -5673,9 +6680,19 @@ def run_benchmark():
         "warmup_steps": warmup_steps,
         "batch_steps": batch_steps,
         "fixed_spawn": fixed_spawn,
+        "spawn_scale": float(BENCHMARK_SPAWN_SCALE),
+        "spawn_target_vps": None if spawn_target_vps is None else float(spawn_target_vps),
+        "spawn_per_point_vps": None if spawn_per_point_vps is None else float(spawn_per_point_vps),
+        "spawn_total_requested": None if BENCHMARK_SPAWN_TOTAL is None else float(BENCHMARK_SPAWN_TOTAL),
+        "max_agents": int(benchmark_max_agents),
+        "gpu_optimized": bool(BENCHMARK_OPTIMIZE_GPU),
+        "gpu_turbo": bool(BENCHMARK_GPU_TURBO),
         "order": order,
         "cpu_workers": cpu_workers_for_benchmark,
         "speedup_cuda_over_cpu": speedup,
+        "speedup_cuda_over_sumo_sim_rate": speedup_cuda_over_sumo_sim_rate,
+        "speedup_cuda_over_sumo_vehicle_updates": speedup_cuda_over_sumo_vehicle_updates,
+        "sumo_runner": str(SUMO_BENCHMARK_RUNNER),
         "results": rows,
     }
     ensure_parent(summary_json_path)
@@ -5831,6 +6848,32 @@ def main():
     total_vps = float(np.sum(demand_np))
     if total_vps > MAX_TOTAL_VPS and total_vps > 1.0e-9:
         demand_np *= MAX_TOTAL_VPS / total_vps
+    benchmark_base_vps = float(np.sum(demand_np))
+    benchmark_spawn_target_vps = _benchmark_spawn_target_vps(BENCHMARK_STEPS, DT) if BENCHMARK_CHILD else None
+    benchmark_spawn_per_point_vps = BENCHMARK_SPAWN_PER_POINT_VPS if BENCHMARK_CHILD and BENCHMARK_SPAWN_PER_POINT_VPS is not None and BENCHMARK_SPAWN_PER_POINT_VPS >= 0.0 else None
+    benchmark_spawn_applied = "default"
+    if BENCHMARK_CHILD:
+        if benchmark_spawn_per_point_vps is not None:
+            demand_np[:] = float(benchmark_spawn_per_point_vps)
+            benchmark_spawn_applied = "per_point_vps"
+        elif benchmark_spawn_target_vps is not None and benchmark_spawn_target_vps > 0.0:
+            if benchmark_base_vps > 1.0e-9:
+                demand_np *= float(benchmark_spawn_target_vps) / benchmark_base_vps
+            elif num_spawn_points > 0:
+                demand_np[:] = float(benchmark_spawn_target_vps) / float(num_spawn_points)
+            benchmark_spawn_applied = "target_total_vps"
+        elif abs(float(BENCHMARK_SPAWN_SCALE) - 1.0) > 1.0e-9:
+            demand_np *= float(BENCHMARK_SPAWN_SCALE)
+            benchmark_spawn_applied = "scale"
+        if benchmark_spawn_applied != "default":
+            print(
+                "[Benchmark] spawn override |",
+                "mode:", benchmark_spawn_applied,
+                "base_total_vps:", float(benchmark_base_vps),
+                "target_total_vps:", float(np.sum(demand_np)),
+                "scale:", float(BENCHMARK_SPAWN_SCALE),
+                "per_point_vps:", benchmark_spawn_per_point_vps,
+            )
     demand_np = as_contig_f32(demand_np)
     profile_slots = max(1, int(SPAWN_PROFILE_SLOTS))
     spawn_profile_np = np.zeros((num_spawn_points, profile_slots), dtype=np.float32)
@@ -6324,6 +7367,27 @@ def main():
                         return float(default)
                 timed_steps = max(0, int(final_step) - int(benchmark_timed_start_step))
                 timed_sim_time = float(timed_steps) * float(DT)
+                final_active_count = int(round(_metric_number("active")))
+                final_connector_active_count = 0
+                try:
+                    alive_mask = veh["active"] == 1
+                    final_active_count = int(alive_mask.sum().detach().item())
+                    final_connector_active_count = int((alive_mask & (veh["vehicle_state"] == VEH_IN_CONNECTOR)).sum().detach().item())
+                except Exception as e:
+                    print("[Benchmark] final active count failed:", e)
+                stats_samples_est = _count_due_interval_steps(int(benchmark_timed_start_step), int(timed_steps), int(BENCHMARK_STATS_INTERVAL))
+                benchmark_stats_samples = int(round(_metric_number("benchmark_stats_samples", 0.0)))
+                if benchmark_stats_samples > 0:
+                    stats_samples_for_avg = benchmark_stats_samples
+                    active_sample_sum = float(_metric_number("benchmark_active_sample_sum", 0.0))
+                else:
+                    # Older native binaries do not expose benchmark active accumulators.
+                    # Keep this estimate conservative and avoid forcing a CUDA/C++ rebuild.
+                    stats_samples_for_avg = 1 if timed_steps > 0 else 0
+                    active_sample_sum = float(final_active_count)
+                avg_active_est = float(active_sample_sum) / float(max(1, stats_samples_for_avg)) if stats_samples_for_avg > 0 else 0.0
+                vehicle_updates_est = float(avg_active_est) * float(timed_steps)
+                vehicle_updates_per_second = float(vehicle_updates_est) / float(elapsed) if elapsed > 0.0 else 0.0
                 benchmark_result = {
                     "backend": str(sim_backend),
                     "requested_backend": str(SIM_BACKEND),
@@ -6341,9 +7405,22 @@ def main():
                     "sim_seconds_per_wall_second": float(timed_sim_time) / float(elapsed),
                     "fixed_spawn": bool(BENCHMARK_FIXED_SPAWN),
                     "total_spawn_vps": float(total_vps_host),
+                    "spawn_scale": float(BENCHMARK_SPAWN_SCALE),
+                    "spawn_target_vps": None if _benchmark_spawn_target_vps(BENCHMARK_STEPS, DT) is None else float(_benchmark_spawn_target_vps(BENCHMARK_STEPS, DT)),
+                    "spawn_per_point_vps": None if BENCHMARK_SPAWN_PER_POINT_VPS is None else float(BENCHMARK_SPAWN_PER_POINT_VPS),
+                    "spawn_total_requested": None if BENCHMARK_SPAWN_TOTAL is None else float(BENCHMARK_SPAWN_TOTAL),
                     "spawned": int(round(_metric_number("spawned"))),
                     "completed": int(round(_metric_number("completed"))),
-                    "active": int(round(_metric_number("active"))),
+                    "active": int(final_active_count),
+                    "active_metric_last": float(_metric_number("active")),
+                    "active_sample_sum": float(active_sample_sum),
+                    "stats_samples": int(stats_samples_for_avg),
+                    "stats_samples_est": int(stats_samples_est),
+                    "avg_active_est": float(avg_active_est),
+                    "final_active": int(final_active_count),
+                    "final_connector_active": int(final_connector_active_count),
+                    "vehicle_updates_est": float(vehicle_updates_est),
+                    "vehicle_updates_per_second": float(vehicle_updates_per_second),
                     "rejected_spawn": int(round(_metric_number("rejected_spawn"))),
                     "avg_speed": float(_metric_number("avg_speed")),
                     "max_agents": int(MAX_AGENTS),
@@ -6747,6 +7824,8 @@ def main():
             print("[Warning] unregister failed:", e)
         pygame.quit()
 if __name__ == "__main__":
+    if SUMO_BENCHMARK_CHILD:
+        raise SystemExit(run_sumo_benchmark_child())
     if BENCHMARK_MODE and not BENCHMARK_CHILD:
         raise SystemExit(run_benchmark())
     main()

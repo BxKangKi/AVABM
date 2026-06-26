@@ -264,3 +264,60 @@ To override the step count without editing the config:
 ```bat
 run.bat benchmark --benchmark-steps=20000
 ```
+
+### Benchmark load controls
+
+Benchmark demand can be scaled without touching the CUDA or C++ extension sources:
+
+```bash
+./run.sh benchmark gpu --benchmark-spawn-vps=50
+./run.sh benchmark gpu --benchmark-spawn-vps=100 --benchmark-max-agents=300000
+./run.sh benchmark both --benchmark-spawn-scale=10
+./run.sh benchmark gpu --benchmark-spawn-total=100000
+```
+
+```bat
+run.bat benchmark gpu --benchmark-spawn-vps=50
+run.bat benchmark gpu --benchmark-spawn-vps=100 --benchmark-max-agents=300000
+run.bat benchmark both --benchmark-spawn-scale=10
+run.bat benchmark gpu --benchmark-spawn-total=100000
+```
+
+`BENCHMARK_SPAWN_VPS` targets total vehicles per simulated second,
+`BENCHMARK_SPAWN_TOTAL` converts a timed-run vehicle count into VPS,
+`BENCHMARK_SPAWN_SCALE` multiplies the normal demand, and
+`BENCHMARK_SPAWN_PER_POINT_VPS` assigns the same VPS to each spawn slot.
+`BENCHMARK_MAX_AGENTS` raises the benchmark child process capacity for high-load
+runs.
+
+### SUMO baseline
+
+SUMO can be included as a benchmark backend without rebuilding the AVABM CUDA or
+C++ extensions. This path exports the AVABM road network, route cache, spawn
+slots, and benchmark spawn demand into SUMO XML files, runs `netconvert`, then
+runs either `libsumo` or the `sumo` CLI.
+
+Examples:
+
+```bash
+./run.sh benchmark sumo
+./run.sh benchmark gpu --with-sumo --benchmark-spawn-vps=100
+./run.sh benchmark all --benchmark-spawn-vps=200 --benchmark-max-agents=500000
+./run.sh benchmark --benchmark-order=cuda,sumo --sumo-runner=cli
+```
+
+```bat
+run.bat benchmark sumo
+run.bat benchmark gpu --with-sumo --benchmark-spawn-vps=100
+run.bat benchmark all --benchmark-spawn-vps=200 --benchmark-max-agents=500000
+run.bat benchmark --benchmark-order=cuda,sumo --sumo-runner=cli
+```
+
+`SUMO_BENCHMARK_RUNNER=auto` tries `libsumo` first so warmup is excluded from the
+timed wall clock like AVABM. If `libsumo` is unavailable, it falls back to the
+`sumo` executable. Set `SUMO_BINARY` and `SUMO_NETCONVERT_BINARY` in `config.txt`
+when they are not on `PATH` or discoverable through `SUMO_HOME/bin`.
+
+SUMO export files are written under `data/results/sumo_baseline/`, and the usual
+`benchmark_summary.json` / `benchmark_summary.csv` include the SUMO row and CUDA
+versus SUMO speedups when both are run.

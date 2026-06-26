@@ -140,6 +140,8 @@ if /I "%~1"=="benchmark-gpu" goto :cmd_benchmark
 if /I "%~1"=="benchmark-cuda" goto :cmd_benchmark
 if /I "%~1"=="bench-gpu" goto :cmd_benchmark
 if /I "%~1"=="bench-cuda" goto :cmd_benchmark
+if /I "%~1"=="benchmark-sumo" goto :cmd_benchmark
+if /I "%~1"=="bench-sumo" goto :cmd_benchmark
 
 echo [Warning] Unknown command: %~1
 echo [Info] Opening launcher menu instead.
@@ -161,7 +163,7 @@ echo 7. Clean rebuild CUDA
 echo 8. Hard clean + rebuild CUDA
 echo 9. CUDA build status
 echo 10. Exit
-echo 11. Benchmark - CPU/CUDA throughput comparison
+echo 11. Benchmark - CPU/CUDA/SUMO throughput comparison
 echo.
 set "CHOICE="
 set /p "CHOICE=Select [1-11]: "
@@ -206,6 +208,7 @@ if /I "%MENU_CHOICE%"=="status" goto :cmd_status
 if /I "%MENU_CHOICE%"=="check" goto :cmd_status
 if /I "%MENU_CHOICE%"=="benchmark" goto :cmd_benchmark
 if /I "%MENU_CHOICE%"=="bench" goto :cmd_benchmark
+if /I "%MENU_CHOICE%"=="sumo" goto :cmd_benchmark
 echo [Warning] Invalid selection: %CHOICE%
 goto :menu
 
@@ -273,16 +276,25 @@ goto :finish
 
 :detect_benchmark_order
 set "BENCHMARK_LAUNCH_ORDER=both"
-echo(%ORIGINAL_ARGS% | findstr /I /C:"benchmark cpu" /C:"benchmark-cpu" /C:"bench-cpu" /C:"--benchmark-cpu" /C:"--bench-cpu" /C:"--cpu" /C:"--backend=cpu" /C:"--benchmark-backend=cpu" /C:"--benchmark-backends=cpu" >nul 2>nul
+echo(%ORIGINAL_ARGS% | findstr /I /C:"benchmark sumo" /C:"benchmark-sumo" /C:"bench-sumo" /C:"--benchmark-sumo" /C:"--bench-sumo" /C:"--benchmark-order=sumo" /C:"--benchmark-backend=sumo" /C:"--benchmark-backends=sumo" >nul 2>nul
+if not errorlevel 1 set "BENCHMARK_LAUNCH_ORDER=sumo"
+echo(%ORIGINAL_ARGS% | findstr /I /C:"benchmark cpu" /C:"benchmark-cpu" /C:"bench-cpu" /C:"--benchmark-cpu" /C:"--bench-cpu" /C:"--cpu" /C:"--backend=cpu" /C:"--benchmark-backend=cpu" /C:"--benchmark-backends=cpu" /C:"--benchmark-order=cpu" >nul 2>nul
 if not errorlevel 1 set "BENCHMARK_LAUNCH_ORDER=cpu"
-echo(%ORIGINAL_ARGS% | findstr /I /C:"benchmark gpu" /C:"benchmark cuda" /C:"benchmark-gpu" /C:"benchmark-cuda" /C:"bench-gpu" /C:"bench-cuda" /C:"--benchmark-gpu" /C:"--benchmark-cuda" /C:"--bench-gpu" /C:"--bench-cuda" /C:"--gpu" /C:"--cuda" /C:"--cuda-strict" /C:"--backend=cuda" /C:"--backend=cuda_strict" /C:"--benchmark-backend=gpu" /C:"--benchmark-backend=cuda" /C:"--benchmark-backends=gpu" /C:"--benchmark-backends=cuda" >nul 2>nul
+echo(%ORIGINAL_ARGS% | findstr /I /C:"benchmark gpu" /C:"benchmark cuda" /C:"benchmark-gpu" /C:"benchmark-cuda" /C:"bench-gpu" /C:"bench-cuda" /C:"--benchmark-gpu" /C:"--benchmark-cuda" /C:"--bench-gpu" /C:"--bench-cuda" /C:"--gpu" /C:"--cuda" /C:"--cuda-strict" /C:"--backend=cuda" /C:"--backend=cuda_strict" /C:"--benchmark-backend=gpu" /C:"--benchmark-backend=cuda" /C:"--benchmark-backends=gpu" /C:"--benchmark-backends=cuda" /C:"--benchmark-order=gpu" /C:"--benchmark-order=cuda" >nul 2>nul
 if not errorlevel 1 set "BENCHMARK_LAUNCH_ORDER=cuda"
-echo(%ORIGINAL_ARGS% | findstr /I /C:"benchmark both" /C:"benchmark all" /C:"benchmark compare" /C:"--benchmark-order=cpu,cuda" /C:"--benchmark-order=cuda,cpu" /C:"--benchmark-backends=cpu,cuda" /C:"--benchmark-backends=cuda,cpu" >nul 2>nul
+echo(%ORIGINAL_ARGS% | findstr /I /C:"benchmark cpu-sumo" /C:"benchmark cpu+sumo" /C:"--benchmark-order=cpu,sumo" /C:"--benchmark-backends=cpu,sumo" >nul 2>nul
+if not errorlevel 1 set "BENCHMARK_LAUNCH_ORDER=cpu"
+echo(%ORIGINAL_ARGS% | findstr /I /C:"benchmark gpu-sumo" /C:"benchmark cuda-sumo" /C:"benchmark gpu+sumo" /C:"benchmark cuda+sumo" /C:"--benchmark-order=cuda,sumo" /C:"--benchmark-order=gpu,sumo" /C:"--benchmark-backends=cuda,sumo" /C:"--benchmark-backends=gpu,sumo" >nul 2>nul
+if not errorlevel 1 set "BENCHMARK_LAUNCH_ORDER=cuda"
+echo(%ORIGINAL_ARGS% | findstr /I /C:"benchmark both" /C:"--benchmark-order=cpu,cuda" /C:"--benchmark-order=cuda,cpu" /C:"--benchmark-backends=cpu,cuda" /C:"--benchmark-backends=cuda,cpu" >nul 2>nul
+if not errorlevel 1 set "BENCHMARK_LAUNCH_ORDER=both"
+echo(%ORIGINAL_ARGS% | findstr /I /C:"benchmark all" /C:"benchmark compare" /C:"--benchmark-order=cpu,cuda,sumo" /C:"--benchmark-order=cuda,cpu,sumo" /C:"--benchmark-backends=cpu,cuda,sumo" /C:"--benchmark-backends=cuda,cpu,sumo" >nul 2>nul
 if not errorlevel 1 set "BENCHMARK_LAUNCH_ORDER=both"
 exit /b 0
 
 :cmd_benchmark
 call :detect_benchmark_order
+if /I "%BENCHMARK_LAUNCH_ORDER%"=="sumo" goto :cmd_benchmark_launch
 if /I "%BENCHMARK_LAUNCH_ORDER%"=="cpu" goto :cmd_benchmark_cpu
 if /I "%BENCHMARK_LAUNCH_ORDER%"=="cuda" goto :cmd_benchmark_cuda
 call :ensure_cpu_built
@@ -489,7 +501,7 @@ set "HEADLESS_MODE=1"
 set "SIM_HEADLESS=1"
 set "BENCHMARK_MODE=1"
 set "ABM_TURBO_PROFILE=1"
-echo [Info] Starting AVABM benchmark mode ^(use: benchmark cpu ^| benchmark gpu ^| benchmark both^).
+echo [Info] Starting AVABM benchmark mode ^(use: benchmark cpu ^| gpu ^| sumo ^| both ^| all; add --with-sumo; load: --benchmark-spawn-vps=100^).
 %PYTHON_COMMAND% main.py --benchmark %ORIGINAL_ARGS%
 exit /b %ERRORLEVEL%
 

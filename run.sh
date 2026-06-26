@@ -319,7 +319,7 @@ ensure_backend_built() {
 }
 
 benchmark_order_from_args() {
-  local arg value order
+  local arg value order low
   order=""
   for arg in "$@"; do
     value=""
@@ -328,35 +328,51 @@ benchmark_order_from_args() {
         value="cpu" ;;
       gpu|GPU|cuda|CUDA|benchmark-gpu|benchmark-cuda|bench-gpu|bench-cuda|--gpu|--cuda|--cuda-strict|--benchmark-gpu|--benchmark-cuda|--bench-gpu|--bench-cuda|--backend=cuda|--backend=cuda_strict|--benchmark-backend=gpu|--benchmark-backend=cuda|--benchmark-backends=gpu|--benchmark-backends=cuda|--benchmark-order=gpu|--benchmark-order=cuda)
         value="cuda" ;;
-      both|Both|all|All|compare|Compare|cpu,cuda|cuda,cpu|--benchmark-order=cpu,cuda|--benchmark-order=cuda,cpu|--benchmark-backends=cpu,cuda|--benchmark-backends=cuda,cpu)
+      sumo|SUMO|benchmark-sumo|bench-sumo|--sumo|--benchmark-sumo|--bench-sumo|baseline|sumo-baseline|--benchmark-backend=sumo|--benchmark-backends=sumo|--benchmark-order=sumo)
+        value="sumo" ;;
+      both|Both|cpu,cuda|cuda,cpu|--benchmark-order=cpu,cuda|--benchmark-order=cuda,cpu|--benchmark-backends=cpu,cuda|--benchmark-backends=cuda,cpu)
         value="cpu,cuda" ;;
+      all|All|compare|Compare|cpu,cuda,sumo|cuda,cpu,sumo|--benchmark-order=cpu,cuda,sumo|--benchmark-order=cuda,cpu,sumo|--benchmark-backends=cpu,cuda,sumo|--benchmark-backends=cuda,cpu,sumo)
+        value="cpu,cuda,sumo" ;;
+      gpu+sumo|cuda+sumo|gpu-sumo|cuda-sumo|sumo+gpu|sumo+cuda|sumo-gpu|sumo-cuda|--benchmark-order=cuda,sumo|--benchmark-order=gpu,sumo|--benchmark-backends=cuda,sumo|--benchmark-backends=gpu,sumo)
+        value="cuda,sumo" ;;
+      cpu+sumo|cpu-sumo|sumo+cpu|sumo-cpu|--benchmark-order=cpu,sumo|--benchmark-backends=cpu,sumo)
+        value="cpu,sumo" ;;
       --benchmark-order=*|--benchmark-backend=*|--benchmark-backends=*)
         value="${arg#*=}" ;;
+      --with-sumo|--benchmark-with-sumo|--include-sumo)
+        if [ -n "$order" ]; then value="$order,sumo"; else value="cpu,cuda,sumo"; fi ;;
     esac
-    case "$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')" in
+    low="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
+    case "$low" in
       cpu|cpp|cpp_cpu|c++) order="cpu" ;;
       gpu|cuda|cuda_strict|cuda-strict) order="cuda" ;;
-      both|all|compare|cpu,cuda|cuda,cpu) order="cpu,cuda" ;;
+      sumo|sumo_cli|sumo-cli|baseline|sumo-baseline) order="sumo" ;;
+      both|cpu,cuda|cuda,cpu) order="cpu,cuda" ;;
+      all|compare|cpu,cuda,sumo|cuda,cpu,sumo|sumo,cpu,cuda|sumo,cuda,cpu) order="cpu,cuda,sumo" ;;
+      gpu+sumo|cuda+sumo|gpu-sumo|cuda-sumo|sumo+gpu|sumo+cuda|sumo-gpu|sumo-cuda|cuda,sumo|gpu,sumo|sumo,cuda|sumo,gpu) order="cuda,sumo" ;;
+      cpu+sumo|cpu-sumo|sumo+cpu|sumo-cpu|cpu,sumo|sumo,cpu) order="cpu,sumo" ;;
     esac
   done
   printf '%s' "$order"
 }
 
 ensure_benchmark_backends_built() {
-  local order
+  local order need_cpu need_cuda
   order="$(benchmark_order_from_args "$@")"
-  case "$order" in
-    cpu)
-      ensure_cpu_built
-      ;;
-    cuda)
-      ensure_cuda_built
-      ;;
-    *)
-      ensure_cpu_built
-      ensure_cuda_built
-      ;;
-  esac
+  if [ -z "$order" ]; then
+    order="cpu,cuda"
+  fi
+  need_cpu=0
+  need_cuda=0
+  case ",$order," in *",cpu,"*) need_cpu=1 ;; esac
+  case ",$order," in *",cuda,"*) need_cuda=1 ;; esac
+  if [ "$need_cpu" = "1" ]; then
+    ensure_cpu_built
+  fi
+  if [ "$need_cuda" = "1" ]; then
+    ensure_cuda_built
+  fi
 }
 
 launch_mode() {
@@ -385,7 +401,7 @@ launch_mode() {
       export SIM_HEADLESS=1
       export BENCHMARK_MODE=1
       export ABM_TURBO_PROFILE=1
-      echo "[Info] Starting AVABM benchmark mode (use: benchmark cpu | benchmark gpu | benchmark both)."
+      echo "[Info] Starting AVABM benchmark mode (use: benchmark cpu | gpu | sumo | both | all; add --with-sumo; load: --benchmark-spawn-vps=100)."
       exec "$PYTHON_COMMAND" main.py --benchmark "$@"
       ;;
     *)
@@ -410,7 +426,7 @@ show_menu() {
   echo "8. Hard clean + rebuild CUDA"
   echo "9. CUDA build status"
   echo "10. Exit"
-  echo "11. Benchmark - CPU/CUDA throughput comparison"
+  echo "11. Benchmark - CPU/CUDA/SUMO throughput comparison"
   echo
   printf 'Select [1-11]: '
 }
@@ -481,7 +497,8 @@ case "$cmd" in
   *)
     echo "[Error] Unknown command: $cmd" >&2
     echo "Usage: ./run.sh [turbo|visual|benchmark|build|build-selected|build-cuda|build-cpu|rebuild|hardclean|status] [extra main.py args...]" >&2
-    echo "       Benchmark shortcuts: ./run.sh benchmark cpu | ./run.sh benchmark gpu | ./run.sh benchmark both" >&2
+    echo "       Benchmark shortcuts: ./run.sh benchmark cpu | gpu | sumo | both | all" >&2
+    echo "       Benchmark load: ./run.sh benchmark gpu --with-sumo --benchmark-spawn-vps=100 --benchmark-max-agents=300000" >&2
     echo "       Numeric shortcuts are also accepted: 1..11"
     exit 1
     ;;
